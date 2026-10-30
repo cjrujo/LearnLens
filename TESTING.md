@@ -9,7 +9,7 @@ npm test
 npm run check
 ```
 
-Latest import release checks: **100 passed, 0 failed, 1 optional media test skipped** in the regular suite. The real managed-media suite separately passed **17/17** with offline caches. Server, adapters, import modules and frontend syntax checks passed.
+Latest import release checks: **100 passed, 0 failed, 1 optional media test skipped** in the regular suite. The real material suite separately passed **25/25** (17 media plus 8 staging tests) with offline caches on Windows and Linux. Server, adapters, import modules and frontend syntax checks passed.
 
 Coverage includes browser-session isolation, secret redaction, model discovery versus explicit paid probes, Responses/Chat request formats, narrow fallback rules, valid/invalid image input, body/media limits, missing/failed speech, transcription multipart encoding, untrusted output escaping, export CSP, authorization/CSRF, public IP policy, and hosted configuration guards. Additional setup tests cover reasoning fields/omission for both APIs, unsupported-effort failure without downgrade, recommendation consent/privacy/scope/candidate validation, no silent role saving, provider-edit key transfer protection, and managed Kokoro authorization/routing/failures.
 
@@ -71,7 +71,9 @@ PowerShell: set those environment variables with `$env:NAME='1'` before the npm 
 
 Main-agent Windows rerun passed the full staged browser suite with real MP3/MP4/WebM/PDF/DOCX/PPTX on 2026-10-31 (UTC+8). A 251.25-second synthetic MP3 yielded 0–180 and 180–251.25 segments with exactly 251.25 seconds of decoded audio. The native MediaRecorder fixture is a one-second oscillator, not microphone audio. Silent video works without a transcription role. Full media extraction does not call any provider; teaching/transcription integration uses loopback fixtures only.
 
-`.github/workflows/material-imports.yml` provides separate Windows/Linux real-engine checks; Linux uses an OS network namespace after cache preparation. Import-release Linux results are recorded after that workflow completes; prior speech CI does not verify the new media engine. Local evidence: `artifacts/import-browser-recovery.log`, `artifacts/native-media-verified.log`.
+`.github/workflows/material-imports.yml` passed on **Windows and Linux** at `c0edea8`: [run 41090185334](https://github.com/cjrujo/LearnLens/actions/runs/41090185334). Both passed 100 regular tests (one opt-in skip), audit, setup and 25/25 real material checks. Linux processed fixtures with external networking disabled at the OS network-namespace level. The 251.25-second MP3's complete audio coverage passed on both platforms.
+
+After activating the coherent public UI, the main agent reran the complete browser suite plus actual native Kokoro export playback: PASS. Native cache-only full lesson smoke again produced a 248,444-byte WAV. Live `/health` returned 200; disposable Chromium reported no runtime exceptions and an enabled composer. Local evidence: `artifacts/import-browser-live-release.log`, `artifacts/import-final-media.log`, `artifacts/native-import-release.log`. No cloud-provider teaching or actual user gateway was exercised.
 
 ## Docker-free native speech
 
@@ -86,6 +88,8 @@ Native unit coverage includes private token/Host/Origin enforcement, supported v
 `.github/workflows/bundled-speech.yml` is a manually triggered packaging check. It builds the complete image, starts it with `--network none`, exercises the included default speech role and probe, synthesizes a real English MP3 clip, and verifies embedding in HTML. Docker is unavailable on the local Windows machine, so the real container was verified on GitHub Actions (Linux amd64): **PASS**, [run 41001150719](https://github.com/cjrujo/LearnLens/actions/runs/41001150719), commit `8001cf6`.
 
 Evidence: image build synthesized a 142,774-byte WAV while populating caches. With external networking disabled, the packaged app started, preselected speech without a cloud provider, passed the speech probe, generated a real 61,868-byte MP3 and embedded it in standalone HTML. This proves the packaged English synthesis path, not perceptual naturalness, every voice/language, arm64 execution or public deployment.
+
+The optional container was rebuilt and rechecked after the import dependencies and tar/xz prerequisites changed: **PASS at `c0edea8`**, [run 41090193018](https://github.com/cjrujo/LearnLens/actions/runs/41090193018). Its existing network-isolated speech/export smoke passed; this does not claim container media cache preloading (the separate Linux native job verifies real media processing).
 
 ## Not yet verified
 
