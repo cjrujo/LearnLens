@@ -54,7 +54,7 @@ async function attachments(session, count) {
   await wait(session, `document.querySelectorAll('#material-list > li').length === ${count} && document.getElementById('material-list').getAttribute('aria-busy') === 'false'`);
   assert.equal(await evaluate(session, 'document.querySelectorAll("#material-list .inline-message.error").length'), 0, await evaluate(session, 'document.getElementById("material-list").innerText'));
 }
-async function shot(session, name) { const { data } = await call('Page.captureScreenshot', { format: 'png' }, session); await writeFile(resolve('artifacts', name), Buffer.from(data, 'base64')); }
+async function shot(session, name) { await call('Page.bringToFront', {}, session); const { data } = await call('Page.captureScreenshot', { format: 'png' }, session); await writeFile(resolve('artifacts', name), Buffer.from(data, 'base64')); }
 async function upload(session, selector, files) { const { root } = await call('DOM.getDocument', {}, session); const { nodeId } = await call('DOM.querySelector', { nodeId: root.nodeId, selector }, session); await call('DOM.setFileInputFiles', { nodeId, files: files.map(file => resolve(file)) }, session); }
 const provider = createQAProvider(), kokoro = createQAProvider(), gated = createApp({ publicDirectory, accessPassword: 'test-private-beta-password' }).server;
 let app;
@@ -198,6 +198,16 @@ try {
   await consent(s);
   await wait(s, '!document.getElementById("preview-error").hidden');
   assert.match(await evaluate(s, 'document.getElementById("preview-error-message").textContent'), /Provider/);
+  assert.equal(await evaluate(s, 'document.getElementById("lesson-diagnostics").open && !document.getElementById("lesson-diagnostics").hidden'), true);
+  const firstFailure = await evaluate(s, 'JSON.parse(document.getElementById("diagnostic-report").textContent)');
+  assert.equal(firstFailure.lastOperation.stage, 'lesson_generation');
+  assert.equal(firstFailure.lastOperation.upstreamStatus, 500);
+  assert.equal(firstFailure.lastOperation.appStatus, 502);
+  assert.match(firstFailure.lastOperation.appRequestId, /^[a-f0-9-]{36}$/);
+  assert.equal(firstFailure.lastOperation.automaticRetry, false);
+  assert.doesNotMatch(JSON.stringify(firstFailure), /Explain this screenshot|Markdown source|test-screenshot|data:audio|data:image|apiKey|Bearer/);
+  assert.equal(await evaluate(s, 'document.documentElement.scrollWidth <= innerWidth'), true, '320px failure diagnostics have no horizontal overflow');
+  await shot(s, 'app-provider-diagnostics.png');
   assert.equal(await evaluate(s, 'document.getElementById("show-previous").hidden'), false);
   await evaluate(s, 'document.getElementById("show-previous").click()');
   assert.equal(await evaluate(s, 'document.getElementById("preview-result").hidden'), false);
@@ -268,6 +278,39 @@ try {
   const finalInput = JSON.stringify(provider.calls.findLast(c=>c.kind==='lesson').body.input);
   for (const card of cards) for (let part=1;part<=card.parts;part++) assert.ok(finalInput.includes(card.name) && finalInput.includes('(' + part + '/' + card.parts + ')'), 'Final lesson includes prepared source ' + card.name + ' part ' + part);
   passed('all document pages/Office chunks reach primary digests and final lesson; final failure retains attachments/previous lesson; retry does not repeat finished paid preparation');
+  // A separate draft exercises digest/STT failures without disturbing prior cached work.
+  const diagnosticTab = await tab(origin);
+  await wait(diagnosticTab, 'document.getElementById("setup-count")?.textContent === "3/3"');
+  await upload(diagnosticTab, '#material-input', ['artifacts/test-notes.md', 'artifacts/test-audio.wav']);
+  await attachments(diagnosticTab, 2);
+  for (const [kind, stage, part] of [['digest', 'source_preparation', 1], ['transcription', 'transcription', 2]]) {
+    provider.config.failKind = kind;
+    const beforeFailure = provider.calls.filter(c => c.kind === kind).length;
+    await evaluate(diagnosticTab, 'document.getElementById("lesson-form").requestSubmit()');
+    await consent(diagnosticTab);
+    await wait(diagnosticTab, '!document.getElementById("preview-error").hidden && !document.getElementById("generate-button").disabled');
+    const report = await evaluate(diagnosticTab, 'JSON.parse(document.getElementById("diagnostic-report").textContent)');
+    assert.equal(report.lastOperation.stage, stage);
+    assert.equal(report.lastOperation.part.current, part);
+    assert.equal(report.lastOperation.part.total, 2);
+    assert.equal(report.lastOperation.upstreamStatus, 500);
+    assert.equal(report.lastOperation.model, kind === 'digest' ? 'test/vision' : 'test/transcribe');
+    assert.equal(provider.calls.filter(c => c.kind === kind).length - beforeFailure, 1, 'No automatic replay of the failed paid stage');
+    assert.doesNotMatch(JSON.stringify(report), /Markdown source|Teach me about Newton|test-notes|test-audio|data:audio|Bearer/);
+  }
+  const callsBeforeCopy = provider.calls.length;
+  await evaluate(diagnosticTab, 'Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async text=>{window.__copiedReport=text}}});document.getElementById("copy-diagnostics").click()');
+  await wait(diagnosticTab, 'typeof window.__copiedReport === "string"');
+  assert.equal(await evaluate(diagnosticTab, 'window.__copiedReport === document.getElementById("diagnostic-report").textContent'), true);
+  await evaluate(diagnosticTab, 'Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async()=>{throw new Error("denied")}}});document.getElementById("copy-diagnostics").click()');
+  await wait(diagnosticTab, 'getSelection().toString() === document.getElementById("diagnostic-report").textContent');
+  assert.equal(provider.calls.length, callsBeforeCopy, 'Viewing/copying diagnostics is non-billable');
+  provider.config.failKind = null;
+  await evaluate(diagnosticTab, 'document.getElementById("error-back-draft").click();document.querySelector("#material-list button").click()');
+  await wait(diagnosticTab, 'document.querySelectorAll("#material-list > li").length === 1 && !document.querySelector("#material-list button").disabled');
+  await evaluate(diagnosticTab, 'document.querySelector("#material-list button").click()');
+  await attachments(diagnosticTab, 0);
+  passed('safe stage/part/model/status/timing diagnostics for digest, transcription and final failures; copy/fallback; no source/key leakage or automatic paid replay');
   if (fixtures.media.length) {
     const beforeMedia = provider.calls.length;
     await evaluate(s, 'document.getElementById("tab-compose").click()');

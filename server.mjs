@@ -129,6 +129,12 @@ export function createApp(options = {}) {
   const interval = setInterval(prune, 60_000).unref();
 
   const server = http.createServer(async (request, response) => {
+    const requestId = randomUUID(); let diagnosticContext;
+    const context = (stage, provider, role) => {
+      const safe = value => typeof value === 'string' && ![provider?.apiKey, accessPassword].filter(Boolean).some(secret => value.includes(secret)) ? value.slice(0, 200) : '[redacted]';
+      diagnosticContext = { stage, provider: safe(provider?.name || 'Configured provider'), model: safe(role?.model), apiMode: stage === 'transcription' ? 'audio/transcriptions' : ['auto', 'chat', 'responses'].includes(role?.api) ? role.api : 'auto', thinking: role?.reasoningEffort || 'default' };
+    };
+    response.setHeader('X-LearnLens-Request-Id', requestId);
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.setHeader('Referrer-Policy', 'no-referrer');
@@ -311,6 +317,7 @@ export function createApp(options = {}) {
       if (request.method === 'POST' && path === '/api/materials/summarize') {
         const input = digestInput(await readPaidBody()), primary = session.roles.primary;
         if (!primary) throw new AppError('Assign a primary model before preparing material notes.');
+        context('source_preparation', session.providers.get(primary.providerId), primary);
         await runJob(session, async () => {
           const result = await generateText(session.providers.get(primary.providerId), primary, { ...digestPrompt(input), maxTokens: 2000 });
           ensureCurrent(); json(response, 200, parseDigest(result.text));
@@ -362,6 +369,7 @@ export function createApp(options = {}) {
         const audio = decodeDataUrl(body.dataUrl, 'audio');
         const extensions = { 'audio/webm': 'webm', 'audio/wav': 'wav', 'audio/mpeg': 'mp3', 'audio/mp4': 'mp4', 'audio/ogg': 'ogg' };
         const provider = session.providers.get(role.providerId);
+        context('transcription', provider, role);
         await runJob(session, async () => {
           const text = await transcribeAudio(provider, role, audio, `recording.${extensions[audio.mime]}`);
           ensureCurrent();
@@ -375,6 +383,7 @@ export function createApp(options = {}) {
         if (!primary) throw new AppError('Assign a primary lesson model in AI providers first.');
         if (input.includeAudio && !speech) throw new AppError('Assign a speech generation model or turn off lesson audio.');
         const provider = session.providers.get(primary.providerId);
+        context('lesson_generation', provider, primary);
         const speechProvider = speech && (speech.engine === 'kokoro' ? kokoro : session.providers.get(speech.providerId));
         await runJob(session, async () => {
           const output = await generateText(provider, primary, lessonPrompt(input));
@@ -407,7 +416,10 @@ export function createApp(options = {}) {
       }
       throw new AppError('Not found.', 404);
     } catch (error) {
-      if (!response.headersSent) json(response, error instanceof AppError ? error.status : 500, { error: error instanceof AppError ? error.message : 'An unexpected server error occurred. Please try again.' });
+      if (!response.headersSent) json(response, error instanceof AppError ? error.status : 500, {
+        error: error instanceof AppError ? error.message : 'An unexpected server error occurred. Please try again.', requestId,
+        ...((diagnosticContext || (error instanceof AppError && error.diagnostics)) ? { diagnostics: { ...diagnosticContext, ...(error instanceof AppError ? error.diagnostics : {}), ...(!(error instanceof AppError) ? { category: 'internal' } : {}) } } : {}),
+      });
       else response.end();
     }
   });

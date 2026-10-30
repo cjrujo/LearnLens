@@ -30,13 +30,92 @@ function checkOf(role, kind) {
   return check;
 }
 
+// Metadata-only, per-attempt activity; never retain request bodies, filenames or credentials.
+let lessonTrace = null;
+const tracePanel = element('details'), traceTitle = element('summary', 'Request activity & safe diagnostics');
+tracePanel.id = 'lesson-diagnostics'; tracePanel.className = 'guide-card'; tracePanel.hidden = true;
+const traceStatus = element('p'), traceHint = element('p'), traceOutput = element('pre'), traceCopy = element('button', 'Copy safe report');
+traceStatus.id = 'diagnostic-status'; traceHint.id = 'diagnostic-hint'; traceHint.className = 'field-hint';
+traceOutput.id = 'diagnostic-report'; traceOutput.className = 'material-text-preview'; traceOutput.tabIndex = 0;
+traceCopy.id = 'copy-diagnostics'; traceCopy.type = 'button'; traceCopy.className = 'btn secondary small';
+tracePanel.append(traceTitle, traceStatus, traceHint, traceOutput, traceCopy,
+  element('p', 'Current attempt only; up to 520 operations. Keys, request/response bodies, instructions and filenames are not collected. Provider/model labels are included—review before sharing. Reloading clears this report and the in-page preparation cache.', 'field-hint'));
+$('preview-error').after(tracePanel);
+traceStatus.style.overflowWrap = 'anywhere';
+const stageLabel = value => ({ transcription: 'Transcribing audio', source_preparation: 'Preparing source notes', lesson_generation: 'Generating final lesson' }[value] || value);
+const traceStages = { '/transcribe': 'Transcribing audio', '/materials/summarize': 'Preparing source notes', '/lessons': 'Generating final lesson' };
+function renderTrace() {
+  if (!lessonTrace) return;
+  const { roles, providers, part, ...report } = lessonTrace;
+  const last = report.operations.at(-1), { operations, ...summary } = report;
+  traceOutput.textContent = JSON.stringify({ ...summary, lastOperation: last, operations }, null, 2);
+  traceStatus.textContent = `${report.status} · ${stageLabel(report.failedAt?.stage || last?.stage || 'Local preparation')}${last?.provider ? ` · ${last.provider} / ${last.model}` : ''}${last?.part ? ` · part ${last.part.current}/${last.part.total}` : ''}${last?.upstreamStatus ? ` · provider HTTP ${last.upstreamStatus}` : ''} · ${report.cachedResults} cached preparation result(s) retained`;
+  traceHint.textContent = last?.providerCode === 'convert_request_failed'
+    ? 'The gateway reported request conversion failure. Check its support for the selected endpoint/model, images/audio and thinking level. Give gateway support the provider request ID, if shown. This is not proof your files are invalid.'
+    : last?.upstreamStatus >= 500 ? 'The upstream service returned a server error. This alone does not identify the cause. Check provider status/logs with the request ID before choosing another potentially billable attempt.'
+    : 'Requests below are sent only after your confirmation. Successful preparation is reused from cache; failed or unknown paid calls are never automatically replayed. API Auto may try Chat only after Responses returns 404, 405 or 501. No server-internal narration progress is available.';
+}
+traceCopy.onclick = async () => {
+  try { await navigator.clipboard.writeText(traceOutput.textContent); toast('Diagnostic metadata copied. Review provider/model labels before sharing.'); }
+  catch { const selection = getSelection(), range = document.createRange(); range.selectNodeContents(traceOutput); selection.removeAllRanges(); selection.addRange(range); toast('Select and copy the diagnostic report manually.'); }
+};
+function beginTrace(approvedSetup) {
+  lessonTrace = { version: 1, startedAt: new Date().toISOString(), status: 'Preparing', cachedResults: materials.cache.size,
+    roles: approvedSetup.roles, providers: state.providers.map(({ id, name }) => ({ id, name })), part: null, operations: [] };
+  tracePanel.hidden = false; tracePanel.open = true; renderTrace();
+  $('progress-footnote').textContent = 'Current app operation is shown below, not a percentage estimate. Final lesson/narration runs inside one server request.';
+}
+function tracePart(current, total) {
+  let index = current - 1;
+  for (let n = 0; n < materials.items.length; n++) {
+    const item = materials.items[n];
+    if (index < item.partCount) return { current, total, material: n + 1, kind: item.kind, materialPart: index + 1, materialParts: item.partCount };
+    index -= item.partCount;
+  }
+  return { current, total };
+}
+function operationStart(path, body) {
+  if (!busy || !lessonTrace || !traceStages[path]) return null;
+  const trace = lessonTrace, role = trace.roles[path === '/transcribe' ? 'transcription' : 'primary'];
+  const entry = { number: trace.operations.length + 1, stage: traceStages[path], part: path === '/lessons' ? null : trace.part,
+    startedAt: new Date().toISOString(), provider: trace.providers.find(p => p.id === role?.providerId)?.name || 'Configured provider', model: role?.model,
+    apiMode: path === '/transcribe' ? 'audio/transcriptions' : role?.api, thinking: path === '/transcribe' ? undefined : role?.reasoningEffort || 'default',
+    appEndpoint: path, status: 'Waiting', input: { textCharacters: body?.text?.length || 0, images: body?.images?.length || 0,
+      audioBytesApprox: body?.dataUrl ? Math.floor((body.dataUrl.split(',')[1]?.length || 0) * .75) : 0 } };
+  if (trace.operations.length >= 520) trace.operations.shift();
+  trace.operations.push(entry); $('progress-title').textContent = entry.stage + (entry.part ? ` · part ${entry.part.current} of ${entry.part.total}` : ''); renderTrace();
+  return { trace, entry, started: Date.now() };
+}
+function operationFinish(operation, error) {
+  if (!operation) return;
+  const { trace, entry, started } = operation;
+  entry.elapsedMs = Date.now() - started; entry.status = error ? error.name === 'AbortError' ? 'Stopped; upstream outcome unknown' : 'Failed' : 'Completed';
+  if (error) {
+    if (error.status) entry.appStatus = error.status;
+    if (/^[a-f0-9-]{36}$/.test(error.requestId || '')) entry.appRequestId = error.requestId;
+    const d = error.diagnostics || {};
+    if (Number.isFinite(d.elapsedMs)) entry.providerElapsedMs = d.elapsedMs;
+    // Keep a fixed schema, not arbitrary server fields or error prose.
+    for (const key of ['stage', 'provider', 'model', 'apiMode', 'thinking', 'category', 'endpoint', 'upstreamStatus', 'contentType', 'responseBytes', 'providerCode', 'providerRequestId', 'automaticRetry', 'responseBodyOmitted']) {
+      if (Object.hasOwn(d, key) && ['string', 'number', 'boolean'].includes(typeof d[key])) entry[key] = typeof d[key] === 'string' ? d[key].slice(0, 200) : d[key];
+    }
+  }
+  trace.cachedResults = materials.cache.size;
+  if (lessonTrace === trace) renderTrace();
+}
 async function api(path, options = {}) {
+  const operation = operationStart(path, options.body);
+  try { const result = await apiRequest(path, options, operation); operationFinish(operation); return result; }
+  catch (error) { operationFinish(operation, error); throw error; }
+}
+async function apiRequest(path, options = {}, operation = null) {
   let response;
   try {
     response = await fetch('/api' + path, { ...options, headers: { 'X-LearnLens-Token': token, ...(options.raw ? { 'Content-Type': 'application/octet-stream' } : options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers }, credentials: 'same-origin', cache: 'no-store', body: options.raw || (options.body ? JSON.stringify(options.body) : undefined) });
   } catch (cause) { if (cause.name === 'AbortError') throw cause; const error = new Error('Could not reach LearnLens. Check your connection. An AI request already sent may still incur charges; it will not be retried automatically.'); error.network = true; throw error; }
+  if (operation) { operation.entry.appStatus = response.status; const id = response.headers.get('X-LearnLens-Request-Id'); if (/^[a-f0-9-]{36}$/.test(id || '')) operation.entry.appRequestId = id; }
   let result;
-  try { result = await response.json(); } catch (cause) { if (cause.name === 'AbortError') throw cause; const error = new Error('LearnLens returned an unreadable response. Check the server connection.'); error.network = cause instanceof TypeError; throw error; }
+  try { result = await response.json(); } catch (cause) { if (cause.name === 'AbortError') throw cause; const error = new Error('LearnLens returned an unreadable response. Check the server connection.'); error.network = cause instanceof TypeError; error.status = response.status; error.requestId = response.headers.get('X-LearnLens-Request-Id'); throw error; }
   if (!response.ok) {
     if (response.status === 409 && ['/transcribe', '/materials/summarize', '/lessons'].includes(path)) {
       ready = false; cancelWork();
@@ -45,7 +124,7 @@ async function api(path, options = {}) {
     if ([401, 403].includes(response.status)) {
       cancelWork(true); ready = false; $('connection-banner').hidden = false; $('connection-message').textContent = 'Your session changed or expired. Download your lesson or copy your draft before reloading.'; $('reload-session').hidden = false; updateStatus();
     }
-    const error = new Error(result.error || `Request failed (HTTP ${response.status}).`); error.status = response.status; throw error;
+    const error = new Error(result.error || `Request failed (HTTP ${response.status}).`); error.status = response.status; error.requestId = result.requestId; error.diagnostics = result.diagnostics; throw error;
   }
   return result;
 }
@@ -321,11 +400,12 @@ async function preview(kind, request, approvedSetup) {
   $('request-kind').textContent = kind === 'demo' ? 'LOCAL EXAMPLE' : 'CREATING YOUR LESSON';
   $('progress-title').textContent = kind === 'demo' ? 'Opening the example' : 'Preparing your materials';
   $('progress-description').textContent = kind === 'demo' ? 'No AI credits are used.' : 'All automatic parts are processed in order. Successful preparation is cached for retries on this page.';
+  if (kind === 'demo') { lessonTrace = null; tracePanel.hidden = true; } else beginTrace(approvedSetup);
   const started = Date.now(); const tick = () => $('progress-elapsed').textContent = duration(Math.floor((Date.now() - started) / 1000)) + ' elapsed'; tick(); clock = setInterval(tick, 1000);
   try {
     let payload = request;
     if (kind !== 'demo') {
-      const prepared = await materials.prepare({ consent: true, goal: request.goal, roles: approvedSetup.roles, expectedSetupRevision: approvedSetup.revision, progress: text => { check(); $('progress-title').textContent = text; } });
+      const prepared = await materials.prepare({ consent: true, goal: request.goal, roles: approvedSetup.roles, expectedSetupRevision: approvedSetup.revision, progress: text => { check(); const part = /^Processing part (\d+) of (\d+)/.exec(text); if (lessonTrace) { lessonTrace.part = part ? tracePart(Number(part[1]), Number(part[2])) : null; lessonTrace.cachedResults = materials.cache.size; renderTrace(); } $('progress-title').textContent = text; } });
       check(); payload = { ...request, ...prepared, consent: true };
       $('progress-title').textContent = 'Creating the final lesson';
       $('progress-description').textContent = 'Sending bounded source notes and representative images. Requested spoken examples follow. This may take a few minutes.';
@@ -334,9 +414,13 @@ async function preview(kind, request, approvedSetup) {
     const result = kind === 'demo' ? await api('/demo', { signal: generationController.signal }) : await api('/lessons', { method: 'POST', body: payload, signal: generationController.signal });
     check();
     currentLesson = { ...result, sample: kind === 'demo', sourceDescription: kind === 'demo' ? 'Hand-authored English sample · no uploaded material' : `${materials.items.length} original attachment(s) · ${materials.partCount} parts processed · ${payload.images.length} representative image(s)` };
+    if (lessonTrace) { lessonTrace.status = 'Completed'; lessonTrace.cachedResults = materials.cache.size; renderTrace(); tracePanel.open = false; }
     displayLesson(); announce('Your lesson is ready.'); await refreshState(false);
   } catch (error) {
-    $('preview-error').hidden = false; $('preview-error-message').textContent = error.message;
+    if (lessonTrace) { lessonTrace.status = error.name === 'AbortError' ? 'Stopped' : 'Failed'; if (lessonTrace.operations.at(-1)?.status === 'Completed' || !lessonTrace.operations.length) lessonTrace.failedAt = { stage: 'Local preparation', part: lessonTrace.part, appStatus: error.status }; lessonTrace.cachedResults = materials.cache.size; renderTrace(); tracePanel.open = true; }
+    $('preview-error').hidden = false;
+    const failedStage = lessonTrace?.operations.at(-1);
+    $('preview-error-message').textContent = (failedStage?.status === 'Failed' ? stageLabel(failedStage.stage) + ': ' : '') + error.message;
     $('preview-error-note').textContent = 'Your attachments, instructions, previous lesson and successful cached preparation remain intact. Retry asks for paid consent and skips cached successes. A failed or unknown AI request may still incur charges.';
     $('show-previous').hidden = !currentLesson; announce('Processing stopped. Your draft is intact.');
   } finally { clearInterval(clock); busy = false; generationController = null; $('preview-loading').hidden = true; updateStatus(); }
@@ -419,7 +503,7 @@ $('reload-session').onclick = async () => { if (await confirmAction({ title: 'Re
 $('clear-session').onclick = async () => {
   if (!await confirmAction({ title: 'Clear this browser’s session?', description: 'Your provider keys and custom model assignments will be removed. Included speech returns to its default where available. Your current draft stays on this page. Already submitted AI requests cannot be undone.', accept: 'Clear session' })) return;
   cancelWork(true);
-  try { await api('/logout', { method: 'POST', body: {} }); resetProviderForm(); await refreshState(); toast('Your provider settings were cleared.'); } catch (error) { toast(error.message); }
+  try { await api('/logout', { method: 'POST', body: {} }); lessonTrace = null; tracePanel.hidden = true; resetProviderForm(); await refreshState(); toast('Your provider settings were cleared.'); } catch (error) { toast(error.message); }
 };
 $('login-form').onsubmit = async event => {
   event.preventDefault(); $('login-button').disabled = true; message('login-message');
