@@ -1,68 +1,54 @@
-# Optional Kokoro speech service
+# Built-in natural speech
 
-LearnLens supports two independent speech methods:
+**Kokoro ships with the standard LearnLens container. Learners do not install it, configure a service URL, download a model, or supply a speech API key.**
 
-| Method | Runs where | Network requirement |
-|---|---|---|
-| AI provider | Your selected provider’s `/audio/speech` service | Usually internet |
-| Kokoro | An operator-configured service beside the LearnLens backend | Local network only after all model assets are installed |
+The default package includes the CPU speech runtime, Kokoro model, voices and build-time English-language warmup/cache. One app container starts the private speech process automatically, waits for readiness, then starts LearnLens. New sessions already select **Built-in natural speech · Kokoro**. Online-provider speech remains an optional alternative.
 
-Both produce audio embedded in downloaded HTML. Neither bundles the speech model inside the lesson. A cloud lesson model can still be used with local Kokoro narration.
+## For learners
 
-## Local setup
+1. Connect a primary lesson model for understanding your material.
+2. Enable **Add spoken examples** when creating a lesson. Built-in speech is already selected.
+3. Listen in the app or download the HTML lesson. The generated audio travels with the file and works offline.
 
-One compatible implementation is [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI). Its README documents `/v1/audio/speech`, `model: "kokoro"`, provider-specific voice IDs, and MP3 output. LearnLens uses those standard fields. Follow that project’s current installation, model-download, hardware, security and license instructions.
+No separate Kokoro installation or API key is needed. The initial voice is English `af_heart`; choosing another voice is optional. Voice/language coverage and naturalness vary, and this release does not automatically select a voice by language. If synthesis fails, the text lesson is kept with a warning; there is **no silent switch to paid online speech**.
 
-For example, its documented CPU image can be run with a **loopback-only** published port:
+Clearing a bundled session removes user-configured providers/keys and restores the included speech default. Speech can still be disabled by clearing its role or leaving spoken examples off.
 
-```sh
-docker run --name learnlens-kokoro -p 127.0.0.1:8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest
-```
+## For deployment operators
 
-This command downloads a third-party image and may need model assets. It has **not** been run automatically or verified with real synthesis here. For deployment, select and pin a vetted image tag/digest rather than relying on `latest`. Keep the container/model storage persistent according to the service’s documentation; verify offline operation after initial downloads complete.
-
-Start LearnLens with the service location. Git Bash/Linux/macOS:
+Use the normal project Dockerfile—not a second Kokoro service:
 
 ```sh
-KOKORO_BASE_URL=http://127.0.0.1:8880/v1 npm start
+docker build -t learnlens .
+docker run --env-file .env -p 127.0.0.1:3210:3210 --name learnlens learnlens
 ```
 
-PowerShell:
+Set the usual HTTPS `PUBLIC_ORIGIN`, `LEARNLENS_ACCESS_PASSWORD`, `HOST` and `PORT` in `.env`; see README. **No `KOKORO_BASE_URL` is needed.** Put the app behind an HTTPS reverse proxy and never expose the raw Node HTTP port publicly.
 
-```powershell
-$env:KOKORO_BASE_URL = 'http://127.0.0.1:8880/v1'
-npm start
-```
+The first image build downloads the pinned upstream speech image and any remaining warmup assets. This is a deployment/build step, not something each learner does. The built image is larger than the previous Node-only image and needs more CPU/RAM; select a host that supports a persistent Docker process rather than a tiny request-scoped serverless function.
 
-Or put settings in your private `.env` and start with `node --env-file=.env server.mjs`. Do not reuse the hosted example’s HOST/PUBLIC_ORIGIN settings for a local-only installation without adjusting them.
+The package:
 
-Optional variables:
+- Includes the multi-arch Kokoro-FastAPI CPU v0.9.1 image pinned by digest, plus Node 22.
+- Synthesizes a sample during the build, failing the build if the included English voice cannot run.
+- Enables offline model-cache mode at runtime; model installation is not deferred to learners.
+- Binds speech to private `127.0.0.1:8880`. Only the app port is intended for routing; speech is not published.
+- Does not pass workspace passwords or provider keys to the speech child process.
+- Disables upstream web-player, CORS, debug, tuning/cloning, voice tags and SSML features.
+- Terminates both processes on shutdown and fails the container if either process unexpectedly exits, so an unhealthy worker is not silently advertised as ready.
 
-```text
-KOKORO_MODEL=kokoro
-KOKORO_VOICE=af_heart
-KOKORO_API_KEY=
-```
+Model synthesis can run without internet after packaging. A remote primary model still needs connectivity for new lessons. Downloaded HTML contains audio bytes, **not the model itself**.
 
-Then in LearnLens:
+### Advanced development/operator overrides
 
-1. Open AI providers → Natural speech → Speech method → **Kokoro · local / self-hosted**.
-2. Choose a voice ID supported by your service and target language. `af_heart` is the configurable initial default, not an automatic multilingual voice choice. Kokoro-FastAPI exposes its voices at `/v1/audio/voices`; LearnLens currently accepts a manual voice ID.
-3. Optionally run **Test speech**, confirm the local synthetic request, and save model roles.
-4. Enable spoken examples and create a lesson. Listen before judging voice quality or language suitability.
+`npm start` remains a lightweight, Node-only developer command; it does not install Python/model dependencies. It is not the bundled end-user distribution. Use the container to test included speech.
 
-## Hosted deployment
+Operators can intentionally opt out with `LEARNLENS_SPEECH_MODE=disabled`, or set `KOKORO_BASE_URL` to an already-managed service to override the included worker. `KOKORO_MODEL`, `KOKORO_VOICE` and `KOKORO_API_KEY` remain advanced configuration for that service. An external override is not automatically selected as the bundled default. These are not learner-facing installation requirements, and browser input cannot change the internal service URL.
 
-Kokoro must be reachable **from the LearnLens server**. A learner’s phone/PC `localhost` is not the server’s `localhost`.
+## Verification
 
-- Bare-metal: bind Kokoro to loopback and configure the same-host URL.
-- Docker: put both services on a private network and use a service URL such as `http://kokoro:8880/v1`. Do not publish Kokoro’s port publicly. Inside the LearnLens container, `127.0.0.1` refers to that container, not the other service.
-- Restrict network access, size the CPU/RAM or GPU, persist model assets, and set appropriate proxy timeouts. Free or sleeping application tiers may not be suitable for sustained TTS.
-- `KOKORO_BASE_URL` is trusted **operator-only configuration**. It can reach private HTTP(S) services, unlike browser-supplied provider URLs in hosted mode. The browser cannot override it. Its API key is never sent to the browser or model advisor.
-- The shared service is available to authenticated beta users. Apply authentication/quotas and infrastructure limits before wider use.
+Local unit/browser checks cover the preselected speech role, process lifecycle, credential isolation, switching to online speech, and embedded audio. The separate **Bundled speech verification** GitHub Actions workflow builds the real container, starts it with `--network none`, tests the default speech role and API probe, synthesizes real MP3 audio and verifies its inclusion in HTML. See TESTING.md for the recorded outcome and remaining gaps.
 
-Kokoro is speech-only in LearnLens. It does not replace the lesson model or transcription role. There is no automatic cloud fallback. If synthesis fails, you receive a text lesson with a warning.
+English build-time warmup is not a guarantee that every language/voice works without additional assets; those combinations need explicit validation. No perceptual rating of voice naturalness or physical-device compatibility is implied by successful synthesis.
 
-## Verification boundary
-
-The API contract and routing are covered by mocks, including embedded audio and failure behavior. A real Kokoro deployment, voice quality, language coverage, latency and offline asset completeness still require operator/device testing. No claim of a running Kokoro installation is made by merely displaying the option.
+Upstream: https://github.com/remsky/Kokoro-FastAPI/tree/v0.9.1. See THIRD-PARTY-NOTICES.md and third_party/ for licensing/provenance.

@@ -27,7 +27,7 @@ const provider = createQAProvider(), kokoro = createQAProvider(), gated = create
 let app;
 try {
   const providerOrigin = await listen(provider.server), kokoroOrigin = await listen(kokoro.server);
-  app = createApp({ kokoroBaseUrl: kokoroOrigin + '/v1' }).server;
+  app = createApp({ kokoroBaseUrl: kokoroOrigin + '/v1', kokoroBuiltin: true }).server;
   const origin = await listen(app), gatedOrigin = await listen(gated);
   ({ browserContextId } = await call('Target.createBrowserContext'));
   await mkdir('artifacts', { recursive: true });
@@ -41,6 +41,8 @@ try {
   await wait(s, 'document.getElementById("setup-label")?.textContent === "Connect your AI"');
   await call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false }, s);
   assert.equal(await evaluate(s, 'document.getElementById("provider-url").value'), 'https://api.openai.com/v1');
+  assert.equal(await evaluate(s, 'document.getElementById("role-speech-engine").value'), 'kokoro', 'Built-in speech needs no learner setup');
+  assert.equal(await evaluate(s, 'document.getElementById("role-speech-voice").value'), 'af_heart');
   await shot(s, 'app-desktop.png');
   await evaluate(s, `document.querySelector('[data-action="demo"]').click()`);
   await wait(s, '!document.getElementById("preview-result").hidden');
@@ -76,10 +78,10 @@ try {
   await evaluate(s, 'document.getElementById("confirm-consent").click();document.getElementById("confirm-accept").click()');
   await wait(s, '!document.getElementById("recommend-results").hidden');
   assert.equal(provider.calls.at(-1).body.reasoning.effort, 'high');
-  assert.equal(await evaluate(s, 'document.getElementById("setup-count").textContent'), '0/3', 'Advice cannot save roles');
-  await evaluate(s, 'document.querySelector("#recommend-cards input[data-role=primary]").click();document.getElementById("apply-recommendations").click()');
+  assert.equal(await evaluate(s, 'document.getElementById("setup-count").textContent'), '1/3', 'Advice cannot save roles');
+  await evaluate(s, 'document.querySelector("#recommend-cards input[data-role=primary]").click();document.querySelector("#recommend-cards input[data-role=speech]").click();document.getElementById("apply-recommendations").click()');
   assert.equal(await evaluate(s, 'document.getElementById("role-primary-model").value'), 'test/vision');
-  assert.equal(await evaluate(s, 'document.getElementById("setup-count").textContent'), '0/3', 'Applying advice only changes the form');
+  assert.equal(await evaluate(s, 'document.getElementById("setup-count").textContent'), '1/3', 'Applying advice only changes the form');
   await evaluate(s, 'document.querySelector(".setup-advisor").scrollIntoView({block:"start"})');
   await shot(s, 'app-model-advisor.png');
   await call('Emulation.setDeviceMetricsOverride', { width: 320, height: 700, deviceScaleFactor: 1, mobile: true }, s);

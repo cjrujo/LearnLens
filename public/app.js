@@ -77,7 +77,7 @@ function updateStatus() {
   $('generation-helper').textContent = state.roles.primary ? `Using ${state.roles.primary.model}` : 'One primary model is all you need to start.';
   $('include-audio').disabled = !state.roles.speech || !usable;
   if (!state.roles.speech) $('include-audio').checked = false;
-  $('speech-note').textContent = state.roles.speech?.engine === 'kokoro' ? 'Kokoro speech runs on the LearnLens server. Works without cloud TTS after models are installed; voice/language coverage varies.' : state.roles.speech ? `AI-generated speech via ${providerFor(state.roles.speech)?.name} · additional credits apply.` : 'A compatible speech model is needed. Audio uses additional provider credits.';
+  $('speech-note').textContent = state.roles.speech?.engine === 'kokoro' ? 'Built-in Kokoro speech · no extra API key. Generated audio is included in your download. Choose a voice that matches your language.' : state.roles.speech ? `AI-generated speech via ${providerFor(state.roles.speech)?.name} · additional credits apply.` : 'A compatible speech model is needed. Audio uses additional provider credits.';
   $('speech-setup-link').hidden = Boolean(state.roles.speech);
   $('voice-role-note').textContent = state.roles.transcription ? `Send to ${providerFor(state.roles.transcription)?.name} / ${state.roles.transcription.model}. Transcription may use paid credits.` : 'Assign an optional transcription role in AI providers before sending audio.';
   $('transcribe-button').disabled = !usable || !state.roles.transcription || !audioBlob || Boolean(recording);
@@ -150,7 +150,7 @@ function renderRecommendations(result) {
     const name = rolesConfig[item.role].title;
     title.append(box, element('strong', name));
     const selection = item.selection;
-    const selected = selection ? `${selection.engine === 'kokoro' ? 'Server-managed Kokoro' : providerFor(selection)?.name || 'Provider'} / ${selection.model}` : 'No confident choice · keep your current selection';
+    const selected = selection ? `${selection.engine === 'kokoro' ? 'Built-in Kokoro' : providerFor(selection)?.name || 'Provider'} / ${selection.model}` : 'No confident choice · keep your current selection';
     card.append(title, element('p', selected, 'recommend-model'), element('p', item.reason));
     if (item.caveat) card.append(element('p', item.caveat, 'field-hint'));
     const existing = roleDrafts[item.role];
@@ -236,7 +236,7 @@ function renderRoles() {
     const draft = roleDrafts[name]; fields.provider.value = draft?.providerId || ''; fields.api.value = draft?.api || 'auto'; fields.voice.value = draft?.voice || ''; fields.effort.value = draft?.reasoningEffort || 'default'; fields.engine.value = draft?.engine || 'provider';
     card.querySelector('.api-field').hidden = name !== 'primary'; card.querySelector('.effort-field').hidden = name !== 'primary'; card.querySelector('.voice-field').hidden = name !== 'speech'; card.querySelector('.engine-field').hidden = name !== 'speech';
     fields.engine.querySelector('[value="kokoro"]').disabled = !state.speechServices?.kokoro?.available;
-    card.querySelector('.kokoro-hint').textContent = state.speechServices?.kokoro?.available ? 'Kokoro is configured on this LearnLens server. It needs installed model files, and its own voice IDs. No automatic cloud fallback.' : 'To enable offline-capable speech, run a Kokoro OpenAI-compatible service beside LearnLens and set KOKORO_BASE_URL on the server. See README. A hosted app cannot use your phone’s localhost.';
+    card.querySelector('.kokoro-hint').textContent = state.speechServices?.kokoro?.available ? 'Included speech runs on this server. No installation or API key needed. English voice af_heart is the default; voice and language support vary. No automatic cloud fallback.' : 'Built-in speech is unavailable on this server. You can use an online provider or contact the workspace administrator. No learner-side installation is required.';
     function readDraft() {
       if (name === 'speech' && fields.engine.value === 'kokoro') return { engine: 'kokoro', model: state.speechServices.kokoro.model, api: 'auto', voice: fields.voice.value.trim() || state.speechServices.kokoro.voice };
       if (!fields.provider.value) return null;
@@ -262,7 +262,7 @@ function renderRoles() {
       for (const kind of config.kinds) {
         const check = checkOf(role, kind); const badge = element('span', `${kind}: ${check?.status === 'verified' ? 'Verified' : check?.status === 'failed' ? 'Test failed' : 'Untested'}`, 'badge ' + (check?.status === 'verified' ? 'verified' : check?.status === 'failed' ? 'failed' : 'neutral')); badge.title = check?.detail || 'No verified capability test yet.'; checks.append(badge);
       }
-      const help = role?.engine === 'kokoro' ? 'Uses the operator-configured Kokoro /audio/speech endpoint, never the cloud speech provider. Changing voices requires another check. Voice/language support depends on the installed service.' : name === 'primary' ? 'Auto tries Responses, then Chat only for missing endpoints. Thinking levels are model-dependent; Default is safest. Vision checks one synthetic image, not handwriting accuracy.' : name === 'speech' ? 'Requires /audio/speech compatibility. A Realtime-only model will not work here. Voice defaults to alloy; set a voice your provider supports.' : 'Requires /audio/transcriptions. Verification comes from an actual recording, not from a model name.';
+      const help = role?.engine === 'kokoro' ? 'Uses the included Kokoro engine, never the online speech provider. Changing voices requires another check. Listen to judge language coverage and naturalness.' : name === 'primary' ? 'Auto tries Responses, then Chat only for missing endpoints. Thinking levels are model-dependent; Default is safest. Vision checks one synthetic image, not handwriting accuracy.' : name === 'speech' ? 'Requires /audio/speech compatibility. A Realtime-only model will not work here. Voice defaults to alloy; set a voice your provider supports.' : 'Requires /audio/transcriptions. Verification comes from an actual recording, not from a model name.';
       card.querySelector('.role-check-help').textContent = help;
       card.querySelectorAll('.probe-buttons button').forEach(button => button.disabled = !role?.model || (!provider && role?.engine !== 'kokoro') || busy || settingsBusy);
     }
@@ -278,7 +278,7 @@ function renderRoles() {
         const role = readDraft(); if (!role?.model || busy || settingsBusy) return;
         const provider = providerFor(role);
         const local = role.engine === 'kokoro';
-        if (!await confirmAction({ title: `Run a ${kind} capability test?`, description: local ? 'Generate a short synthetic clip using the server-managed Kokoro service. No lesson material is included and there is no automatic cloud fallback.' : 'This sends a synthetic request to your selected provider. It may use paid credits; higher thinking levels can increase cost. No learning material is included.', detail: `${local ? 'Server-managed Kokoro' : provider.name} · ${role.model}${kind === 'speech' ? ' · voice: ' + role.voice : ''}`, paid: !local, accept: local ? 'Test Kokoro' : 'Run paid test' })) return;
+        if (!await confirmAction({ title: `Run a ${kind} capability test?`, description: local ? 'Generate a short synthetic clip using built-in speech. No lesson material is included and no cloud speech provider will be called.' : 'This sends a synthetic request to your selected provider. It may use paid credits; higher thinking levels can increase cost. No learning material is included.', detail: `${local ? 'Built-in Kokoro' : provider.name} · ${role.model}${kind === 'speech' ? ' · voice: ' + role.voice : ''}`, paid: !local, accept: local ? 'Test Kokoro' : 'Run paid test' })) return;
         settingsBusy = true; updateStatus(); refreshChecks(); message(card.querySelector('.role-feedback'), 'Testing this capability…');
         try { const result = await api(local ? '/speech/kokoro/probe' : `/providers/${provider.id}/probe`, { method: 'POST', body: { ...role, kind, consent: true } }); await refreshState(false); message(card.querySelector('.role-feedback'), result.check.detail, result.check.status === 'failed' ? 'error' : ''); }
         catch (error) { message(card.querySelector('.role-feedback'), error.message, 'error'); }

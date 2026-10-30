@@ -1,0 +1,23 @@
+name: Bundled speech verification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app with included speech model
+        run: docker build --progress=plain -t learnlens-bundled:test .
+      - name: Start with all external networking disabled
+        run: docker run -d --name learnlens-offline --network none -e HOST=127.0.0.1 learnlens-bundled:test
+      - name: Test built-in default and real offline speech
+        run: docker exec learnlens-offline node deploy/container-smoke.mjs
+      - name: Container logs
+        if: always()
+        run: docker logs learnlens-offline || true
+      - name: Stop test container
+        if: always()
+        run: docker rm -f learnlens-offline || true

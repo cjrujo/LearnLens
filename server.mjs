@@ -51,7 +51,9 @@ function roleFor(session, value, name) {
   if (!value || typeof value !== 'object') throw new AppError(`Invalid ${name} role.`);
   if (value.engine === 'kokoro') {
     if (name !== 'speech' || !session.kokoro) throw new AppError('Kokoro is only available for speech when configured by the server operator.');
-    return { engine: 'kokoro', model: session.kokoro.model, api: 'auto', voice: boundedString(value.voice || session.kokoro.voice, 'Voice ID', 200) };
+    const voice = boundedString(value.voice || session.kokoro.voice, 'Voice ID', 200);
+    if (!/^[a-z0-9_]+(?:\+[a-z0-9_]+)*$/i.test(voice)) throw new AppError('Choose a Kokoro voice ID, such as af_heart. Paths, URLs and markup are not voice IDs.');
+    return { engine: 'kokoro', model: session.kokoro.model, api: 'auto', voice };
   }
   if (value.engine && value.engine !== 'provider') throw new AppError('Unknown speech method.');
   const providerId = boundedString(value.providerId, 'Provider ID', 100);
@@ -79,6 +81,8 @@ export function createApp(options = {}) {
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('KOKORO_BASE_URL must be an HTTP(S) API base URL without credentials or query parameters.');
     kokoro = { baseUrl: url.toString().replace(/\/+$/, ''), apiKey: boundedString(options.kokoroApiKey || '', 'Kokoro API key', 4096, false), publicOnly: false, model: boundedString(options.kokoroModel || 'kokoro', 'Kokoro model', 200), voice: boundedString(options.kokoroVoice || 'af_heart', 'Kokoro voice', 200) };
   }
+  const builtInSpeech = Boolean(kokoro && options.kokoroBuiltin);
+  const initialRoles = () => ({ ...emptyRoles(), ...(builtInSpeech ? { speech: { engine: 'kokoro', model: kokoro.model, api: 'auto', voice: kokoro.voice } } : {}) });
   const accessPassword = options.accessPassword || '';
   let publicOrigin = options.publicOrigin || '';
   if (accessPassword && accessPassword.length < 16) throw new Error('Access password must contain at least 16 characters.');
@@ -129,7 +133,7 @@ export function createApp(options = {}) {
             else throw new AppError('Server session capacity reached. Please try again later.', 503);
           }
           const id = randomBytes(32).toString('hex');
-          session = { id, token: randomBytes(32).toString('hex'), authorized: !accessPassword, providers: new Map(), roles: emptyRoles(), created: Date.now(), touched: Date.now(), busy: false, failures: 0, nextLogin: 0, revision: 0, setupRevision: 0, kokoro, kokoroChecks: Object.create(null) };
+          session = { id, token: randomBytes(32).toString('hex'), authorized: !accessPassword, providers: new Map(), roles: initialRoles(), created: Date.now(), touched: Date.now(), busy: false, failures: 0, nextLogin: 0, revision: 0, setupRevision: 0, kokoro, kokoroChecks: Object.create(null) };
           sessions.set(id, session);
         }
         session.touched = Date.now();
@@ -148,7 +152,7 @@ export function createApp(options = {}) {
       };
       const readBody = async () => { const body = await bodyJson(request); ensureCurrent(); return body; };
       if (request.method === 'GET' && path === '/api/state') {
-        json(response, 200, { locked: !session.authorized, providers: session.authorized ? [...session.providers.values()].map(publicProvider) : [], roles: session.authorized ? session.roles : emptyRoles(), starter: session.authorized ? starterPrimary([...session.providers.values()]) : null, speechServices: { kokoro: { available: Boolean(kokoro), model: kokoro?.model || 'kokoro', voice: kokoro?.voice || 'af_heart', checks: session.authorized ? session.kokoroChecks : {} } } }); return;
+        json(response, 200, { locked: !session.authorized, providers: session.authorized ? [...session.providers.values()].map(publicProvider) : [], roles: session.authorized ? session.roles : emptyRoles(), starter: session.authorized ? starterPrimary([...session.providers.values()]) : null, speechServices: { kokoro: { available: Boolean(kokoro), bundled: builtInSpeech, model: kokoro?.model || 'kokoro', voice: kokoro?.voice || 'af_heart', checks: session.authorized ? session.kokoroChecks : {} } } }); return;
       }
       if (request.method === 'POST' && path === '/api/login') {
         const { password } = await readBody();
@@ -160,7 +164,7 @@ export function createApp(options = {}) {
       if (request.method === 'POST' && path === '/api/logout') {
         await readBody();
         session.revision++;
-        session.providers.clear(); session.roles = emptyRoles(); session.kokoroChecks = Object.create(null); session.setupRevision++; session.authorized = !accessPassword;
+        session.providers.clear(); session.roles = initialRoles(); session.kokoroChecks = Object.create(null); session.setupRevision++; session.authorized = !accessPassword;
         json(response, 200, { ok: true }); return;
       }
       if (!session.authorized) throw new AppError('Enter the LearnLens access password first.', 401);
@@ -338,6 +342,6 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   const host = process.env.HOST || '127.0.0.1';
   const port = Number(process.env.PORT || 3210);
   if (!['127.0.0.1', 'localhost', '::1'].includes(host) && (!process.env.PUBLIC_ORIGIN || !process.env.LEARNLENS_ACCESS_PASSWORD)) throw new Error('Remote binding requires HTTPS PUBLIC_ORIGIN and LEARNLENS_ACCESS_PASSWORD. See README.md for hosting.');
-  const { server } = createApp({ accessPassword: process.env.LEARNLENS_ACCESS_PASSWORD, publicOrigin: process.env.PUBLIC_ORIGIN, kokoroBaseUrl: process.env.KOKORO_BASE_URL, kokoroApiKey: process.env.KOKORO_API_KEY, kokoroModel: process.env.KOKORO_MODEL, kokoroVoice: process.env.KOKORO_VOICE });
+  const { server } = createApp({ accessPassword: process.env.LEARNLENS_ACCESS_PASSWORD, publicOrigin: process.env.PUBLIC_ORIGIN, kokoroBaseUrl: process.env.KOKORO_BASE_URL, kokoroApiKey: process.env.KOKORO_API_KEY, kokoroModel: process.env.KOKORO_MODEL, kokoroVoice: process.env.KOKORO_VOICE, kokoroBuiltin: process.env.KOKORO_BUILTIN === '1' });
   server.listen(port, host, () => console.log(`LearnLens ready at ${process.env.PUBLIC_ORIGIN || `http://${host}:${port}`}\nAPI keys stay in isolated, expiring browser sessions. Press Ctrl+C to stop.`));
 }

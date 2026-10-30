@@ -9,7 +9,7 @@ npm test
 npm run check
 ```
 
-Latest local result: **37/37 tests passed**; server, adapter, schema, renderer and frontend syntax checks passed.
+Latest local result: **40/40 tests passed**; server, adapter, schema, renderer and frontend syntax checks passed.
 
 Coverage includes browser-session isolation, secret redaction, model discovery versus explicit paid probes, Responses/Chat request formats, narrow fallback rules, valid/invalid image input, body/media limits, missing/failed speech, transcription multipart encoding, untrusted output escaping, export CSP, authorization/CSRF, public IP policy, and hosted configuration guards. Additional setup tests cover reasoning fields/omission for both APIs, unsupported-effort failure without downgrade, recommendation consent/privacy/scope/candidate validation, no silent role saving, provider-edit key transfer protection, and managed Kokoro authorization/routing/failures.
 
@@ -48,7 +48,7 @@ Verified:
 - Three role assignments and explicitly consented vision probe.
 - Screenshot and Markdown uploads, consented audio-file transcription into editable notes.
 - Lesson generation with embedded source image and a WAV test clip.
-- Switching from provider speech to server-managed Kokoro, voice default, explicit local probe, and synthesis routing without a cloud fallback. Both speech services are mocks.
+- Built-in speech preselected before any learner configuration, optional switch to online speech and back, voice default, explicit local probe, and routing without a cloud fallback. Browser-level speech services are mocks.
 - Actual Download HTML action; downloaded bytes equal the preview document.
 - Provider failure keeps the draft and allows reopening the preceding lesson.
 - Password-gate login and session clearing.
@@ -57,12 +57,16 @@ Verified:
 
 Screenshots and downloaded files are under `artifacts/` (git-ignored). Browser fixtures are in `tests/browser-fixtures.mjs`; the test audio is an artificial tone, **not natural-voice narration**.
 
+## Real bundled speech container
+
+`.github/workflows/bundled-speech.yml` is a manually triggered packaging check. It builds the complete image, starts it with `--network none`, exercises the included default speech role and probe, synthesizes a real English MP3 clip, and verifies embedding in HTML. Docker is unavailable on the local Windows machine; the remote workflow outcome will be recorded after verification.
+
 ## Not yet verified
 
-- Real providers or a real Kokoro installation, actual model availability/cost, educational accuracy, handwriting/equation comprehension, and natural speech quality in requested languages.
+- Real cloud providers, actual model availability/cost, educational accuracy, handwriting/equation comprehension, and natural speech quality in requested languages.
 - Real microphone hardware/permission behavior. Audio-file upload/transcription is browser-tested; MediaRecorder capture and cleanup need physical-device testing.
 - Safari/iOS, Android browsers, Firefox and physical tablets. Responsive emulation is not a claim of universal device compatibility. Opening local HTML varies by mobile OS; some file previews do not run JavaScript.
-- End-to-end public HTTPS/reverse-proxy deployment, production DNS/TLS networking, Docker image build, multi-instance operation, load testing, and a full independent security/accessibility audit.
+- End-to-end public HTTPS/reverse-proxy deployment, production DNS/TLS networking, multi-instance operation, load testing, and a full independent security/accessibility audit.
 - PDF/Office document extraction, advanced typeset mathematics, generated diagrams, live voice and pronunciation scoring (not implemented).
 
 The hosted tests simulate the proxy’s Host/Origin headers and inspect secure-cookie behavior; they do not establish that a real domain or TLS deployment is running.
