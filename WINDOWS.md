@@ -2,7 +2,7 @@
 
 ## First setup
 
-1. Install **Node.js 22.x (22.9 or newer)** and Git if absent. Use the x64 build on an x64 PC. No Python, Docker, GPU or separate eSpeak installation is needed.
+1. Install **Node.js 22.x (22.13 or newer)** and Git if absent. Use the x64 build on an x64 PC. No Python, Docker, GPU or separate eSpeak installation is needed.
 2. Open PowerShell in a directory where you keep projects:
 
    ```powershell

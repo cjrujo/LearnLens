@@ -1,13 +1,18 @@
+import { MaterialWorkspace } from './materials.js';
+
 const $ = id => document.getElementById(id);
 const $$ = selector => [...document.querySelectorAll(selector)];
 const token = document.querySelector('meta[name="learnlens-token"]').content;
 const EMPTY = { primary: null, transcription: null, speech: null };
 let state = { providers: [], roles: { ...EMPTY }, locked: false };
 let ready = false, busy = false, settingsBusy = false, page = 'lesson';
-let images = [], currentLesson = null, downloadUrl = '', lastRequest = null, clock = null;
+let currentLesson = null, downloadUrl = '', lastRequest = null, clock = null;
 let roleDrafts = { ...EMPTY }, roleViews = {};
 let editingProviderId = null, recommendations = null;
-let recording = null, micStream = null, recordTimer = null, audioBlob = null, audioUrl = '', audioName = '';
+let recording = null, micStream = null, recordTimer = null, micPending = false;
+let sessionEpoch = 0, confirming = false, generationController = null;
+const materials = new MaterialWorkspace({ list: $('material-list'), api, changed: () => updateStatus() });
+function cancelWork(session = false) { sessionEpoch++; generationController?.abort(); materials.cancelPending({ session }); }
 let toastTimer;
 
 function element(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; }
@@ -28,13 +33,17 @@ function checkOf(role, kind) {
 async function api(path, options = {}) {
   let response;
   try {
-    response = await fetch('/api' + path, { ...options, headers: { 'X-LearnLens-Token': token, ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers }, credentials: 'same-origin', cache: 'no-store', body: options.body ? JSON.stringify(options.body) : undefined });
-  } catch { throw new Error('Could not reach LearnLens. Check your connection and try again. A request already sent to an AI provider may still incur charges.'); }
+    response = await fetch('/api' + path, { ...options, headers: { 'X-LearnLens-Token': token, ...(options.raw ? { 'Content-Type': 'application/octet-stream' } : options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers }, credentials: 'same-origin', cache: 'no-store', body: options.raw || (options.body ? JSON.stringify(options.body) : undefined) });
+  } catch (cause) { if (cause.name === 'AbortError') throw cause; const error = new Error('Could not reach LearnLens. Check your connection. An AI request already sent may still incur charges; it will not be retried automatically.'); error.network = true; throw error; }
   let result;
-  try { result = await response.json(); } catch { throw new Error('LearnLens returned an unreadable response. Check the server connection.'); }
+  try { result = await response.json(); } catch (cause) { if (cause.name === 'AbortError') throw cause; const error = new Error('LearnLens returned an unreadable response. Check the server connection.'); error.network = cause instanceof TypeError; throw error; }
   if (!response.ok) {
-    if ([401, 403].includes(response.status) && /expired|token|reload|session changed/i.test(result.error || '')) {
-      ready = false; $('connection-banner').hidden = false; $('connection-message').textContent = 'Your session changed or expired. Download your lesson or copy your draft before reloading.'; $('reload-session').hidden = false; updateStatus();
+    if (response.status === 409 && ['/transcribe', '/materials/summarize', '/lessons'].includes(path)) {
+      ready = false; cancelWork();
+      $('connection-banner').hidden = false; $('connection-message').textContent = 'AI setup changed after confirmation. Processing stopped without switching providers. Refresh setup, then confirm again; your completed draft work remains intact.';
+    }
+    if ([401, 403].includes(response.status)) {
+      cancelWork(true); ready = false; $('connection-banner').hidden = false; $('connection-message').textContent = 'Your session changed or expired. Download your lesson or copy your draft before reloading.'; $('reload-session').hidden = false; updateStatus();
     }
     const error = new Error(result.error || `Request failed (HTTP ${response.status}).`); error.status = response.status; throw error;
   }
@@ -70,17 +79,27 @@ function updateStatus() {
   $('saved-role-count').textContent = assigned;
   $('setup-label').textContent = !ready ? 'Connection unavailable' : state.locked ? 'Unlock workspace' : state.roles.primary ? 'AI setup ready' : 'Connect your AI';
   $('setup-dot').classList.toggle('pending', !state.roles.primary);
-  $('clear-session').disabled = !ready || busy || settingsBusy || Boolean(recording);
-  const usable = ready && !state.locked && !busy && !settingsBusy;
-  $('generate-button').disabled = !usable;
-  $('generate-label').textContent = busy ? 'Creating lesson…' : state.roles.primary ? 'Create my lesson' : 'Connect a primary model';
+  $('clear-session').disabled = !ready || settingsBusy || Boolean(recording) || micPending || confirming;
+  const usable = ready && !state.locked && !busy && !settingsBusy && !confirming && !materials.busy && !micPending;
+  const editable = usable && !recording;
+  $('retry-preview').disabled = !editable;
+  materials.setLocked(busy || settingsBusy || confirming || !ready || state.locked || Boolean(recording) || micPending);
+  $('dropzone').disabled = !editable; $('material-input').disabled = !editable;
+  $('learning-goal').disabled = !editable;
+  for (const id of ['subject', 'level', 'language']) $(id).disabled = !editable;
+  $('custom-subject').disabled = !editable || $('subject').value !== 'custom';
+  $('custom-language').disabled = !editable || $('language').value !== 'custom';
+  $$('[data-goal]').forEach(button => button.disabled = !editable);
+  $('material-list').setAttribute('aria-busy', String(materials.busy));
+  $('import-status').hidden = !materials.busy;
+  $('import-status').textContent = materials.busy ? materials.items.find(item => item.status === 'preparing')?.progress || 'Preparing local material previews… No AI request.' : '';
+  $('generate-button').disabled = !editable;
+  $('generate-label').textContent = busy ? 'Creating lesson…' : materials.busy ? 'Preparing materials locally…' : state.roles.primary ? 'Create my lesson' : 'Connect a primary model';
   $('generation-helper').textContent = state.roles.primary ? `Using ${state.roles.primary.model}` : 'One primary model is all you need to start.';
   $('include-audio').disabled = !state.roles.speech || !usable;
   if (!state.roles.speech) $('include-audio').checked = false;
   $('speech-note').textContent = state.roles.speech?.engine === 'kokoro' ? 'Built-in Kokoro speech · no extra API key. Generated audio is included in your download. Choose a voice that matches your language.' : state.roles.speech ? `AI-generated speech via ${providerFor(state.roles.speech)?.name} · additional credits apply.` : 'A compatible speech model is needed. Audio uses additional provider credits.';
   $('speech-setup-link').hidden = Boolean(state.roles.speech);
-  $('voice-role-note').textContent = state.roles.transcription ? `Send to ${providerFor(state.roles.transcription)?.name} / ${state.roles.transcription.model}. Transcription may use paid credits.` : 'Assign an optional transcription role in AI providers before sending audio.';
-  $('transcribe-button').disabled = !usable || !state.roles.transcription || !audioBlob || Boolean(recording);
   $('provider-fields').disabled = !usable;
   $$('.provider-remove,.provider-edit,.discover-button').forEach(button => button.disabled = !usable);
   $('roles-fields').disabled = !usable;
@@ -88,7 +107,6 @@ function updateStatus() {
   $('settings-lock-note').hidden = !busy;
   $$('[data-action="demo"]').forEach(button => button.disabled = !usable);
   $('record-button').disabled = (!usable && !recording) || !navigator.mediaDevices?.getUserMedia || !window.MediaRecorder;
-  $('audio-upload-button').disabled = !usable || Boolean(recording);
   for (const id of ['mini-roles', 'setup-role-list']) {
     const root = $(id); root.replaceChildren();
     for (const [key, label] of [['primary', 'Lesson model'], ['transcription', 'Voice input'], ['speech', 'Spoken examples']]) {
@@ -102,15 +120,13 @@ function updateStatus() {
   updateSummary();
 }
 function updateSummary() {
-  const text = $('material-text').value;
-  $('text-count').textContent = `${text.length.toLocaleString()} / 40,000`;
-  $('summary-material').textContent = [images.length ? `${images.length} image${images.length === 1 ? '' : 's'}` : '', text.trim() ? 'Text / question' : ''].filter(Boolean).join(' + ') || 'Nothing added yet';
+  $('summary-material').textContent = materials.items.length ? `${materials.items.length} attachment(s) · ${materials.partCount} automatic part(s)${materials.busy ? ' · preparing locally' : ''}` : $('learning-goal').value.trim() ? 'Question / instructions only' : 'Nothing added yet';
   $('summary-subject').textContent = chosenSubject() === 'Auto' ? 'Auto-detect' : chosenSubject() || 'Choose a subject';
   $('summary-level').textContent = $('level').value === 'Auto' ? 'Match the material' : $('level').value;
   $('summary-language').textContent = chosenLanguage() || 'Choose a language';
   $('summary-audio').textContent = $('include-audio').checked ? 'Natural AI voice' : 'Text-only lesson';
   $('summary-goal').textContent = $('learning-goal').value.trim() || 'Let the material guide the lesson.';
-  $('vision-warning').hidden = !images.length || !state.roles.primary || checkOf(state.roles.primary, 'vision')?.status === 'verified';
+  $('vision-warning').hidden = !materials.hasVisuals || !state.roles.primary || checkOf(state.roles.primary, 'vision')?.status === 'verified';
   $('vision-warning-text').textContent = 'Image understanding is unverified for your primary model. You can run an optional paid vision test, or generate and carefully check the result.';
 }
 
@@ -290,48 +306,40 @@ function renderRoles() {
   }
 }
 
-function dataUrl(blob) { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onerror = () => reject(new Error('Could not read the selected file.')); reader.onload = () => resolve(reader.result); reader.readAsDataURL(blob); }); }
 async function addFiles(files) {
-  if (busy) { message('upload-message', 'Wait for generation to finish before changing the attached images.', 'warning'); return; }
-  const issues = [];
-  for (const file of files) {
-    try {
-      if (/\.(txt|md|markdown)$/i.test(file.name)) {
-        if (file.size > 160_000) throw new Error(`${file.name}: text file is too large.`);
-        const next = ($('material-text').value + `\n\n[Source: ${file.name}]\n` + await file.text()).trim();
-        if (next.length > 40_000) throw new Error(`${file.name}: combined text would exceed 40,000 characters.`);
-        $('material-text').value = next; continue;
-      }
-      if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) throw new Error(`${file.name}: use PNG, JPG, WebP, TXT or MD. PDF and Office files are not supported yet.`);
-      if (images.length >= 5) throw new Error('You can attach at most 5 images.');
-      if (file.size > 4 * 1024 * 1024 || images.reduce((sum, image) => sum + image.size, 0) + file.size > 8 * 1024 * 1024) throw new Error('Images must be under 4 MB each and 8 MB combined.');
-      const url = await dataUrl(file); images.push({ name: file.name.slice(0, 180) || 'Screenshot.png', dataUrl: url, size: file.size });
-    } catch (error) { issues.push(error.message); }
-  }
-  renderImages(); updateSummary(); message('upload-message', issues.join(' '), issues.length ? 'error' : '');
-}
-function renderImages() {
-  const list = $('image-list'); list.replaceChildren(); list.hidden = !images.length;
-  images.forEach((image, index) => { const item = element('li'); const img = element('img'); img.src = image.dataUrl; img.alt = image.name; const label = element('p', image.name); label.title = image.name; const button = element('button', undefined, 'icon-button'); button.type = 'button'; button.setAttribute('aria-label', 'Remove ' + image.name); button.append(icon('close')); button.onclick = () => { if (busy) return; images.splice(index, 1); renderImages(); updateSummary(); }; item.append(img, label, button); list.append(item); });
+  if (busy || settingsBusy || confirming || recording || micPending || !ready || state.locked) return;
+  try { const issues = await materials.add(files); message('upload-message', issues.join(' '), issues.length ? 'error' : ''); }
+  catch (error) { if (error.name !== 'AbortError') message('upload-message', error.message, 'error'); }
 }
 
-async function preview(kind, request) {
-  if (busy || settingsBusy || !ready) return;
+async function preview(kind, request, approvedSetup) {
+  if (busy || settingsBusy || materials.busy || confirming || recording || !ready) return;
+  const epoch = sessionEpoch; generationController = new AbortController();
+  const check = () => { if (epoch !== sessionEpoch || generationController.signal.aborted) throw new DOMException('Stopped. Your draft and completed preparation remain on this page.', 'AbortError'); };
   busy = true; lastRequest = { kind, request }; navigate('lesson'); tab('preview'); updateStatus();
   $('preview-empty').hidden = true; $('preview-error').hidden = true; $('preview-result').hidden = true; $('preview-loading').hidden = false;
   $('request-kind').textContent = kind === 'demo' ? 'LOCAL EXAMPLE' : 'CREATING YOUR LESSON';
-  $('progress-title').textContent = kind === 'demo' ? 'Opening the example' : 'Waiting for your AI provider';
-  $('progress-description').textContent = kind === 'demo' ? 'No API key or AI credits are used.' : 'The model is preparing your lesson. Requested audio is generated afterward. Keep this page open; this may take a few minutes.';
+  $('progress-title').textContent = kind === 'demo' ? 'Opening the example' : 'Preparing your materials';
+  $('progress-description').textContent = kind === 'demo' ? 'No AI credits are used.' : 'All automatic parts are processed in order. Successful preparation is cached for retries on this page.';
   const started = Date.now(); const tick = () => $('progress-elapsed').textContent = duration(Math.floor((Date.now() - started) / 1000)) + ' elapsed'; tick(); clock = setInterval(tick, 1000);
   try {
-    const result = kind === 'demo' ? await api('/demo') : await api('/lessons', { method: 'POST', body: request });
-    currentLesson = { ...result, sample: kind === 'demo', sourceDescription: kind === 'demo' ? 'Hand-authored English sample · no uploaded material' : `${request.images.length} source image(s)${request.text ? ' + source text / request' : ''}` };
+    let payload = request;
+    if (kind !== 'demo') {
+      const prepared = await materials.prepare({ consent: true, goal: request.goal, roles: approvedSetup.roles, expectedSetupRevision: approvedSetup.revision, progress: text => { check(); $('progress-title').textContent = text; } });
+      check(); payload = { ...request, ...prepared, consent: true };
+      $('progress-title').textContent = 'Creating the final lesson';
+      $('progress-description').textContent = 'Sending bounded source notes and representative images. Requested spoken examples follow. This may take a few minutes.';
+    }
+    check();
+    const result = kind === 'demo' ? await api('/demo', { signal: generationController.signal }) : await api('/lessons', { method: 'POST', body: payload, signal: generationController.signal });
+    check();
+    currentLesson = { ...result, sample: kind === 'demo', sourceDescription: kind === 'demo' ? 'Hand-authored English sample · no uploaded material' : `${materials.items.length} original attachment(s) · ${materials.partCount} parts processed · ${payload.images.length} representative image(s)` };
     displayLesson(); announce('Your lesson is ready.'); await refreshState(false);
   } catch (error) {
     $('preview-error').hidden = false; $('preview-error-message').textContent = error.message;
-    $('preview-error-note').textContent = 'Your draft is intact. Retrying may create another billable request; upstream work may continue after a connection fails.';
-    $('show-previous').hidden = !currentLesson; announce('Lesson could not be created. Your draft is intact.');
-  } finally { clearInterval(clock); busy = false; $('preview-loading').hidden = true; updateStatus(); }
+    $('preview-error-note').textContent = 'Your attachments, instructions, previous lesson and successful cached preparation remain intact. Retry asks for paid consent and skips cached successes. A failed or unknown AI request may still incur charges.';
+    $('show-previous').hidden = !currentLesson; announce('Processing stopped. Your draft is intact.');
+  } finally { clearInterval(clock); busy = false; generationController = null; $('preview-loading').hidden = true; updateStatus(); }
 }
 function displayLesson() {
   const result = currentLesson; if (!result) return;
@@ -349,55 +357,52 @@ function displayLesson() {
   $('review-note-text').textContent = 'This HTML includes styles, exercises, source images and any successfully generated audio. It needs no internet. Open in a browser rather than a file-manager preview. Review AI explanations and answers.';
 }
 async function generate(event) {
-  event.preventDefault(); message('generation-error');
+  event?.preventDefault(); message('generation-error');
+  if (busy || settingsBusy || confirming || materials.busy || !ready || micPending) return;
   if (!state.roles.primary) { navigate('providers', true); toast('Connect a provider and assign a primary lesson model.'); return; }
   if (recording) { message('generation-error', 'Stop recording before generating a lesson.', 'error'); return; }
-  const request = { text: $('material-text').value.trim(), images: images.map(({ name, dataUrl }) => ({ name, dataUrl })), language: chosenLanguage(), level: $('level').value, subject: chosenSubject(), goal: $('learning-goal').value.trim(), includeAudio: $('include-audio').checked };
-  if (!request.text && !request.images.length) { message('generation-error', 'Add a screenshot, question, or some source text first.', 'error'); $('material-text').focus(); return; }
-  if (!request.language || !request.subject) { message('generation-error', 'Enter your chosen language and subject, or select automatic subject detection.', 'error'); return; }
-  await preview('generate', request);
+  const request = { language: chosenLanguage(), level: $('level').value, subject: chosenSubject(), goal: $('learning-goal').value.trim(), includeAudio: $('include-audio').checked };
+  if (!request.goal && !materials.items.length) { message('generation-error', 'Add material or ask a question in Instructions.', 'error'); $('learning-goal').focus(); return; }
+  if (!request.language || !request.subject) { message('generation-error', 'Enter your chosen language and subject, or choose automatic detection.', 'error'); return; }
+  if (materials.items.some(item => item.status !== 'ready')) { message('generation-error', 'Resume failed local imports before creating the lesson.', 'error'); return; }
+  if (materials.needsTranscription && !state.roles.transcription) { message('generation-error', 'Assign a transcription role in AI providers for your audio or video.', 'error'); return; }
+  if (!Number.isInteger(state.setupRevision)) { message('generation-error', 'Refresh AI setup before confirming: the server did not provide its setup revision.', 'error'); return; }
+  const approvedSetup = { revision: state.setupRevision, roles: structuredClone(state.roles) };
+  request.expectedSetupRevision = approvedSetup.revision;
+  const epoch = sessionEpoch; confirming = true; updateStatus();
+  let consent;
+  try {
+    consent = await confirmAction({ title: 'Process all parts and create your lesson?', description: 'Extracted text and images go to your primary provider; prepared audio parts go to your transcription provider. Originals never go directly to providers. This can make multiple billable calls. AI digests are lossy, not guaranteed verbatim; only representative preview images are embedded. Remove sensitive material before continuing.', detail: materials.describe() + '\nPrimary: ' + approvedSetup.roles.primary.model + (request.includeAudio ? '\nSpoken examples enabled: additional generation calls may apply.' : ''), paid: true, accept: 'Process all parts & create' });
+  } finally { confirming = false; updateStatus(); }
+  if (consent && epoch === sessionEpoch) await preview('generate', request, approvedSetup);
 }
 
-function clearAudio() { if (audioUrl) URL.revokeObjectURL(audioUrl); audioUrl = ''; audioBlob = null; audioName = ''; $('audio-player').removeAttribute('src'); $('audio-review').hidden = true; updateStatus(); }
-function reviewAudio(blob, name) {
-  if (blob.size > 8 * 1024 * 1024) { message('voice-message', 'Recording exceeds 8 MB. Try a shorter recording.', 'error'); return; }
-  clearAudio(); audioBlob = blob; audioName = name; audioUrl = URL.createObjectURL(blob); $('audio-player').src = audioUrl; $('audio-review').hidden = false; $('audio-file-label').textContent = name; $('audio-state').textContent = 'Local only · not sent'; updateStatus();
-}
 async function toggleRecording() {
   if (recording) { recording.stop(); return; }
-  if (busy || settingsBusy) return;
-  message('voice-message');
+  if (busy || settingsBusy || confirming || materials.busy || micPending || !ready || state.locked) return;
+  const epoch = sessionEpoch; micPending = true; updateStatus(); message('voice-message');
   try {
-    $('record-button').disabled = true;
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (epoch !== sessionEpoch) { stream.getTracks().forEach(track => track.stop()); return; }
+    micStream = stream;
     const type = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus'].find(mime => MediaRecorder.isTypeSupported(mime));
-    if (!type) throw new Error('No supported recording format in this browser. Upload an audio file instead.');
-    recording = new MediaRecorder(micStream, { mimeType: type }); const chunks = []; let bytes = 0;
+    if (!type) throw new Error('No supported recording format. Upload an audio file instead.');
+    recording = new MediaRecorder(stream, { mimeType: type }); const chunks = []; let recordingBytes = 0;
     const recorder = recording;
-    recorder.ondataavailable = event => { if (event.data.size) { chunks.push(event.data); bytes += event.data.size; if (bytes > 7.5 * 1024 * 1024 && recorder.state === 'recording') recorder.stop(); } };
+    recorder.ondataavailable = event => { if (event.data.size && epoch === sessionEpoch) { chunks.push(event.data); recordingBytes += event.data.size; if (recordingBytes > 1020 * 1024 * 1024 && recorder.state === 'recording') recorder.stop(); } };
     recorder.onstop = () => {
-      micStream?.getTracks().forEach(track => track.stop()); micStream = null; recording = null; clearInterval(recordTimer);
-      $('record-label').textContent = 'Record notes'; $('recording-time').hidden = true;
-      const mime = type.split(';')[0]; reviewAudio(new Blob(chunks, { type: mime }), `recording.${mime.split('/')[1]}`); updateStatus();
+      stream.getTracks().forEach(track => track.stop()); micStream = null; recording = null; clearInterval(recordTimer);
+      $('record-label').textContent = 'Record material'; $('recording-time').hidden = true; updateStatus();
+      if (epoch === sessionEpoch) {
+        const mime = type.split(';')[0]; const file = new File(chunks, `recording-${Date.now()}.${mime.split('/')[1]}`, { type: mime });
+        addFiles([file]); message('voice-message', 'Recording added as material. Speech is automatically split; transcription requires confirmation when creating.');
+      }
     };
-    recorder.onerror = () => { message('voice-message', 'Recording failed. Please upload an audio file instead.', 'error'); if (recorder.state !== 'inactive') recorder.stop(); micStream?.getTracks().forEach(track => track.stop()); };
-    recorder.start(500); $('record-label').textContent = 'Stop recording'; $('recording-time').hidden = false;
-    const started = Date.now(); recordTimer = setInterval(() => { const seconds = Math.floor((Date.now() - started) / 1000); $('recording-time').textContent = duration(seconds); if (seconds >= 180 && recorder.state === 'recording') recorder.stop(); }, 1000); updateStatus();
-  } catch (error) { micStream?.getTracks().forEach(track => track.stop()); recording = null; micStream = null; message('voice-message', error.name === 'NotAllowedError' ? 'Microphone access was declined. You can upload audio or type your request.' : error.message, 'error'); updateStatus(); }
-}
-async function sendTranscription() {
-  if (!audioBlob || !state.roles.transcription || busy || settingsBusy) return;
-  const role = state.roles.transcription;
-  if (!await confirmAction({ title: 'Transcribe your recording?', description: 'Send this recording to your chosen transcription provider. Check for private information before continuing. You can edit the text before creating a lesson.', detail: `${providerFor(role)?.name} · ${role.model}`, paid: true, accept: 'Send recording' })) return;
-  busy = true; updateStatus(); message('voice-message', 'Transcribing your recording…');
-  try {
-    const result = await api('/transcribe', { method: 'POST', body: { dataUrl: await dataUrl(audioBlob), name: audioName } });
-    const next = ($('material-text').value + '\n\n' + result.text).trim();
-    if (next.length <= 40_000) { $('material-text').value = next; message('voice-message', 'Transcript added to your notes. Please check it before generating.'); }
-    else { $('transcript-overflow').hidden = false; $('transcript-overflow-text').value = result.text; message('voice-message', 'Your notes are full. The transcript is preserved below; copy or shorten it.', 'warning'); }
-    $('audio-state').textContent = 'Transcribed · editable in notes'; await refreshState(false);
-  } catch (error) { message('voice-message', error.message, 'error'); }
-  finally { busy = false; updateStatus(); }
+    recorder.onerror = () => { message('voice-message', 'Recording failed. Upload an audio file instead.', 'error'); if (recorder.state !== 'inactive') recorder.stop(); stream.getTracks().forEach(track => track.stop()); };
+    recorder.start(1000); $('record-label').textContent = 'Stop recording'; $('recording-time').hidden = false; $('recording-time').textContent = '0:00';
+    const started = Date.now(); recordTimer = setInterval(() => { const seconds = Math.floor((Date.now() - started) / 1000); $('recording-time').textContent = duration(seconds); if (seconds > 0 && seconds % 300 === 0) void api('/state').catch(() => {}); if (seconds >= 14395 && recorder.state === 'recording') recorder.stop(); }, 1000);
+  } catch (error) { micStream?.getTracks().forEach(track => track.stop()); recording = null; micStream = null; message('voice-message', error.name === 'NotAllowedError' ? 'Microphone access was declined. Upload audio or type your request.' : error.message, 'error'); }
+  finally { micPending = false; updateStatus(); }
 }
 
 // Navigation and dialogs.
@@ -406,12 +411,14 @@ $$('[data-action="demo"]').forEach(button => button.onclick = () => preview('dem
 for (const name of ['compose', 'preview']) { $('tab-' + name).onclick = () => tab(name); $('tab-' + name).onkeydown = event => { if (['ArrowLeft', 'ArrowRight'].includes(event.key)) { event.preventDefault(); const next = name === 'compose' ? 'preview' : 'compose'; tab(next); $('tab-' + next).focus(); } }; }
 for (const id of ['empty-back-draft', 'error-back-draft', 'back-to-draft']) $(id).onclick = () => tab('compose');
 $('show-previous').onclick = displayLesson;
-$('retry-preview').onclick = async () => { if (lastRequest && await confirmAction({ title: 'Try this request again?', description: 'Your provider may charge for another attempt. Check the previous error before retrying.', accept: 'Retry' })) preview(lastRequest.kind, lastRequest.request); };
+$('retry-preview').onclick = () => { if (lastRequest?.kind === 'demo') preview('demo'); else generate(); };
+$('stop-processing').onclick = () => cancelWork();
 $('dismiss-toast').onclick = () => $('toast').hidden = true;
 $('retry-state').onclick = () => refreshState();
 $('reload-session').onclick = async () => { if (await confirmAction({ title: 'Reload your session?', description: 'Download any finished lesson and copy your draft first. Reloading clears the current draft.', accept: 'Reload' })) location.reload(); };
 $('clear-session').onclick = async () => {
   if (!await confirmAction({ title: 'Clear this browser’s session?', description: 'Your provider keys and custom model assignments will be removed. Included speech returns to its default where available. Your current draft stays on this page. Already submitted AI requests cannot be undone.', accept: 'Clear session' })) return;
+  cancelWork(true);
   try { await api('/logout', { method: 'POST', body: {} }); resetProviderForm(); await refreshState(); toast('Your provider settings were cleared.'); } catch (error) { toast(error.message); }
 };
 $('login-form').onsubmit = async event => {
@@ -465,25 +472,24 @@ $('roles-form').onsubmit = async event => {
   catch (error) { message('roles-message', error.message, 'error'); }
   finally { settingsBusy = false; updateStatus(); }
 };
-$('dropzone').onclick = () => { if (!busy) $('material-input').click(); };
+$('dropzone').onclick = () => { if (!$('dropzone').disabled) $('material-input').click(); };
 $('material-input').onchange = async event => { await addFiles(event.target.files); event.target.value = ''; };
 for (const type of ['dragenter', 'dragover']) $('dropzone').addEventListener(type, event => { event.preventDefault(); $('dropzone').classList.add('dragover'); });
 for (const type of ['dragleave', 'drop']) $('dropzone').addEventListener(type, event => { event.preventDefault(); $('dropzone').classList.remove('dragover'); if (type === 'drop') addFiles(event.dataTransfer.files); });
 window.addEventListener('dragover', event => event.preventDefault()); window.addEventListener('drop', event => event.preventDefault());
-document.addEventListener('paste', event => { if (page !== 'lesson' || state.locked || $('confirm-dialog').open) return; const files = [...(event.clipboardData?.files || [])].filter(file => file.type.startsWith('image/')); if (files.length) { event.preventDefault(); addFiles(files); } });
+document.addEventListener('paste', event => {
+  if (page !== 'lesson' || state.locked || busy || settingsBusy || confirming || recording || micPending || !ready || $('confirm-dialog').open || event.target.closest('input,textarea,[contenteditable="true"]')) return;
+  const files = [...(event.clipboardData?.files || [])]; const text = event.clipboardData?.getData('text/plain');
+  if (files.length || text?.trim()) { event.preventDefault(); addFiles(files.length ? files : [new File([text], 'Pasted notes.txt', { type: 'text/plain' })]); }
+});
 $('subject').onchange = () => { const custom = $('subject').value === 'custom'; $('custom-subject-field').hidden = !custom; $('custom-subject').disabled = !custom; updateSummary(); };
 $('language').onchange = () => { const custom = $('language').value === 'custom'; $('custom-language-field').hidden = !custom; $('custom-language').disabled = !custom; updateSummary(); };
-for (const id of ['material-text', 'learning-goal', 'custom-language', 'custom-subject', 'level', 'include-audio']) $(id).addEventListener('input', updateSummary);
+for (const id of ['learning-goal', 'custom-language', 'custom-subject', 'level', 'include-audio']) $(id).addEventListener('input', updateSummary);
 $$('[data-goal]').forEach(button => button.onclick = () => { const value = button.dataset.goal; const current = $('learning-goal').value; if (!current.includes(value)) $('learning-goal').value = (current + (current ? '\n' : '') + value).slice(0, 2000); button.setAttribute('aria-pressed', 'true'); updateSummary(); });
 $('lesson-form').onsubmit = generate;
-$('toggle-voice').onclick = () => { $('voice-panel').open = !$('voice-panel').open; $('toggle-voice').setAttribute('aria-expanded', String($('voice-panel').open)); };
-$('voice-panel').ontoggle = () => $('toggle-voice').setAttribute('aria-expanded', String($('voice-panel').open));
-$('record-button').onclick = toggleRecording; $('audio-upload-button').onclick = () => $('audio-input').click(); $('clear-audio').onclick = clearAudio; $('transcribe-button').onclick = sendTranscription;
-$('audio-input').onchange = event => { const file = event.target.files[0]; if (!file) return; const extension = file.name.split('.').pop().toLowerCase(); const mime = { webm: 'audio/webm', wav: 'audio/wav', mp3: 'audio/mpeg', mp4: 'audio/mp4', ogg: 'audio/ogg' }[extension]; if (!mime) message('voice-message', 'Use WebM, WAV, MP3, MP4 or OGG.', 'error'); else reviewAudio(file.slice(0, file.size, mime), file.name); event.target.value = ''; };
-$('insert-transcript').onclick = () => { const next = ($('material-text').value + '\n\n' + $('transcript-overflow-text').value).trim(); if (next.length > 40_000) { message('voice-message', 'Shorten your notes or transcript first.', 'error'); return; } $('material-text').value = next; $('transcript-overflow').hidden = true; updateSummary(); };
-$('copy-transcript').onclick = async () => { try { await navigator.clipboard.writeText($('transcript-overflow-text').value); toast('Transcript copied.'); } catch { $('transcript-overflow-text').select(); toast('Select and copy the transcript manually.'); } };
-window.addEventListener('pagehide', () => { if (recording?.state === 'recording') recording.stop(); micStream?.getTracks().forEach(track => track.stop()); });
-window.addEventListener('beforeunload', event => { if (busy || recording) { event.preventDefault(); event.returnValue = ''; } });
+$('record-button').onclick = toggleRecording;
+window.addEventListener('pagehide', () => { cancelWork(); if (recording?.state === 'recording') recording.stop(); micStream?.getTracks().forEach(track => track.stop()); });
+window.addEventListener('beforeunload', event => { if (busy || recording || materials.busy) { event.preventDefault(); event.returnValue = ''; } });
 if (/Mac|iPhone|iPad/.test(navigator.platform)) $('paste-shortcut').textContent = '⌘ V';
 if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) message('voice-message', 'Recording is unavailable here. Use HTTPS and a supported browser, or upload an audio file.');
 await refreshState();

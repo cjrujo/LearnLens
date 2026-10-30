@@ -2,14 +2,14 @@
 
 ## Automated checks
 
-From the project directory, with Node.js 22+:
+From the project directory, with Node.js 22.13+ (run `npm ci` first):
 
 ```sh
 npm test
 npm run check
 ```
 
-Latest local result: **51/51 tests passed**; server, adapter, schema, renderer and frontend syntax checks passed.
+Latest import release checks: **100 passed, 0 failed, 1 optional media test skipped** in the regular suite. The real managed-media suite separately passed **17/17** with offline caches. Server, adapters, import modules and frontend syntax checks passed.
 
 Coverage includes browser-session isolation, secret redaction, model discovery versus explicit paid probes, Responses/Chat request formats, narrow fallback rules, valid/invalid image input, body/media limits, missing/failed speech, transcription multipart encoding, untrusted output escaping, export CSP, authorization/CSRF, public IP policy, and hosted configuration guards. Additional setup tests cover reasoning fields/omission for both APIs, unsupported-effort failure without downgrade, recommendation consent/privacy/scope/candidate validation, no silent role saving, provider-edit key transfer protection, and managed Kokoro authorization/routing/failures.
 
@@ -46,16 +46,32 @@ Verified:
 - OpenAI preset and editable base URL, provider discovery, catalog-based starter primary.
 - Consented model advisor using the chosen thinking level; suggestions remain unsaved, selected suggestions fill only the draft, and users can modify fields before saving.
 - Three role assignments and explicitly consented vision probe.
-- Screenshot and Markdown uploads, consented audio-file transcription into editable notes.
+- Unified screenshot/Markdown/WAV, five-page PDF, >35k-character DOCX, six-slide PPTX, MP3/MP4/WebM and native browser MediaRecorder input. All pages/parts enter preparation; instructions are never overwritten. No AI calls occur during upload/preview or cancelled consent.
 - Lesson generation with embedded source image and a WAV test clip.
 - Built-in speech preselected before any learner configuration, optional switch to online speech and back, voice default, explicit local probe, and routing without a cloud fallback. Browser-level speech services are mocks.
 - Actual Download HTML action; downloaded bytes equal the preview document.
-- Provider failure keeps the draft and allows reopening the preceding lesson.
+- Provider failure preserves attachments/instructions and the preceding lesson. Explicit retry reuses successful cached paid preparation instead of repeating it.
 - Password-gate login and session clearing.
 - Downloaded file reopened with Chromium networking disabled: answer reveal, decoded audio metadata, 0.5× speed retained through audio reload, audio playback advancing, and no HTTP(S) resource requests.
 - No unexpected JavaScript/CSP/resource errors. The deliberate provider failure emits one expected HTTP 502 console entry.
 
 Screenshots and downloaded files are under `artifacts/` (git-ignored). Browser fixtures are in `tests/browser-fixtures.mjs`; their audio is an artificial tone, **not natural-voice narration**. The optional `LEARNLENS_NATIVE_LESSON=artifacts/native-offline-lesson.html` browser check additionally opens actual native Kokoro output, decodes/plays it with networking disabled, checks all three speeds through media reload and exercises answers. That real-WAV check also passed on Windows/Chromium.
+
+## Real document/media import verification
+
+The regular suite adds malformed provider wire responses/SSE, document signatures/ZIP paths/CRC/expansion/XML limits, actual PDF ranges, Office relationships/order/notes, isolated parser deadlines/cancellation, Unicode splitting, idempotent upload replay, ownership/logout cleanup and paid-digest consent/stale-setup regressions.
+
+```sh
+npm run setup:media
+LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1 npm run test:media
+LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1 npm run test:browser
+```
+
+PowerShell: set those environment variables with `$env:NAME='1'` before the npm command. The browser script can serve a staged coherent UI using `LEARNLENS_TEST_UI=artifacts/import-ui`; normally it tests `public/`.
+
+Main-agent Windows rerun passed the full staged browser suite with real MP3/MP4/WebM/PDF/DOCX/PPTX on 2026-10-31 (UTC+8). A 251.25-second synthetic MP3 yielded 0–180 and 180–251.25 segments with exactly 251.25 seconds of decoded audio. The native MediaRecorder fixture is a one-second oscillator, not microphone audio. Silent video works without a transcription role. Full media extraction does not call any provider; teaching/transcription integration uses loopback fixtures only.
+
+`.github/workflows/material-imports.yml` provides separate Windows/Linux real-engine checks; Linux uses an OS network namespace after cache preparation. Import-release Linux results are recorded after that workflow completes; prior speech CI does not verify the new media engine. Local evidence: `artifacts/import-browser-recovery.log`, `artifacts/native-media-verified.log`.
 
 ## Docker-free native speech
 
@@ -74,9 +90,9 @@ Evidence: image build synthesized a 142,774-byte WAV while populating caches. Wi
 ## Not yet verified
 
 - Real cloud providers, actual model availability/cost, educational accuracy, handwriting/equation comprehension, and natural speech quality in requested languages.
-- Real microphone hardware/permission behavior. Audio-file upload/transcription is browser-tested; MediaRecorder capture and cleanup need physical-device testing.
+- Real microphone hardware/permission behavior. Native MediaRecorder was exercised using an oscillator-backed stream without microphone permission; physical-device behavior remains unverified.
 - Safari/iOS, Android browsers, Firefox and physical tablets. Responsive emulation is not a claim of universal device compatibility. Opening local HTML varies by mobile OS; some file previews do not run JavaScript.
 - End-to-end public HTTPS/reverse-proxy deployment, production DNS/TLS networking, multi-instance operation, load testing, and a full independent security/accessibility audit.
-- PDF/Office document extraction, advanced typeset mathematics, generated diagrams, live voice and pronunciation scoring (not implemented).
+- Full Office visual/layout rendering, advanced typeset mathematics, generated diagrams, live voice and pronunciation scoring. Import fixtures do not establish correctness for every document/codec.
 
 The hosted tests simulate the proxy’s Host/Origin headers and inspect secure-cookie behavior; they do not establish that a real domain or TLS deployment is running.

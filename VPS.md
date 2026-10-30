@@ -5,7 +5,7 @@ Native Node/ONNX speech, no Docker. This is a **prospective runbook**, not a ver
 ## 1. Prerequisites
 
 - A non-root account, a trusted LearnLens checkout (examples use `~/LearnLens`), Git and tmux.
-- Debian/Ubuntu with glibc and native dependency support for your architecture. Use Node.js **22.x, at least 22.9.0**. The project requires Node >=22.9; 22 is the tested major, not a guarantee for every host.
+- Debian/Ubuntu with glibc and native dependency support for your architecture. Use Node.js **22.x, at least 22.13.0**. The project requires Node >=22.13; 22 is the tested major, not a guarantee for every host.
 - Start planning around **2 GB RAM or more** for a small trial. This is an estimate, not a measured minimum or concurrency guarantee. Monitor real memory/CPU usage.
 - Writable disk and network access for project-local npm dependencies, the pinned Q8 model (about **92 MB**) and supporting speech assets/cache. The model size is not the total installation size.
 

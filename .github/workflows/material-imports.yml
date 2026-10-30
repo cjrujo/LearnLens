@@ -1,0 +1,33 @@
+name: Real material imports
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  material-imports:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm audit --omit=dev
+      - run: npm run check
+      - run: npm test
+      - run: npm run setup:media
+      - name: Real Windows media from cache
+        if: runner.os == 'Windows'
+        run: npm run test:media
+        env:
+          LEARNLENS_MEDIA_OFFLINE: '1'
+          LEARNLENS_MEDIA_INTEGRATION: '1'
+      - name: Real Linux media without external networking
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo unshare --net -- bash -c 'ip link set lo up; export LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1; exec "$1" --test tests/native-media.test.mjs tests/material-import.test.mjs' _ "$(command -v node)"

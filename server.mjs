@@ -1,11 +1,14 @@
 import http from 'node:http';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 import { AppError, boundedString, normalizeBaseUrl, publicProvider, discoverModels, generateText, generateSpeech, transcribeAudio, decodeDataUrl, probeImage } from './lib/provider.mjs';
 import { validateLessonInput, lessonPrompt, parseLesson, demoLesson } from './lib/lesson.mjs';
 import { renderLesson, renderScriptHash } from './lib/render.mjs';
+import { documentName, documentBody, importDocument } from './lib/document-import.mjs';
+import { createMaterialStore, UPLOAD_CHUNK_BYTES } from './lib/material-store.mjs';
+import { digestInput, digestPrompt, parseDigest } from './lib/material-digest.mjs';
 import { reasoningEffort, starterPrimary, recommendationCatalog, recommendationPrompt, parseRecommendations } from './lib/setup.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
@@ -99,6 +102,14 @@ export function deploymentConfig(env = process.env) {
 
 export function createApp(options = {}) {
   const sessions = new Map();
+  const materials = createMaterialStore(options.materialStoreOptions);
+  // Snapshot a coherent UI at startup: editing source files cannot break live tabs.
+  const publicDirectory = options.publicDirectory || resolve(root, 'public');
+  const indexHtml = readFileSync(resolve(publicDirectory, 'index.html'), 'utf8');
+  const assets = new Map(['/app.js', '/materials.js', '/media.js', '/styles.css', '/favicon.svg'].flatMap(path => {
+    const file = resolve(publicDirectory, path.slice(1));
+    return existsSync(file) ? [[path, readFileSync(file)]] : [];
+  }));
   // Operator-controlled endpoint only. Never accept a private Kokoro URL from browser input.
   let kokoro = null;
   if (options.kokoroBaseUrl) {
@@ -110,10 +121,10 @@ export function createApp(options = {}) {
   const builtInSpeech = Boolean(kokoro && options.kokoroBuiltin);
   const initialRoles = () => ({ ...emptyRoles(), ...(builtInSpeech ? { speech: { engine: 'kokoro', model: kokoro.model, api: 'auto', voice: kokoro.voice } } : {}) });
   const { accessPassword, publicOrigin } = hostingOptions(options);
-  let activeJobs = 0, loginAttempts = 0, loginWindow = Date.now();
+  let activeJobs = 0, activeImports = 0, loginAttempts = 0, loginWindow = Date.now();
   function prune() {
     const now = Date.now();
-    for (const [id, session] of sessions) if (now - session.touched > SESSION_IDLE_MS || now - session.created > SESSION_MAX_MS) sessions.delete(id);
+    for (const [id, session] of sessions) if (now - session.touched > SESSION_IDLE_MS || now - session.created > SESSION_MAX_MS) { session.importController?.abort(); void materials.clearOwner(id).catch(() => {}); sessions.delete(id); }
   }
   const interval = setInterval(prune, 60_000).unref();
 
@@ -134,8 +145,8 @@ export function createApp(options = {}) {
       if (request.headers['sec-fetch-site'] === 'cross-site') throw new AppError('Cross-site requests are not allowed.', 403);
       const url = new URL(request.url, origin);
       const path = url.pathname;
-      if (request.method === 'GET' && ['/app.js', '/styles.css', '/favicon.svg'].includes(path)) {
-        const content = await readFile(resolve(root, 'public', path.slice(1)));
+      if (request.method === 'GET' && assets.has(path)) {
+        const content = assets.get(path);
         response.setHeader('Content-Type', path.endsWith('.js') ? 'text/javascript; charset=utf-8' : path.endsWith('.css') ? 'text/css; charset=utf-8' : 'image/svg+xml');
         response.end(content); return;
       }
@@ -156,9 +167,8 @@ export function createApp(options = {}) {
         }
         session.touched = Date.now();
         response.setHeader('Set-Cookie', `learnlens_session=${session.id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${publicOrigin ? '; Secure' : ''}`);
-        const html = await readFile(resolve(root, 'public/index.html'), 'utf8');
         response.setHeader('Content-Type', 'text/html; charset=utf-8');
-        response.end(html.replaceAll('__APP_TOKEN__', session.token)); return;
+        response.end(indexHtml.replaceAll('__APP_TOKEN__', session.token)); return;
       }
       if (!path.startsWith('/api/')) throw new AppError('Not found.', 404);
       if (!session) throw new AppError('Session expired. Reload LearnLens and reconnect your provider.', 401);
@@ -169,8 +179,13 @@ export function createApp(options = {}) {
         if (session.revision !== revision || !sessions.has(session.id)) throw new AppError('Session changed or expired. Reload LearnLens.', 401);
       };
       const readBody = async () => { const body = await bodyJson(request); ensureCurrent(); return body; };
+      const readPaidBody = async () => {
+        const body = await readBody();
+        if (body.expectedSetupRevision !== undefined && body.expectedSetupRevision !== session.setupRevision) throw new AppError('AI settings changed. Review the current providers and confirm again before sending material.', 409);
+        return body;
+      };
       if (request.method === 'GET' && path === '/api/state') {
-        json(response, 200, { locked: !session.authorized, providers: session.authorized ? [...session.providers.values()].map(publicProvider) : [], roles: session.authorized ? session.roles : emptyRoles(), starter: session.authorized ? starterPrimary([...session.providers.values()]) : null, speechServices: { kokoro: { available: Boolean(kokoro), bundled: builtInSpeech, languages: kokoro?.languages || null, voices: kokoro?.voices || null, model: kokoro?.model || 'kokoro', voice: kokoro?.voice || 'af_heart', checks: session.authorized ? session.kokoroChecks : {} } } }); return;
+        json(response, 200, { locked: !session.authorized, setupRevision: session.setupRevision, providers: session.authorized ? [...session.providers.values()].map(publicProvider) : [], roles: session.authorized ? session.roles : emptyRoles(), starter: session.authorized ? starterPrimary([...session.providers.values()]) : null, speechServices: { kokoro: { available: Boolean(kokoro), bundled: builtInSpeech, languages: kokoro?.languages || null, voices: kokoro?.voices || null, model: kokoro?.model || 'kokoro', voice: kokoro?.voice || 'af_heart', checks: session.authorized ? session.kokoroChecks : {} } } }); return;
       }
       if (request.method === 'POST' && path === '/api/login') {
         const { password } = await readBody();
@@ -182,7 +197,9 @@ export function createApp(options = {}) {
       if (request.method === 'POST' && path === '/api/logout') {
         await readBody();
         session.revision++;
+        session.importController?.abort();
         session.providers.clear(); session.roles = initialRoles(); session.kokoroChecks = Object.create(null); session.setupRevision++; session.authorized = !accessPassword;
+        await materials.clearOwner(session.id);
         json(response, 200, { ok: true }); return;
       }
       if (!session.authorized) throw new AppError('Enter the LearnLens access password first.', 401);
@@ -287,8 +304,59 @@ export function createApp(options = {}) {
       if (request.method === 'GET' && path === '/api/demo') {
         json(response, 200, { id: 'sample', title: demoLesson.title, lesson: demoLesson, warnings: demoLesson.warnings, html: renderLesson(demoLesson, { warnings: demoLesson.warnings, sample: true }) }); return;
       }
+      if (request.method === 'POST' && path === '/api/materials') {
+        const body = await readBody(); const result = await materials.create(session.id, body); ensureCurrent();
+        json(response, 201, result); return;
+      }
+      if (request.method === 'POST' && path === '/api/materials/summarize') {
+        const input = digestInput(await readPaidBody()), primary = session.roles.primary;
+        if (!primary) throw new AppError('Assign a primary model before preparing material notes.');
+        await runJob(session, async () => {
+          const result = await generateText(session.providers.get(primary.providerId), primary, { ...digestPrompt(input), maxTokens: 2000 });
+          ensureCurrent(); json(response, 200, parseDigest(result.text));
+        }); return;
+      }
+      const materialPath = /^\/api\/materials\/([a-f0-9-]{36})(?:\/(content|finish|parts))?$/.exec(path);
+      if (materialPath) {
+        const [, id, action] = materialPath;
+        if (request.method === 'GET' && !action) { json(response, 200, materials.status(session.id, id)); return; }
+        if (request.method === 'DELETE' && !action) { await materials.remove(session.id, id); ensureCurrent(); json(response, 200, { ok: true }); return; }
+        if (request.method === 'PUT' && action === 'content') {
+          await runJob(session, async () => {
+            const data = await documentBody(request, undefined, UPLOAD_CHUNK_BYTES); ensureCurrent();
+            const result = await materials.append(session.id, id, Number(url.searchParams.get('offset')), data); ensureCurrent();
+            json(response, 200, result);
+          }); return;
+        }
+        if (request.method === 'POST' && ['finish', 'parts'].includes(action)) {
+          const body = await readBody(); materials.status(session.id, id);
+          if (activeImports >= 2) throw new AppError('Local material processing is busy. Try again shortly.', 503);
+          await runJob(session, async () => {
+            activeImports++;
+            try {
+              const result = action === 'finish' ? await materials.finish(session.id, id) : await materials.part(session.id, id, body.index);
+              ensureCurrent(); json(response, 200, result);
+            } finally { activeImports--; }
+          }); return;
+        }
+      }
+      if (request.method === 'POST' && path === '/api/materials/import') {
+        const { name, extension } = documentName(request.headers['x-learnlens-filename']);
+        if (activeImports >= 2) throw new AppError('Document extraction is busy. Try again shortly.', 503);
+        await runJob(session, async () => {
+          activeImports++;
+          const controller = new AbortController(); session.importController = controller;
+          const cancel = () => { if (!response.writableEnded) controller.abort(); };
+          response.once('close', cancel);
+          try {
+            const buffer = await documentBody(request, controller.signal); ensureCurrent();
+            const result = await importDocument(buffer, extension, { signal: controller.signal }); ensureCurrent();
+            json(response, 200, { name, ...result });
+          } finally { activeImports--; session.importController = null; response.removeListener('close', cancel); }
+        }); return;
+      }
       if (request.method === 'POST' && path === '/api/transcribe') {
-        const body = await readBody();
+        const body = await readPaidBody();
         const role = session.roles.transcription;
         if (!role) throw new AppError('Assign a speech-to-text model in AI providers first.');
         const audio = decodeDataUrl(body.dataUrl, 'audio');
@@ -302,7 +370,7 @@ export function createApp(options = {}) {
         }); return;
       }
       if (request.method === 'POST' && path === '/api/lessons') {
-        const input = validateLessonInput(await readBody());
+        const input = validateLessonInput(await readPaidBody());
         const primary = session.roles.primary, speech = session.roles.speech;
         if (!primary) throw new AppError('Assign a primary lesson model in AI providers first.');
         if (input.includeAudio && !speech) throw new AppError('Assign a speech generation model or turn off lesson audio.');
@@ -312,7 +380,7 @@ export function createApp(options = {}) {
           const output = await generateText(provider, primary, lessonPrompt(input));
           ensureCurrent();
           const lesson = parseLesson(output.text);
-          const warnings = [...lesson.warnings];
+          const warnings = [...input.sourceWarnings, ...lesson.warnings];
           if (input.images.length && (provider.checks[primary.model]?.vision?.status !== 'verified' || provider.checks[primary.model]?.vision?.api !== primary.api || (provider.checks[primary.model]?.vision?.reasoningEffort || 'default') !== (primary.reasoningEffort || 'default'))) warnings.push('Image understanding was not capability-tested. Check that the lesson accurately reflects your screenshots.');
           provider.checks[primary.model] ||= Object.create(null); provider.checks[primary.model].text = check('verified', `Generated a structurally valid lesson using ${output.api}. Factual accuracy still needs review.`, primary);
           const audio = []; let audioBytes = 0;
@@ -352,7 +420,7 @@ export function createApp(options = {}) {
   }
   server.requestTimeout = 30_000;
   server.headersTimeout = 15_000;
-  server.on('close', () => { clearInterval(interval); sessions.clear(); });
+  server.on('close', () => { clearInterval(interval); for (const session of sessions.values()) session.importController?.abort(); sessions.clear(); void materials.close().catch(() => {}); });
   return { server };
 }
 

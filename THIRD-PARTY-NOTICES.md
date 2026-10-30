@@ -1,4 +1,13 @@
-# Speech components and licenses
+# Third-party components and licenses
+
+## Document and managed-media imports
+
+- `pdfjs-dist` **6.4.299**, Apache-2.0, from Mozilla PDF.js: https://github.com/mozilla/pdf.js. Its packaged fonts/CMaps and optional native `@napi-rs/canvas` **1.1.0** (MIT wrapper, upstream component notices also apply) retain their own licenses. Keep npm package licenses and lock integrity.
+- `yauzl` **3.4.0**, MIT: https://github.com/thejoshwolfe/yauzl. `saxes` **6.0.0**, ISC: https://github.com/lddubeau/saxes.
+- Media tools are downloaded directly from **BtbN/FFmpeg-Builds**, not vendored into Git or a LearnLens installer. Pinned release: `autobuild-2026-10-30-13-01`; Windows x64/Linux x64 `ffmpeg-n8.1.3-27-g8dca1586f4-*-lgpl-8.1` archives. Source/build recipes: https://github.com/BtbN/FFmpeg-Builds; FFmpeg source: https://git.ffmpeg.org/ffmpeg.git. `deploy/media-assets.mjs` contains exact release URLs, sizes and SHA-256 pins. The cached Windows archive's LICENSE.txt is **LGPL-3.0**, incorporating GPL-3.0 terms as specified there; do not label the entire binary stack MIT/Apache-only.
+- The original media archive, upstream notices and generated provenance/checksum manifest are retained in `.cache/media/`. The cache is excluded from Git/Docker build context. This is not a certification of redistribution compliance: before distributing a repackaged binary, container with media preloaded, or installer, review corresponding-source, notice and relinking obligations for all included libraries. Upstream release retention is not guaranteed.
+
+See [IMPORTS.md](IMPORTS.md) for platform prerequisites and offline cache preparation.
 
 ## Native Node deployment (default)
 

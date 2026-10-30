@@ -1,9 +1,17 @@
 # The default deployment includes Kokoro, its CPU runtime, model and voice files.
 # Pinned multi-arch Kokoro-FastAPI v0.9.1 image (amd64 + arm64).
 FROM node:22-bookworm-slim AS node-runtime
+WORKDIR /deps
+COPY package.json package-lock.json .npmrc ./
+RUN npm ci --omit=dev
 FROM ghcr.io/remsky/kokoro-fastapi-cpu@sha256:03334df0f6de21df0138d2896f8211c20d1d513bae865e14a695b17d647bc961
+USER root
+# The automatically managed Linux media archive needs tar with xz support.
+RUN apt-get update && apt-get install -y --no-install-recommends tar xz-utils && rm -rf /var/lib/apt/lists/*
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 WORKDIR /learnlens
+COPY --from=node-runtime --chown=1000:1000 /deps/node_modules ./node_modules
+RUN mkdir -p /learnlens/.cache && chown 1000:1000 /learnlens/.cache
 COPY --chown=1000:1000 package.json server.mjs ./
 COPY --chown=1000:1000 lib ./lib
 COPY --chown=1000:1000 public ./public

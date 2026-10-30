@@ -1,16 +1,18 @@
 {
   "name": "learnlens",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Screenshot-first, provider-independent AI tutoring.",
   "engines": {
-    "node": ">=22.9.0"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "start": "node deploy/native-start.mjs",
     "start:lite": "node --env-file-if-exists=.env server.mjs",
     "setup:speech": "node deploy/setup-native.mjs",
+    "setup:media": "node deploy/setup-media.mjs",
+    "test:media": "node --test tests/native-media.test.mjs tests/material-import.test.mjs",
     "test:native": "node tests/native-smoke.mjs",
     "dev": "node --watch deploy/native-start.mjs",
     "test": "node --test tests/*.test.mjs",
@@ -19,7 +21,10 @@
   },
   "dependencies": {
     "@huggingface/transformers": "3.8.1",
-    "kokoro-js": "1.2.1"
+    "kokoro-js": "1.2.1",
+    "pdfjs-dist": "6.4.299",
+    "saxes": "6.0.0",
+    "yauzl": "3.4.0"
   },
   "overrides": {
     "phonemizer": "1.2.1",

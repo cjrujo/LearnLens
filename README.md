@@ -6,7 +6,7 @@ A responsive, bring-your-own-provider web app that turns screenshots, questions 
 
 ## Run locally
 
-Requires **Node.js 22.9 or later**. **Docker is not required:** normal startup manages native Kokoro speech on Windows and Linux. There is no frontend build step. See [WINDOWS.md](WINDOWS.md) for a local PC and [VPS.md](VPS.md) for a Linux VPS with **tmux + HTTPS**.
+Requires **Node.js 22.13 or later**. **Docker is not required:** normal startup manages native Kokoro speech on Windows and Linux. There is no frontend build step. See [WINDOWS.md](WINDOWS.md) for a local PC and [VPS.md](VPS.md) for a Linux VPS with **tmux + HTTPS**.
 
 ```sh
 cd LearnLens
@@ -23,12 +23,13 @@ npm test
 npm run check
 ```
 
-The tests use local mock providers. They do not call paid models or prove the educational quality of a real model. **51 automated tests pass**, plus a Chromium browser smoke suite covering desktop/mobile layouts, provider setup, uploads, transcription, sandboxed preview, real browser download, password gating and offline audio playback. See [TESTING.md](TESTING.md) for reproduction and remaining validation gaps.
+The tests use local mock providers. They do not call paid models or prove the educational quality of a real model. **100 automated tests pass** (one additional opt-in media integration test runs separately), plus a Chromium browser smoke suite covering desktop/mobile layouts, provider setup, uploads, transcription, sandboxed preview, real browser download, password gating and offline audio playback. See [TESTING.md](TESTING.md) for reproduction and remaining validation gaps.
 
-## What works in v0.1
+## What works in v0.2
 
 - Screenshot/photo input: PNG, JPEG, WebP, including clipboard paste and drag/drop.
-- Text, Markdown and TXT material; text/voice learning requests.
+- One unified material area plus one instruction box. Text/Markdown, PDF, DOCX, PPTX, MP3, MP4, WebM, WAV and OGG join screenshots and voice recording.
+- Resumable uploads and automatic document/media segmentation. Large sources become source-labeled preparation notes without asking learners to manually cut ordinary files. See [IMPORTS.md](IMPORTS.md) for processing, limits, privacy and costs.
 - Free-form subjects and AI classification, across primary, junior secondary, high school and college/university. Users can specify subject, level, language and teaching goal.
 - Flexible model-chosen lesson composition: explanations, ordered steps, examples, vocabulary, translations, practice with revealable answers, summaries and objectives.
 - Built-in OpenAI standard preset (`https://api.openai.com/v1`), editable connections, multiple compatible providers and manual model IDs.
@@ -36,8 +37,8 @@ The tests use local mock providers. They do not call paid models or prove the ed
 - Optional primary-model setup advisor: reviewed suggestions with reasons, never silently saved or treated as capability verification.
 - Explicit model listing and opt-in **billable** text, vision and speech capability tests.
 - Separate primary, transcription and speech model roles. Same provider/model may serve several roles when supported.
-- Responses API with narrowly scoped Chat Completions fallback, or explicit endpoint mode.
-- Voice request recording/upload and transcription through `/audio/transcriptions`. Transcribed text is editable before lesson creation.
+- Responses API with narrowly scoped Chat Completions fallback, or explicit endpoint mode. Bounded completed SSE responses and UTF-8 BOMs are handled; malformed, empty and HTML responses get safe, format-specific diagnostics rather than blaming the model.
+- Voice recording and media transcription through `/audio/transcriptions`, after explicit consent. Long recordings are automatically split into independent audio parts; video also contributes sampled stills.
 - Two speech methods: an online/compatible AI provider or the included native Kokoro engine via a private `/audio/speech` adapter. Native speech is English-only and returns WAV; other languages can use a compatible online provider. Successful audio is embedded in the lesson with 1×, 0.75× and 0.5× playback. No browser speech-synthesis fallback. Voice quality depends on provider/model/language; listen to verify.
 - Downloaded HTML includes its own CSS, trusted interaction script, source images and successfully generated audio. No CDN, font download, API connection or API key is required to open it offline.
 - Responsive browser interface; separate in-memory state and credentials for each browser session.
@@ -119,11 +120,11 @@ Before broad public launch: replace the shared password with real authentication
 
 - API keys are write-only and held **only in server memory**. They are not returned by `/api/state`, logged, placed in localStorage or embedded in HTML. The app host necessarily has access to in-memory keys; use a trusted host and limited-scope provider keys.
 - Browser sessions expire after one hour idle or twelve hours total; clear session removes user providers and keys and, in the bundled package, restores the included speech default. Expired sessions require reload/reconfiguration. In-flight provider requests are not undone by clearing a session or closing the browser.
-- Lesson input/output is transient on the server. Exported lessons can contain private original images/text; share them carefully. Provider retention policies still apply.
+- Uploaded originals and prepared parts temporarily use private host OS storage; removal, logout, expiry and normal shutdown clean them up. Hard crashes can leave temporary directories requiring operator/OS cleanup. Keys remain memory-only. Exports can contain private source text/images; share carefully. Provider retention policies still apply.
 - State-changing requests require same-origin checks and an unpredictable session token. API keys never go directly from browser to AI providers after setup.
 - Redirects from providers are not followed. In hosted mode only public HTTPS provider destinations are permitted; all resolved addresses are checked and the selected address is pinned to the outbound TLS connection. User-configured private/local provider access is available only in local mode. The sole hosted exception is the managed internal Kokoro worker (or an explicit advanced operator override); browser input cannot choose or override its private destination.
 - Model content is untrusted. Only validated lesson JSON is rendered; every text value is escaped. Exported files have a restrictive CSP and no network connections. Preview uses a sandboxed iframe without same-origin permission.
-- Inputs are bounded: 40,000 text characters; 5 images at most, 4 MB each / 8 MB combined; recordings at most 8 MB; HTTP request at most 13 MB. Generated audio is capped at 8 lines and 12 MB total embedded audio. One AI job per session, eight across the instance; 200 browser sessions max.
+- The app automatically splits uploads into 4 MB transfers, PDF into three-page ranges, Office text into roughly 20k-character parts, and media into three-minute audio parts. Final model input remains bounded to 40,000 characters and 5 images (4 MB each / 8 MB combined); per-request audio remains at most 8 MB. Host storage/CPU quotas still apply; see [IMPORTS.md](IMPORTS.md). Generated audio is capped at 8 lines and 12 MB. One AI job per session, eight globally, two local processors and 200 sessions max.
 - Natural narration is clearly AI-generated. Transcription does **not** establish pronunciation quality. No phoneme-scoring claims are made.
 
 ## Architecture
@@ -139,7 +140,7 @@ Browser: material + preferences
   → Sandboxed preview + offline download
 ```
 
-The teaching composition is dynamic, but execution is deliberately bounded. The AI chooses section types, order, examples and explanations; it cannot create arbitrary executable workflows. The first version uses one primary generation call, not a separate multi-agent reviewer or a claim of independent factual verification.
+The teaching composition is dynamic, but execution is deliberately bounded. The AI chooses section types, order, examples and explanations; it cannot create arbitrary executable workflows. Small inputs use one final generation call; larger inputs may first use multiple consented transcription/digest calls and hierarchical merging. This is not a separate independent reviewer or factual-verification guarantee. Successful preparation is cached in-page for retries; failed/unknown paid requests are not automatically retried.
 
 ```text
 server.mjs           HTTP/session/security/routes
@@ -155,7 +156,7 @@ API-CONTRACT.md      Endpoint and LessonSpec documentation
 
 ## Next increments
 
-1. PDF, DOCX, PPTX and XLSX extraction with page/slide/sheet provenance. These formats are **not yet accepted**; screenshot the material for now.
+1. XLSX extraction, richer Office visual rendering and better document-layout preservation. PDF/DOCX/PPTX and the requested audio/video formats are now accepted, with documented limitations.
 2. Stronger math typesetting, trusted diagram/plot widgets, and accessibility/localization testing.
 3. Current provider-specific audio adapters (Realtime/Chat audio) behind the same speech-role interface.
 4. Lesson revision and clarification turns, curriculum alignment, calibrated source/answer checking.
