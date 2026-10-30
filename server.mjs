@@ -3,7 +3,7 @@ import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
-import { AppError, boundedString, normalizeBaseUrl, publicProvider, discoverModels, generateText, generateSpeech, transcribeAudio, decodeDataUrl, probeImage } from './lib/provider.mjs';
+import { AppError, boundedString, normalizeBaseUrl, publicProvider, discoverModels, generateText, generateSpeech, transcribeAudio, geminiAudioTarget, decodeDataUrl, probeImage } from './lib/provider.mjs';
 import { validateLessonInput, lessonPrompt, parseLesson, demoLesson } from './lib/lesson.mjs';
 import { renderLesson, renderScriptHash } from './lib/render.mjs';
 import { documentName, documentBody, importDocument } from './lib/document-import.mjs';
@@ -65,8 +65,9 @@ function roleFor(session, value, name) {
   const model = boundedString(value.model, 'Model ID', 200);
   if (/[\r\n]/.test(model)) throw new AppError('Model ID cannot contain newlines.');
   const api = value.api || 'auto';
-  if (!['auto', 'chat', 'responses'].includes(api)) throw new AppError('API mode must be auto, chat, or responses.');
+  if (!['auto', 'chat', 'responses'].includes(api) && !(name === 'transcription' && api === 'gemini')) throw new AppError('API mode must be auto, chat, or responses; gemini is available only for speech-to-text.');
   const role = { providerId, model, api };
+  if (api === 'gemini') role.model = geminiAudioTarget(session.providers.get(providerId), model).model;
   if (value.reasoningEffort !== undefined) {
     if (name !== 'primary') throw new AppError('Thinking level applies only to the primary lesson model.');
     const effort = reasoningEffort(value.reasoningEffort);
@@ -132,7 +133,7 @@ export function createApp(options = {}) {
     const requestId = randomUUID(); let diagnosticContext;
     const context = (stage, provider, role) => {
       const safe = value => typeof value === 'string' && ![provider?.apiKey, accessPassword].filter(Boolean).some(secret => value.includes(secret)) ? value.slice(0, 200) : '[redacted]';
-      diagnosticContext = { stage, provider: safe(provider?.name || 'Configured provider'), model: safe(role?.model), apiMode: stage === 'transcription' ? 'audio/transcriptions' : ['auto', 'chat', 'responses'].includes(role?.api) ? role.api : 'auto', thinking: role?.reasoningEffort || 'default' };
+      diagnosticContext = { stage, provider: safe(provider?.name || 'Configured provider'), model: safe(role?.model), apiMode: stage === 'transcription' ? (role?.api === 'gemini' ? 'gemini.generateContent' : 'audio/transcriptions') : ['auto', 'chat', 'responses'].includes(role?.api) ? role.api : 'auto', thinking: role?.reasoningEffort || 'default' };
     };
     response.setHeader('X-LearnLens-Request-Id', requestId);
     response.setHeader('Cache-Control', 'no-store');
@@ -187,6 +188,7 @@ export function createApp(options = {}) {
       const readBody = async () => { const body = await bodyJson(request); ensureCurrent(); return body; };
       const readPaidBody = async () => {
         const body = await readBody();
+        if (body.consent !== true) throw new AppError('Explicit consent is required before sending material to an AI provider.');
         if (body.expectedSetupRevision !== undefined && body.expectedSetupRevision !== session.setupRevision) throw new AppError('AI settings changed. Review the current providers and confirm again before sending material.', 409);
         return body;
       };
@@ -373,7 +375,7 @@ export function createApp(options = {}) {
         await runJob(session, async () => {
           const text = await transcribeAudio(provider, role, audio, `recording.${extensions[audio.mime]}`);
           ensureCurrent();
-          provider.checks[role.model] ||= Object.create(null); provider.checks[role.model].transcription = check('verified', 'Successfully transcribed a recording. Transcription is not pronunciation scoring.', role);
+          provider.checks[role.model] ||= Object.create(null); provider.checks[role.model].transcription = check('verified', `Successfully transcribed a recording using ${role.api === 'gemini' ? 'Gemini-native audio' : '/audio/transcriptions'}. This is a sample check, not pronunciation scoring or a guarantee for other recordings.`, role);
           json(response, 200, { text });
         }); return;
       }

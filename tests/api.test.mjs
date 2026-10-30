@@ -122,6 +122,8 @@ test('explicit chat uses the fake provider and renders a complete LessonSpec wit
   }));
   const { client, mock, roles } = await configured(t, { api: 'chat', mock: { lesson: spec } });
   const input = lessonInput({ text: 'Unique source marker: 517693. Teach the notes, not a canned lesson.' });
+  for (const consent of [undefined, false, 1, 'true']) rejected(await generate(client, { ...input, consent }), 'Missing explicit lesson consent');
+  assert.equal(mock.calls.length, 0);
   const result = validLesson(await generate(client, input));
   assert.equal(result.lesson.title, hostile, 'The mock model result, not a local placeholder, supplies the lesson.');
   assert.equal(mock.calls.length, 1);
@@ -264,7 +266,9 @@ test('missing speech selection rejects before billing; failing speech keeps the 
 test('transcription uploads decoded audio as multipart with selected model/key and records a real verification', OPTIONS, async (t) => {
   const { client, mock, provider, roles } = await configured(t);
   await setRoles(client, { ...roles, transcription: role(provider, 'manual-transcription-model') });
-  const input = { dataUrl: `data:audio/wav;base64,${WAV.toString('base64')}`, name: 'voice-note.wav' };
+  const input = { dataUrl: `data:audio/wav;base64,${WAV.toString('base64')}`, name: 'voice-note.wav', consent: true };
+  for (const consent of [undefined, false, 1, 'true']) rejected(await client.request('/api/transcribe', { method: 'POST', json: { ...input, consent } }), 'Missing explicit transcription consent');
+  assert.equal(mock.calls.length, 0);
   const result = ok(await client.request('/api/transcribe', { method: 'POST', json: input }));
   assert.equal(result.text, TRANSCRIPT);
   assert.equal(mock.calls.length, 1);
@@ -280,7 +284,7 @@ test('transcription uploads decoded audio as multipart with selected model/key a
 
   mock.calls.length = 0;
   rejected(await client.request('/api/transcribe', {
-    method: 'POST', json: { name: 'not-audio.txt', dataUrl: 'data:text/plain;base64,aGVsbG8=' },
+    method: 'POST', json: { name: 'not-audio.txt', dataUrl: 'data:text/plain;base64,aGVsbG8=', consent: true },
   }), 'Invalid transcription MIME');
   assert.equal(mock.calls.length, 0);
 });

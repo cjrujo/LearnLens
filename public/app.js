@@ -24,9 +24,10 @@ function providerFor(role) { return state.providers.find(p => p.id === role?.pro
 function chosenSubject() { return $('subject').value === 'custom' ? $('custom-subject').value.trim() : 'Auto'; }
 function chosenLanguage() { return $('language').value === 'custom' ? $('custom-language').value.trim() : $('language').value; }
 function duration(seconds) { return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`; }
+function transcriptionMode(role) { return role?.api === 'gemini' ? 'Gemini-native audio (generateContent)' : 'OpenAI multipart (/audio/transcriptions)'; }
 function checkOf(role, kind) {
   const check = role?.engine === 'kokoro' ? state.speechServices?.kokoro?.checks?.[role.voice] : providerFor(role)?.checks?.[role?.model]?.[kind];
-  if (!check || (['text', 'vision'].includes(kind) && (check.api !== role?.api || (check.reasoningEffort || 'default') !== (role?.reasoningEffort || 'default'))) || (kind === 'speech' && check.voice !== (role?.voice || 'alloy'))) return null;
+  if (!check || (['text', 'vision'].includes(kind) && (check.api !== role?.api || (check.reasoningEffort || 'default') !== (role?.reasoningEffort || 'default'))) || (kind === 'speech' && check.voice !== (role?.voice || 'alloy')) || (kind === 'transcription' && (check.api === 'gemini') !== (role?.api === 'gemini'))) return null;
   return check;
 }
 
@@ -79,7 +80,7 @@ function operationStart(path, body) {
   const trace = lessonTrace, role = trace.roles[path === '/transcribe' ? 'transcription' : 'primary'];
   const entry = { number: trace.operations.length + 1, stage: traceStages[path], part: path === '/lessons' ? null : trace.part,
     startedAt: new Date().toISOString(), provider: trace.providers.find(p => p.id === role?.providerId)?.name || 'Configured provider', model: role?.model,
-    apiMode: path === '/transcribe' ? 'audio/transcriptions' : role?.api, thinking: path === '/transcribe' ? undefined : role?.reasoningEffort || 'default',
+    apiMode: path === '/transcribe' ? (role?.api === 'gemini' ? 'gemini.generateContent' : 'audio/transcriptions') : role?.api, thinking: path === '/transcribe' ? undefined : role?.reasoningEffort || 'default',
     appEndpoint: path, status: 'Waiting', input: { textCharacters: body?.text?.length || 0, images: body?.images?.length || 0,
       audioBytesApprox: body?.dataUrl ? Math.floor((body.dataUrl.split(',')[1]?.length || 0) * .75) : 0 } };
   if (trace.operations.length >= 520) trace.operations.shift();
@@ -245,7 +246,7 @@ function renderRecommendations(result) {
     const name = rolesConfig[item.role].title;
     title.append(box, element('strong', name));
     const selection = item.selection;
-    const selected = selection ? `${selection.engine === 'kokoro' ? 'Built-in Kokoro' : providerFor(selection)?.name || 'Provider'} / ${selection.model}` : 'No confident choice · keep your current selection';
+    const selected = selection ? `${selection.engine === 'kokoro' ? 'Built-in Kokoro' : providerFor(selection)?.name || 'Provider'} / ${selection.model}${item.role === 'transcription' ? ' · ' + transcriptionMode(selection) : ''}` : 'No confident choice · keep your current selection';
     card.append(title, element('p', selected, 'recommend-model'), element('p', item.reason));
     if (item.caveat) card.append(element('p', item.caveat, 'field-hint'));
     const existing = roleDrafts[item.role];
@@ -316,7 +317,7 @@ function renderProviders() {
 }
 const rolesConfig = {
   primary: { title: 'Primary lesson model', icon: 'book', description: 'Understands material, identifies subjects, and creates lessons.', kinds: ['text', 'vision'] },
-  transcription: { title: 'Speech-to-text', icon: 'mic', description: 'Turns recorded requests into editable text.', kinds: ['transcription'] },
+  transcription: { title: 'Speech-to-text', icon: 'mic', description: 'Transcribes prepared audio and video segments for your lesson.', kinds: ['transcription'] },
   speech: { title: 'Natural speech', icon: 'headphones', description: 'Creates human-like, AI-generated spoken examples.', kinds: ['speech'] },
 };
 function renderRoles() {
@@ -328,8 +329,12 @@ function renderRoles() {
     const fields = Object.fromEntries(['provider', 'model', 'manual', 'api', 'voice', 'effort', 'engine'].map(key => [key, card.querySelector(`[data-field="${key}"]`)]));
     for (const [key, field] of Object.entries(fields)) { field.id = `role-${name}-${key}`; card.querySelector(`[data-for="${key}"]`).htmlFor = field.id; if (field.tagName === 'INPUT') field.maxLength = 200; }
     for (const provider of state.providers) fields.provider.add(new Option(provider.name, provider.id));
-    const draft = roleDrafts[name]; fields.provider.value = draft?.providerId || ''; fields.api.value = draft?.api || 'auto'; fields.voice.value = draft?.voice || ''; fields.effort.value = draft?.reasoningEffort || 'default'; fields.engine.value = draft?.engine || 'provider';
-    card.querySelector('.api-field').hidden = name !== 'primary'; card.querySelector('.effort-field').hidden = name !== 'primary'; card.querySelector('.voice-field').hidden = name !== 'speech'; card.querySelector('.engine-field').hidden = name !== 'speech';
+    if (name === 'transcription') {
+      fields.api.replaceChildren(new Option('OpenAI multipart', 'auto'), new Option('Gemini-native audio', 'gemini'));
+      card.querySelector('[data-for="api"]').textContent = 'Transcription API';
+    }
+    const draft = roleDrafts[name]; fields.provider.value = draft?.providerId || ''; fields.api.value = name === 'transcription' ? (draft?.api === 'gemini' ? 'gemini' : 'auto') : draft?.api || 'auto'; fields.voice.value = draft?.voice || ''; fields.effort.value = draft?.reasoningEffort || 'default'; fields.engine.value = draft?.engine || 'provider';
+    card.querySelector('.api-field').hidden = !['primary', 'transcription'].includes(name); card.querySelector('.effort-field').hidden = name !== 'primary'; card.querySelector('.voice-field').hidden = name !== 'speech'; card.querySelector('.engine-field').hidden = name !== 'speech';
     fields.engine.querySelector('[value="kokoro"]').disabled = !state.speechServices?.kokoro?.available;
     card.querySelector('.kokoro-hint').textContent = state.speechServices?.kokoro?.available ? (state.speechServices.kokoro.languages?.length === 1 && state.speechServices.kokoro.languages[0] === 'en' ? 'Included native Kokoro supports English (US/UK voices). Default: af_heart. Choose online speech for other languages. No installation, API key or automatic cloud fallback.' : 'Included speech runs on this server. No installation or API key needed. English voice af_heart is the default; voice and language support vary. No automatic cloud fallback.') : 'Built-in speech is unavailable on this server. You can use an online provider or contact the workspace administrator. No learner-side installation is required.';
     function readDraft() {
@@ -357,7 +362,7 @@ function renderRoles() {
       for (const kind of config.kinds) {
         const check = checkOf(role, kind); const badge = element('span', `${kind}: ${check?.status === 'verified' ? 'Verified' : check?.status === 'failed' ? 'Test failed' : 'Untested'}`, 'badge ' + (check?.status === 'verified' ? 'verified' : check?.status === 'failed' ? 'failed' : 'neutral')); badge.title = check?.detail || 'No verified capability test yet.'; checks.append(badge);
       }
-      const help = role?.engine === 'kokoro' ? 'Uses the included Kokoro engine, never the online speech provider. Changing voices requires another check. Listen to judge language coverage and naturalness.' : name === 'primary' ? 'Auto tries Responses, then Chat only for missing endpoints. Thinking levels are model-dependent; Default is safest. Vision checks one synthetic image, not handwriting accuracy.' : name === 'speech' ? 'Requires /audio/speech compatibility. A Realtime-only model will not work here. Voice defaults to alloy; set a voice your provider supports.' : 'Requires /audio/transcriptions. Verification comes from an actual recording, not from a model name.';
+      const help = role?.engine === 'kokoro' ? 'Uses the included Kokoro engine, never the online speech provider. Changing voices requires another check. Listen to judge language coverage and naturalness.' : name === 'primary' ? 'Auto tries Responses, then Chat only for missing endpoints. Thinking levels are model-dependent; Default is safest. Vision checks one synthetic image, not handwriting accuracy.' : name === 'speech' ? 'Requires /audio/speech compatibility. A Realtime-only model will not work here. Voice defaults to alloy; set a voice your provider supports.' : role?.api === 'gemini' ? 'Uses inline WAV audio via models.generateContent on this same provider. A /v1 base becomes /v1beta; native bases are also supported. Gateway audio support needs a real transcription check. No automatic fallback or retry. Primary API mode stays unchanged.' : 'Requires multipart /audio/transcriptions support, not just audio understanding. Gemini-native audio is a separate explicit option; it is never selected from a model name. Verification comes from an actual recording.';
       card.querySelector('.role-check-help').textContent = help;
       card.querySelectorAll('.probe-buttons button').forEach(button => button.disabled = !role?.model || (!provider && role?.engine !== 'kokoro') || busy || settingsBusy);
     }
@@ -456,7 +461,7 @@ async function generate(event) {
   const epoch = sessionEpoch; confirming = true; updateStatus();
   let consent;
   try {
-    consent = await confirmAction({ title: 'Process all parts and create your lesson?', description: 'Extracted text and images go to your primary provider; prepared audio parts go to your transcription provider. Originals never go directly to providers. This can make multiple billable calls. AI digests are lossy, not guaranteed verbatim; only representative preview images are embedded. Remove sensitive material before continuing.', detail: materials.describe() + '\nPrimary: ' + approvedSetup.roles.primary.model + (request.includeAudio ? '\nSpoken examples enabled: additional generation calls may apply.' : ''), paid: true, accept: 'Process all parts & create' });
+    consent = await confirmAction({ title: 'Process all parts and create your lesson?', description: 'Extracted text and images go to your primary provider; prepared audio parts go to your transcription provider. Originals never go directly to providers. This can make multiple billable calls. AI digests are lossy, not guaranteed verbatim; only representative preview images are embedded. Remove sensitive material before continuing.', detail: materials.describe() + '\nPrimary: ' + approvedSetup.roles.primary.model + (materials.needsTranscription ? '\nSpeech-to-text: ' + providerFor(approvedSetup.roles.transcription)?.name + ' / ' + approvedSetup.roles.transcription.model + '\nTranscription API: ' + transcriptionMode(approvedSetup.roles.transcription) : '') + (request.includeAudio ? '\nSpoken examples enabled: additional generation calls may apply.' : ''), paid: true, accept: 'Process all parts & create' });
   } finally { confirming = false; updateStatus(); }
   if (consent && epoch === sessionEpoch) await preview('generate', request, approvedSetup);
 }

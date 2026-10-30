@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { pdf, zip, docxEntries, paragraph, pptxManyEntries } from './document-fixtures.mjs';
 
 export function callKind(call) {
-  if (call.path === '/v1/audio/transcriptions') return 'transcription';
+  if (call.path === '/v1/audio/transcriptions' || /^\/v1beta\/models\/[^/]+:generateContent$/.test(call.path)) return 'transcription';
   if (call.path === '/v1/audio/speech') return 'speech';
   if (call.path !== '/v1/responses') return 'discovery';
   const instructions = call.body?.instructions || '';
@@ -70,7 +70,7 @@ export function createQAProvider() {
     // Retain only synthetic fixture metadata; no request headers, cookies or keys.
     if (call.kind === 'transcription') {
       call.filename = /filename="([^"]+)"/.exec(raw)?.[1];
-      call.model = /name="model"\r\n\r\n([^\r]+)/.exec(raw)?.[1];
+      call.model = /name="model"\r\n\r\n([^\r]+)/.exec(raw)?.[1] || /^\/v1beta\/models\/([^/]+):generateContent$/.exec(req.url)?.[1];
     }
     calls.push(call);
     res.setHeader('Content-Type', 'application/json');
@@ -89,6 +89,7 @@ export function createQAProvider() {
       res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text }] }] }));
     } else if (req.url === '/v1/audio/speech') { res.setHeader('Content-Type', 'audio/wav'); res.end(wav); }
     else if (req.url === '/v1/audio/transcriptions') res.end(JSON.stringify({ text: 'Teach me about Newton’s laws in English.' }));
+    else if (/^\/v1beta\/models\/[^/]+:generateContent$/.test(req.url)) res.end(JSON.stringify({ candidates: [{ finishReason: 'STOP', content: { role: 'model', parts: [{ text: 'Excluded fixture thinking', thought: true }, { text: 'Gemini-native synthetic transcript about Newton’s laws.' }] } }] }));
     else { res.statusCode = 404; res.end('{}'); }
   });
   return { server, config, calls };

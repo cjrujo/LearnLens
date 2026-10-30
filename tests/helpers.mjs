@@ -40,7 +40,7 @@ export function lessonInput(overrides = {}) {
   return {
     text: 'Provided notes: a fraction is an equal part of a whole. One of four parts is 1/4.',
     images: [], language: 'English', level: 'Primary', subject: 'Mathematics',
-    goal: 'Explain equal parts and include one quiz.', includeAudio: false, ...overrides,
+    goal: 'Explain equal parts and include one quiz.', includeAudio: false, consent: true, ...overrides,
   };
 }
 
@@ -245,6 +245,12 @@ export async function mockProvider(t, options = {}) {
       const call = { method: req.method, path: req.url, headers: req.headers, raw, json };
       calls.push(call);
       if (config.beforeResponse) await config.beforeResponse(call);
+      const nativePrefix = config.basePath.replace(/\/v1$/, '/v1beta') + '/models/';
+      if (req.method === 'POST' && req.url.startsWith(nativePrefix) && req.url.endsWith(':generateContent')) {
+        return sendJson(res, config.geminiStatus || 200, Object.hasOwn(config, 'geminiResponse') ? config.geminiResponse : {
+          candidates: [{ content: { role: 'model', parts: [{ text: TRANSCRIPT }] }, finishReason: 'STOP' }],
+        });
+      }
       const route = req.url.slice(config.basePath.length);
       if (!req.url.startsWith(`${config.basePath}/`)) {
         return sendJson(res, 404, { error: { message: `Wrong API prefix: ${req.url}` } });

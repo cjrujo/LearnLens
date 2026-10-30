@@ -65,7 +65,7 @@ test('API distinguishes transcription, source preparation and final lesson failu
   const role = { providerId: provider.id, model: 'fixture-model', api: 'chat' };
   await setRoles(client, { ...EMPTY_ROLES, primary: role, transcription: role });
   for (const [route, body, stage, endpoint] of [
-    ['/api/transcribe', { dataUrl: `data:audio/wav;base64,${WAV.toString('base64')}` }, 'transcription', '/audio/transcriptions'],
+    ['/api/transcribe', { consent: true, dataUrl: `data:audio/wav;base64,${WAV.toString('base64')}` }, 'transcription', '/audio/transcriptions'],
     ['/api/materials/summarize', { consent: true, text: SOURCE, images: [] }, 'source_preparation', '/chat/completions'],
     ['/api/lessons', lessonInput({ text: SOURCE }), 'lesson_generation', '/chat/completions'],
   ]) {

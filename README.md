@@ -23,7 +23,7 @@ npm test
 npm run check
 ```
 
-The tests use local mock providers. They do not call paid models or prove the educational quality of a real model. **100 automated tests pass** (one additional opt-in media integration test runs separately), plus a Chromium browser smoke suite covering desktop/mobile layouts, provider setup, uploads, transcription, sandboxed preview, real browser download, password gating and offline audio playback. See [TESTING.md](TESTING.md) for reproduction and remaining validation gaps.
+The tests use local mock providers. They do not call paid models or prove the educational quality of a real model. **111 automated tests pass** (one additional opt-in media integration test runs separately), plus a Chromium browser smoke suite covering desktop/mobile layouts, provider setup, uploads, transcription, sandboxed preview, real browser download, password gating and offline audio playback. See [TESTING.md](TESTING.md) for reproduction and remaining validation gaps.
 
 ## What works in v0.2
 
@@ -38,7 +38,7 @@ The tests use local mock providers. They do not call paid models or prove the ed
 - Explicit model listing and opt-in **billable** text, vision and speech capability tests.
 - Separate primary, transcription and speech model roles. Same provider/model may serve several roles when supported.
 - Responses API with narrowly scoped Chat Completions fallback, or explicit endpoint mode. Bounded completed SSE responses and UTF-8 BOMs are handled; malformed, empty and HTML responses get safe, format-specific diagnostics rather than blaming the model.
-- Voice recording and media transcription through `/audio/transcriptions`, after explicit consent. Long recordings are automatically split into independent audio parts; video also contributes sampled stills.
+- Voice recording and media transcription through `/audio/transcriptions` or an explicitly selected [Gemini-native audio API](GEMINI-AUDIO.md), after explicit consent. Long recordings are automatically split into independent audio parts; video also contributes sampled stills.
 - Two speech methods: an online/compatible AI provider or the included native Kokoro engine via a private `/audio/speech` adapter. Native speech is English-only and returns WAV; other languages can use a compatible online provider. Successful audio is embedded in the lesson with 1×, 0.75× and 0.5× playback. No browser speech-synthesis fallback. Voice quality depends on provider/model/language; listen to verify.
 - Downloaded HTML includes its own CSS, trusted interaction script, source images and successfully generated audio. No CDN, font download, API connection or API key is required to open it offline.
 - Responsive browser interface; separate in-memory state and credentials for each browser session.
@@ -48,7 +48,7 @@ The tests use local mock providers. They do not call paid models or prove the ed
 | Role | Requirement | When needed |
 |---|---|---|
 | Primary | Text generation and image understanding for screenshots; able to follow a JSON schema prompt | Always |
-| Transcription | OpenAI-compatible multipart `/audio/transcriptions` | Voice input |
+| Transcription | OpenAI multipart `/audio/transcriptions` or explicit Gemini-native `models.generateContent` | Prepared audio input |
 | Speech | OpenAI-compatible `/audio/speech`, binary audio response, a voice supported by the provider | Lesson audio |
 
 That means **one required role and two optional roles**, not necessarily three distinct models. Embeddings, live voice and multi-agent orchestration are not needed for the first document-to-lesson flow.
@@ -59,6 +59,8 @@ That means **one required role and two optional roles**, not necessarily three d
 4. If unsure, click **Use a starter primary** (when available), then **Ask primary to suggest models**. The starter is a transparent catalog-based rule: prefer matching text/vision sample checks, otherwise `gpt-5.4-mini` only if that exact ID is listed. There is no guess for an unknown catalog. The advisor uses your chosen primary model and its thinking level, requires billable-call consent, and only considers listed or already-selected manual model IDs. Review the reasons, check the suggestions you want, copy them into the form, edit anything, and **Save model roles**. Recommendations do not verify capabilities or prices. Default scope shares only the primary provider’s catalog; “All” explicitly shares other connected provider catalogs with the advisor. Keys, base URLs and learning material are excluded.
 5. Optionally run capability tests. Each requires confirmation and may incur a small provider charge. A model ID or successful listing is NOT proof of vision/audio/tools support. A verified badge means only the specific sample operation succeeded, not universal model quality.
 6. Add material, preferences and a goal, then generate. Source material is sent to the selected primary provider. Requested audio scripts go to the selected speech provider. Voice recordings go to the selected transcription provider.
+
+**Gemini audio:** In Speech-to-text, choose **Transcription API → Gemini-native audio**, then save. Your provider/key stay on the same host; a `/v1` base maps to `/v1beta` for audio only. Configure the primary teaching API separately (Aiberm documents Chat Completions for its Gemini model). Local fixture tests pass; actual Aiberm inline-audio forwarding remains unverified. No paid probe or protocol fallback is automatic. See [setup, limits and evidence](GEMINI-AUDIO.md).
 
 **Thinking level:** Default omits the parameter entirely; it is not the same as None. Responses uses `reasoning: { effort }`; Chat uses `reasoning_effort`. Both use output-token limits that include reasoning tokens. More effort can increase latency/cost or exhaust the output budget. Not every model/gateway supports every setting; unsupported requests fail visibly, without silently downgrading effort or retrying against a different endpoint on HTTP 400. Use Default if unsure. Capability badges are scoped to API mode/thinking level (and voice for speech).
 

@@ -9,11 +9,13 @@ npm test
 npm run check
 ```
 
-Latest import release checks: **100 passed, 0 failed, 1 optional media test skipped** in the regular suite. The real material suite separately passed **25/25** (17 media plus 8 staging tests) with offline caches on Windows and Linux. Server, adapters, import modules and frontend syntax checks passed.
+Latest Gemini-audio release checks: **111 passed, 0 failed, 1 optional media test skipped** in the regular suite (112 total). Syntax checks passed for 44 files. Seven native-audio regression groups cover same-origin base/model validation, exact-host auth headers, inline WAV bytes, consent/revision gates, strict completed response parsing, thought exclusion, safe failures without fallback/replay, hosted private-address rejection, and reviewable advisor protocol choices. Both multipart and native transcription require explicit server-side consent; final generation does too. No external provider inference requests were made. The real material suite separately passed **25/25** (17 media plus 8 staging tests) with offline caches on Windows and Linux. Server, adapters, import modules and frontend syntax checks passed.
 
 Coverage includes browser-session isolation, secret redaction, model discovery versus explicit paid probes, Responses/Chat request formats, narrow fallback rules, valid/invalid image input, body/media limits, missing/failed speech, transcription multipart encoding, untrusted output escaping, export CSP, authorization/CSRF, public IP policy, and hosted configuration guards. Additional setup tests cover reasoning fields/omission for both APIs, unsupported-effort failure without downgrade, recommendation consent/privacy/scope/candidate validation, no silent role saving, provider-edit key transfer protection, and managed Kokoro authorization/routing/failures.
 
 Regression tests specifically hold an upload or model response open, clear the session, and verify that stale work cannot repopulate settings, return a lesson, or start subsequent speech calls. A concurrent AI job is rejected before reaching the provider.
+
+Native-audio references and the unverified Aiberm boundary are documented in [GEMINI-AUDIO.md](GEMINI-AUDIO.md). Public endpoint documentation and local fixture passes do **not** establish gateway/token-group audio capability or transcription quality. One initial full-suite run hit the existing one-second bundled-speech child-exit test deadline under load; an unchanged rerun passed. No production deadline was loosened.
 
 ## Browser smoke suite
 
@@ -46,6 +48,7 @@ Verified:
 - OpenAI preset and editable base URL, provider discovery, catalog-based starter primary.
 - Consented model advisor using the chosen thinking level; suggestions remain unsaved, selected suggestions fill only the draft, and users can modify fields before saving.
 - Three role assignments and explicitly consented vision probe.
+- Explicit Gemini-native transcription selector; multipart/native verification and cache separation; saving/cancelled consent sends nothing; renewed consent reuses a completed transcript; native failure keeps the previous lesson/draft without retry or fallback. Primary model/API/thinking remain unchanged. Native setup/help fits 320 px.
 - Unified screenshot/Markdown/WAV, five-page PDF, >35k-character DOCX, six-slide PPTX, MP3/MP4/WebM and native browser MediaRecorder input. All pages/parts enter preparation; instructions are never overwritten. No AI calls occur during upload/preview or cancelled consent.
 - Lesson generation with embedded source image and a WAV test clip.
 - Built-in speech preselected before any learner configuration, optional switch to online speech and back, voice default, explicit local probe, and routing without a cloud fallback. Browser-level speech services are mocks.
@@ -53,7 +56,7 @@ Verified:
 - Provider failure preserves attachments/instructions and the preceding lesson. Explicit retry reuses successful cached paid preparation instead of repeating it.
 - Password-gate login and session clearing.
 - Downloaded file reopened with Chromium networking disabled: answer reveal, decoded audio metadata, 0.5× speed retained through audio reload, audio playback advancing, and no HTTP(S) resource requests.
-- No unexpected JavaScript/CSP/resource errors. The deliberate provider failure emits one expected HTTP 502 console entry.
+- No unexpected JavaScript/CSP/resource errors. Deliberate provider failures emit expected HTTP 502 console entries.
 
 Screenshots and downloaded files are under `artifacts/` (git-ignored). Browser fixtures are in `tests/browser-fixtures.mjs`; their audio is an artificial tone, **not natural-voice narration**. The optional `LEARNLENS_NATIVE_LESSON=artifacts/native-offline-lesson.html` browser check additionally opens actual native Kokoro output, decodes/plays it with networking disabled, checks all three speeds through media reload and exercises answers. That real-WAV check also passed on Windows/Chromium.
 
