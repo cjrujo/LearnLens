@@ -59,7 +59,9 @@ Screenshots and downloaded files are under `artifacts/` (git-ignored). Browser f
 
 ## Real bundled speech container
 
-`.github/workflows/bundled-speech.yml` is a manually triggered packaging check. It builds the complete image, starts it with `--network none`, exercises the included default speech role and probe, synthesizes a real English MP3 clip, and verifies embedding in HTML. Docker is unavailable on the local Windows machine; the remote workflow outcome will be recorded after verification.
+`.github/workflows/bundled-speech.yml` is a manually triggered packaging check. It builds the complete image, starts it with `--network none`, exercises the included default speech role and probe, synthesizes a real English MP3 clip, and verifies embedding in HTML. Docker is unavailable on the local Windows machine, so the real container was verified on GitHub Actions (Linux amd64): **PASS**, [run 41001150719](https://github.com/cjrujo/LearnLens/actions/runs/41001150719), commit `8001cf6`.
+
+Evidence: image build synthesized a 142,774-byte WAV while populating caches. With external networking disabled, the packaged app started, preselected speech without a cloud provider, passed the speech probe, generated a real 61,868-byte MP3 and embedded it in standalone HTML. This proves the packaged English synthesis path, not perceptual naturalness, every voice/language, arm64 execution or public deployment.
 
 ## Not yet verified
 

@@ -411,8 +411,8 @@ $('dismiss-toast').onclick = () => $('toast').hidden = true;
 $('retry-state').onclick = () => refreshState();
 $('reload-session').onclick = async () => { if (await confirmAction({ title: 'Reload your session?', description: 'Download any finished lesson and copy your draft first. Reloading clears the current draft.', accept: 'Reload' })) location.reload(); };
 $('clear-session').onclick = async () => {
-  if (!await confirmAction({ title: 'Clear this browser’s session?', description: 'Provider keys and assigned models will be removed. Your current draft stays on this page. Already submitted AI requests cannot be undone.', accept: 'Clear session' })) return;
-  try { await api('/logout', { method: 'POST', body: {} }); resetProviderForm(); await refreshState(); toast('Provider keys and roles cleared.'); } catch (error) { toast(error.message); }
+  if (!await confirmAction({ title: 'Clear this browser’s session?', description: 'Your provider keys and custom model assignments will be removed. Included speech returns to its default where available. Your current draft stays on this page. Already submitted AI requests cannot be undone.', accept: 'Clear session' })) return;
+  try { await api('/logout', { method: 'POST', body: {} }); resetProviderForm(); await refreshState(); toast('Your provider settings were cleared.'); } catch (error) { toast(error.message); }
 };
 $('login-form').onsubmit = async event => {
   event.preventDefault(); $('login-button').disabled = true; message('login-message');
