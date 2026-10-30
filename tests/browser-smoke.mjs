@@ -27,7 +27,7 @@ const provider = createQAProvider(), kokoro = createQAProvider(), gated = create
 let app;
 try {
   const providerOrigin = await listen(provider.server), kokoroOrigin = await listen(kokoro.server);
-  app = createApp({ kokoroBaseUrl: kokoroOrigin + '/v1', kokoroBuiltin: true }).server;
+  app = createApp({ kokoroBaseUrl: kokoroOrigin + '/v1', kokoroBuiltin: true, kokoroFormat: 'wav', kokoroLanguages: ['en'] }).server;
   const origin = await listen(app), gatedOrigin = await listen(gated);
   ({ browserContextId } = await call('Target.createBrowserContext'));
   await mkdir('artifacts', { recursive: true });
@@ -175,6 +175,28 @@ try {
   const playing = await call('Runtime.evaluate', { expression: 'document.querySelector("audio").play().then(()=>true)', awaitPromise: true, returnByValue: true, userGesture: true }, offline);
   assert.equal(playing.result.value, true, 'Offline audio starts playback');
   await wait(offline, 'document.querySelector("audio").currentTime > 0.1');
+  if (process.env.LEARNLENS_NATIVE_LESSON) {
+    const nativePath = resolve(process.env.LEARNLENS_NATIVE_LESSON);
+    assert.match(await readFile(nativePath, 'utf8'), /data:audio\/wav;base64,/);
+    await call('Page.navigate', { url: pathToFileURL(nativePath).href }, offline);
+    await wait(offline, '!!document.querySelector("audio")');
+    await evaluate(offline, 'document.querySelector("audio").load()');
+    await wait(offline, 'document.querySelector("audio")?.readyState >= 1');
+    assert.ok(await evaluate(offline, 'document.querySelector("audio").duration > 1'), 'Real native speech decodes offline');
+    for (const speed of [1, 0.75, 0.5]) {
+      await evaluate(offline, `document.querySelector('[data-speed="${speed}"]').click();document.querySelector('audio').load()`);
+      await wait(offline, 'document.querySelector("audio").readyState >= 1');
+      assert.equal(await evaluate(offline, 'document.querySelector("audio").playbackRate'), speed);
+    }
+    await evaluate(offline, 'document.querySelector("summary").click()');
+    assert.equal(await evaluate(offline, 'document.querySelector("details").open'), true);
+    const nativePlaying = await call('Runtime.evaluate', { expression: 'document.querySelector("audio").play().then(()=>true)', awaitPromise: true, returnByValue: true, userGesture: true }, offline);
+    assert.equal(nativePlaying.result.value, true);
+    await wait(offline, 'document.querySelector("audio").currentTime > 0.1');
+    assert.deepEqual(await evaluate(offline, 'performance.getEntriesByType("resource").filter(r=>/^https?:/.test(r.name)).map(r=>r.name)'), []);
+    await shot(offline, 'native-offline-lesson.png');
+    console.log('PASS: real native Kokoro WAV decoded and played offline; 1×/0.75×/0.5× rates survive reload; answers work; no HTTP(S) resources.');
+  }
   assert.deepEqual(errors.filter(error => !/Failed to load resource:.*502/.test(error)), [], 'Unexpected browser console/CSP errors');
   console.log('PASS: 1440/390/320px layouts; sandbox; discovery/roles/consented probe; image + MD upload; consented transcription; generation/failure recovery; actual download; OpenAI preset; consented model advisor + thinking controls; online/Kokoro speech routing; password gate; offline audio playback/speed/answers.');
 } finally {

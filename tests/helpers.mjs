@@ -105,7 +105,7 @@ async function close(server) {
 }
 
 /** All traffic initiated by the test harness is restricted to IPv4 loopback. */
-export async function request(url, { method = 'GET', json, raw, token, cookie, headers = {} } = {}) {
+export async function request(url, { method = 'GET', json, raw, token, cookie, headers = {}, timeout = 10_000 } = {}) {
   const target = new URL(url);
   assert.equal(target.protocol, 'http:', 'Tests must never contact external providers.');
   assert.equal(target.hostname, '127.0.0.1', 'Tests may contact only their loopback fixtures.');
@@ -133,7 +133,7 @@ export async function request(url, { method = 'GET', json, raw, token, cookie, h
         resolve({ status: res.statusCode, headers: res.headers, text, json: parsed, bytes });
       });
     });
-    req.setTimeout(10_000, () => req.destroy(new Error(`Timed out: ${method} ${target.pathname}`)));
+    req.setTimeout(timeout, () => req.destroy(new Error(`Timed out: ${method} ${target.pathname}`)));
     req.on('error', reject);
     req.end(body);
   });

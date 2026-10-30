@@ -1,0 +1,39 @@
+name: Native speech verification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm audit --omit=dev
+      - run: npm run check
+      - run: npm test
+      - name: Prepare and warm real native speech
+        run: npm run setup:speech
+      - name: Verify cache-only native speech on Windows
+        if: runner.os == 'Windows'
+        run: npm run test:native
+      - name: Verify native Linux with external networking disabled
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo unshare --net -- bash -c 'ip link set lo up; exec "$1" tests/native-smoke.mjs' _ "$(command -v node)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-offline-example-${{ runner.os }}
+          path: |
+            artifacts/native-offline-lesson.html
+            artifacts/native-speech.wav
+          retention-days: 7

@@ -9,7 +9,7 @@ npm test
 npm run check
 ```
 
-Latest local result: **40/40 tests passed**; server, adapter, schema, renderer and frontend syntax checks passed.
+Latest local result: **51/51 tests passed**; server, adapter, schema, renderer and frontend syntax checks passed.
 
 Coverage includes browser-session isolation, secret redaction, model discovery versus explicit paid probes, Responses/Chat request formats, narrow fallback rules, valid/invalid image input, body/media limits, missing/failed speech, transcription multipart encoding, untrusted output escaping, export CSP, authorization/CSRF, public IP policy, and hosted configuration guards. Additional setup tests cover reasoning fields/omission for both APIs, unsupported-effort failure without downgrade, recommendation consent/privacy/scope/candidate validation, no silent role saving, provider-edit key transfer protection, and managed Kokoro authorization/routing/failures.
 
@@ -55,9 +55,17 @@ Verified:
 - Downloaded file reopened with Chromium networking disabled: answer reveal, decoded audio metadata, 0.5× speed retained through audio reload, audio playback advancing, and no HTTP(S) resource requests.
 - No unexpected JavaScript/CSP/resource errors. The deliberate provider failure emits one expected HTTP 502 console entry.
 
-Screenshots and downloaded files are under `artifacts/` (git-ignored). Browser fixtures are in `tests/browser-fixtures.mjs`; the test audio is an artificial tone, **not natural-voice narration**.
+Screenshots and downloaded files are under `artifacts/` (git-ignored). Browser fixtures are in `tests/browser-fixtures.mjs`; their audio is an artificial tone, **not natural-voice narration**. The optional `LEARNLENS_NATIVE_LESSON=artifacts/native-offline-lesson.html` browser check additionally opens actual native Kokoro output, decodes/plays it with networking disabled, checks all three speeds through media reload and exercises answers. That real-WAV check also passed on Windows/Chromium.
 
-## Real bundled speech container
+## Docker-free native speech
+
+Local Windows / Node 22.23.1 x64: **PASS**. `npm ci`/install resolved native dependencies; `npm run setup:speech` downloaded and SHA-256-verified the pinned ~92 MB Q8 model and synthesized a real warmup. `npm run test:native` restarted from cache with downloads forbidden, tested automatic default selection and the consented probe, exercised the full lesson API against a loopback hand-authored lesson fixture with **real Kokoro WAV synthesis**, embedded a 248,444-byte WAV, and verified logout restores the default. No cloud primary/speech service was called. Output: `artifacts/native-offline-lesson.html` and `artifacts/native-speech.wav`.
+
+Native unit coverage includes private token/Host/Origin enforcement, supported voice/script/format/size bounds, serialized/bounded inference, worker credential isolation, checksum failure/atomic writes/offline cache refusal, complete long-text splitting, IPC lifecycle, app shutdown on worker failure, safe hosting validation and explicit speech opt-out. `npm audit --omit=dev` reports zero known vulnerabilities at verification; `sharp` is pinned to patched 0.35.5.
+
+`.github/workflows/native-speech.yml` performs native Windows/Linux checks; its Linux smoke runs in a network namespace with no external networking. Remote workflow evidence will be recorded after the run. No actual user VPS, public TLS proxy or clean Windows installation missing VC++ runtime has been tested. Native voice coverage is English only; perceptual naturalness/all voices are not established by successful audio generation.
+
+## Real optional Docker speech container
 
 `.github/workflows/bundled-speech.yml` is a manually triggered packaging check. It builds the complete image, starts it with `--network none`, exercises the included default speech role and probe, synthesizes a real English MP3 clip, and verifies embedding in HTML. Docker is unavailable on the local Windows machine, so the real container was verified on GitHub Actions (Linux amd64): **PASS**, [run 41001150719](https://github.com/cjrujo/LearnLens/actions/runs/41001150719), commit `8001cf6`.
 

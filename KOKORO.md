@@ -1,54 +1,68 @@
-# Built-in natural speech
+# Built-in Kokoro — no Docker required
 
-**Kokoro ships with the standard LearnLens container. Learners do not install it, configure a service URL, download a model, or supply a speech API key.**
+`npm start` now starts **native Node/ONNX Kokoro and LearnLens together** on Windows or a Linux VPS. Learners do not install a speech service, enter its URL, download a model themselves or provide a speech API key. Docker remains an optional alternative, not a requirement.
 
-The default package includes the CPU speech runtime, Kokoro model, voices and build-time English-language warmup/cache. One app container starts the private speech process automatically, waits for readiness, then starts LearnLens. New sessions already select **Built-in natural speech · Kokoro**. Online-provider speech remains an optional alternative.
+## Normal startup
 
-## For learners
-
-1. Connect a primary lesson model for understanding your material.
-2. Enable **Add spoken examples** when creating a lesson. Built-in speech is already selected.
-3. Listen in the app or download the HTML lesson. The generated audio travels with the file and works offline.
-
-No separate Kokoro installation or API key is needed. The initial voice is English `af_heart`; choosing another voice is optional. Voice/language coverage and naturalness vary, and this release does not automatically select a voice by language. If synthesis fails, the text lesson is kept with a warning; there is **no silent switch to paid online speech**.
-
-Clearing a bundled session removes user-configured providers/keys and restores the included speech default. Speech can still be disabled by clearing its role or leaving spoken examples off.
-
-## For deployment operators
-
-Use the normal project Dockerfile—not a second Kokoro service:
+Requires Node 22.9+ and project dependencies:
 
 ```sh
-docker build -t learnlens .
-docker run --env-file .env -p 127.0.0.1:3210:3210 --name learnlens learnlens
+npm ci
+npm start
 ```
 
-Set the usual HTTPS `PUBLIC_ORIGIN`, `LEARNLENS_ACCESS_PASSWORD`, `HOST` and `PORT` in `.env`; see README. **No `KOKORO_BASE_URL` is needed.** Put the app behind an HTTPS reverse proxy and never expose the raw Node HTTP port publicly.
+The first start prepares a pinned Q8 model (about 92 MB) in `.cache/speech/`, verifies every model/tokenizer file with SHA-256, loads the installed voices/phonemizer, and synthesizes a warmup before starting the app. npm dependencies take additional space/downloads. No Python, GPU, FFmpeg or system-wide eSpeak installation is needed. Some clean Windows systems may need Microsoft's official VC++ runtime for the native ONNX binary; see [WINDOWS.md](WINDOWS.md).
 
-The first image build downloads the pinned upstream speech image and any remaining warmup assets. This is a deployment/build step, not something each learner does. The built image is larger than the previous Node-only image and needs more CPU/RAM; select a host that supports a persistent Docker process rather than a tiny request-scoped serverless function.
+To prepare the cache separately:
 
-The package:
+```sh
+npm run setup:speech
+```
 
-- Includes the multi-arch Kokoro-FastAPI CPU v0.9.1 image pinned by digest, plus Node 22.
-- Synthesizes a sample during the build, failing the build if the included English voice cannot run.
-- Enables offline model-cache mode at runtime; model installation is not deferred to learners.
-- Binds speech to private `127.0.0.1:8880`. Only the app port is intended for routing; speech is not published.
-- Does not pass workspace passwords or provider keys to the speech child process.
-- Disables upstream web-player, CORS, debug, tuning/cloning, voice tags and SSML features.
-- Terminates both processes on shutdown and fails the container if either process unexpectedly exits, so an unhealthy worker is not silently advertised as ready.
+Subsequent starts verify/reuse it. `LEARNLENS_SPEECH_OFFLINE=1` explicitly forbids asset downloads and fails clearly if a cached file is absent or damaged. Inference always disables remote model fetching; it never downloads new voices based on learner requests. The speech model stays on the app server/PC, not in each learner's browser or exported HTML.
 
-Model synthesis can run without internet after packaging. A remote primary model still needs connectivity for new lessons. Downloaded HTML contains audio bytes, **not the model itself**.
+See [WINDOWS.md](WINDOWS.md) and [VPS.md](VPS.md) for complete startup, tmux and HTTPS instructions. `.env` is loaded automatically by `npm start` and `setup:speech`; existing shell variables take precedence.
 
-### Advanced development/operator overrides
+## Learner experience and language limits
 
-`npm start` remains a lightweight, Node-only developer command; it does not install Python/model dependencies. It is not the bundled end-user distribution. Use the container to test included speech.
+1. Connect a primary lesson model for understanding your material.
+2. Enable **Add spoken examples**. Built-in speech is already selected.
+3. Listen or download the HTML. Successful audio is embedded and works offline at 1×, 0.75× and 0.5×.
 
-Operators can intentionally opt out with `LEARNLENS_SPEECH_MODE=disabled`, or set `KOKORO_BASE_URL` to an already-managed service to override the included worker. `KOKORO_MODEL`, `KOKORO_VOICE` and `KOKORO_API_KEY` remain advanced configuration for that service. An external override is not automatically selected as the bundled default. These are not learner-facing installation requirements, and browser input cannot change the internal service URL.
+**The native JavaScript engine currently supports English US/UK voices only.** Default: `af_heart`; alternatives include `af_bella`, `am_michael` and `bf_emma`. Voice support comes from the pinned package; only specifically tested voices should be considered verified. This is not a claim that other languages are supported merely because the underlying Kokoro model has multilingual variants. Choose an online speech provider for non-English narration. Unsupported voices/scripts fail visibly; Latin-script non-English text cannot always be detected, so choose appropriately.
 
-## Verification
+Native audio is **24 kHz mono PCM WAV**, avoiding an FFmpeg/MP3 encoder dependency. WAV files are larger than MP3; the existing export/audio limits still apply. Online providers and the optional Python container retain their MP3 request behavior. Long native input is split instead of silently truncating narration.
 
-Local unit/browser checks cover the preselected speech role, process lifecycle, credential isolation, switching to online speech, and embedded audio. The separate **Bundled speech verification** GitHub Actions workflow builds the real container, starts it with `--network none`, tests the default speech role and API probe, synthesizes real MP3 audio and verifies its inclusion in HTML. See TESTING.md for the recorded outcome and remaining gaps.
+A speech failure preserves the text lesson with a warning. There is **no automatic switch to paid online speech**. Clear-session restores the included default; learners can still explicitly disable speech or select online speech.
 
-English build-time warmup is not a guarantee that every language/voice works without additional assets; those combinations need explicit validation. No perceptual rating of voice naturalness or physical-device compatibility is implied by successful synthesis.
+## Lifecycle and isolation
 
-Upstream: https://github.com/remsky/Kokoro-FastAPI/tree/v0.9.1. See THIRD-PARTY-NOTICES.md and third_party/ for licensing/provenance.
+- One managed child process, CPU inference serialized through a bounded queue; main app remains responsive.
+- Speech binds an ephemeral **127.0.0.1** port and requires a random internal token. It is not a public speech API.
+- Host passwords, cloud provider keys and `NODE_OPTIONS` are not inherited by that worker. No user text/audio is cached or logged by LearnLens's speech adapter.
+- Readiness is reported through parent/child IPC only after real warmup, not by trusting an arbitrary process already listening on a fixed port.
+- Ctrl+C stops the app and worker. A killed parent disconnects IPC and terminates the worker. An unexpected worker exit closes the app; it does not keep advertising a dead service.
+- The native adapter has no CORS, browser/player, model upload, cloning, tuning, SSML or filesystem-serving endpoints. Never expose its port through a firewall/proxy.
+
+## Operator controls
+
+| Setting | Purpose |
+| --- | --- |
+| `LEARNLENS_SPEECH_OFFLINE=1` | Require a complete valid existing model cache. |
+| `LEARNLENS_SPEECH_CACHE=/private/path` | Override project-local cache directory; preserve between restarts. |
+| `LEARNLENS_SPEECH_THREADS=2` | CPU thread count, allowed 1–8. Measure before tuning. |
+| `LEARNLENS_SPEECH_MODE=disabled` | Start the app without managed speech. |
+| `KOKORO_VOICE=af_heart` | Initial supported voice. |
+| `KOKORO_BASE_URL=...` | Advanced override to an already-managed external service, instead of native startup. |
+
+An external service may also use `KOKORO_MODEL` and `KOKORO_API_KEY`. It is not automatically selected as the included native default. These settings are operator-only; browser input cannot choose a private service URL. `npm run start:lite` is the app-only developer path and does not start speech.
+
+## Optional Docker path
+
+The existing Dockerfile still bundles Kokoro-FastAPI CPU v0.9.1 and Node. It uses `deploy/start.mjs`, not the native Node engine. English assets are warmed during the image build, and runtime downloads are disabled. Inside that container speech is private `127.0.0.1:8880`; only the web app is routed. Native and container language/voice coverage can differ. No Docker installation is required for the normal native path.
+
+## Verification and licensing
+
+`npm test` uses fixtures; `npm run test:native` exercises real native Kokoro with a cached model and a loopback, hand-authored lesson fixture (no cloud model or paid API). It saves `artifacts/native-offline-lesson.html` and `artifacts/native-speech.wav`. The native CI workflow tests Windows/Linux; Linux additionally runs the full smoke test inside a network namespace without external networking. See [TESTING.md](TESTING.md) for recorded outcomes and limitations.
+
+Pinned model: [onnx-community/Kokoro-82M-v1.0-ONNX](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/tree/1939ad2a8e416c0acfeecc08a694d14ef25f2231). Runtime: [kokoro-js](https://github.com/hexgrad/kokoro/tree/664c76a704021239ba59c84dcbaa4d3dece01fe9/kokoro.js), Transformers.js and ONNX Runtime. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), including embedded eSpeak licensing/provenance caveats before redistributing binaries.

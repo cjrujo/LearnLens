@@ -6,12 +6,15 @@ A responsive, bring-your-own-provider web app that turns screenshots, questions 
 
 ## Run locally
 
-For lightweight development, requires **Node.js 22 or later**. The Node app has no npm runtime dependencies and no frontend build step. For the complete app with built-in Kokoro speech, use the standard Docker package below; it includes and starts the speech runtime automatically.
+Requires **Node.js 22.9 or later**. **Docker is not required:** normal startup manages native Kokoro speech on Windows and Linux. There is no frontend build step. See [WINDOWS.md](WINDOWS.md) for a local PC and [VPS.md](VPS.md) for a Linux VPS with **tmux + HTTPS**.
 
 ```sh
 cd LearnLens
+npm ci
 npm start
 ```
+
+First startup downloads and verifies the pinned speech model (~92 MB, plus npm dependencies); subsequent starts reuse `.cache/speech/`. Native speech is English-only, defaults to `af_heart`, and needs no separate speech URL/key. `npm run setup:speech` prepares it separately. `npm start` automatically reads the project-root `.env` if present. For app-only development, use `npm run start:lite`.
 
 Open **http://127.0.0.1:3210**. Start with **Try a local example** (a hand-authored demonstration, no API request), or configure your provider to generate a real lesson.
 
@@ -20,7 +23,7 @@ npm test
 npm run check
 ```
 
-The tests use local mock providers. They do not call paid models or prove the educational quality of a real model. **40 automated tests pass**, plus a Chromium browser smoke suite covering desktop/mobile layouts, provider setup, uploads, transcription, sandboxed preview, real browser download, password gating and offline audio playback. See [TESTING.md](TESTING.md) for reproduction and remaining validation gaps.
+The tests use local mock providers. They do not call paid models or prove the educational quality of a real model. **51 automated tests pass**, plus a Chromium browser smoke suite covering desktop/mobile layouts, provider setup, uploads, transcription, sandboxed preview, real browser download, password gating and offline audio playback. See [TESTING.md](TESTING.md) for reproduction and remaining validation gaps.
 
 ## What works in v0.1
 
@@ -35,7 +38,7 @@ The tests use local mock providers. They do not call paid models or prove the ed
 - Separate primary, transcription and speech model roles. Same provider/model may serve several roles when supported.
 - Responses API with narrowly scoped Chat Completions fallback, or explicit endpoint mode.
 - Voice request recording/upload and transcription through `/audio/transcriptions`. Transcribed text is editable before lesson creation.
-- Two speech methods: an online/compatible AI provider or the included Kokoro engine in the standard package via `/audio/speech`. Successful audio is embedded in the lesson with 1×, 0.75× and 0.5× playback. No browser speech-synthesis fallback. Voice quality depends on provider/model/language; listen to verify.
+- Two speech methods: an online/compatible AI provider or the included native Kokoro engine via a private `/audio/speech` adapter. Native speech is English-only and returns WAV; other languages can use a compatible online provider. Successful audio is embedded in the lesson with 1×, 0.75× and 0.5× playback. No browser speech-synthesis fallback. Voice quality depends on provider/model/language; listen to verify.
 - Downloaded HTML includes its own CSS, trusted interaction script, source images and successfully generated audio. No CDN, font download, API connection or API key is required to open it offline.
 - Responsive browser interface; separate in-memory state and credentials for each browser session.
 
@@ -66,9 +69,9 @@ That means **one required role and two optional roles**, not necessarily three d
 
 ## Built-in natural speech
 
-**Kokoro is included in the standard Docker package and preselected for new sessions. Learners do not install a speech service, configure its URL, download a model or provide a speech API key.** The package contains the CPU runtime/model/voices, warms the English voice at build time, and starts the private worker automatically before the app. Online speech providers remain optional.
+**`npm start` starts built-in Kokoro automatically, without Docker or Python, and preselects it for new sessions. Learners do not install a speech service, configure its URL or provide a speech API key.** The Node/ONNX CPU runtime uses a pinned, checksum-verified local model, performs real warmup before declaring readiness, and runs on an authenticated private loopback port. Native US/UK English voices are supported; choose optional online speech for other languages. The older Python Docker package remains available as an alternative.
 
-See [KOKORO.md](KOKORO.md) for the learner flow and deployment architecture. This is server-side synthesis, not a large model inside each browser or HTML file. Synthesis runs locally after packaging; remote primary-model generation still needs connectivity. Successful audio from either method is embedded in the exported lesson. A Kokoro failure preserves the text lesson and **never silently switches to cloud speech**. Voice/language coverage varies; the initial voice is English `af_heart`.
+See [KOKORO.md](KOKORO.md) for the learner flow and deployment architecture. This is server-side synthesis, not a large model inside each browser or HTML file. Synthesis runs locally after packaging; remote primary-model generation still needs connectivity. Successful audio from either method is embedded in the exported lesson. A Kokoro failure preserves the text lesson and **never silently switches to cloud speech**. The native engine's initial voice is English `af_heart`; native output is PCM WAV, so exports can be larger than provider MP3.
 
 ## Online app, offline lessons
 
@@ -78,12 +81,12 @@ The app can be hosted behind HTTPS and used from modern desktop/tablet/mobile br
 
 ### Hosted private beta
 
-The default Dockerfile bundles both the Node app and Kokoro speech in one container; no separate speech-service setup is required. The image is larger and needs a persistent CPU/RAM allocation. Public deployment has **not** been performed automatically. You need a host and domain/TLS certificate.
+Use [VPS.md](VPS.md) for the recommended **Docker-free native deployment with tmux**. Run a single instance behind an HTTPS reverse proxy; native speech starts automatically. Public deployment has **not** been performed automatically. The optional Dockerfile remains available but is not required.
 
 Set environment variables (see `.env.example`):
 
 ```text
-HOST=0.0.0.0
+HOST=127.0.0.1
 PORT=3210
 PUBLIC_ORIGIN=https://learnlens.your-domain.example
 LEARNLENS_ACCESS_PASSWORD=<unique-random-secret-at-least-16-characters>
@@ -95,7 +98,7 @@ Example Docker commands (create `.env` yourself with real values, do not commit 
 
 ```sh
 docker build -t learnlens .
-docker run --env-file .env -p 127.0.0.1:3210:3210 --name learnlens learnlens
+docker run --env-file .env -e HOST=0.0.0.0 -p 127.0.0.1:3210:3210 --name learnlens learnlens
 ```
 
 Example Caddy site, running on the host:
@@ -106,7 +109,7 @@ learnlens.your-domain.example {
 }
 ```
 
-Alternatively run Node directly: `node --env-file=.env server.mjs`.
+For the normal native deployment, run `npm start` inside your tmux session. No separate speech process command is needed. tmux survives SSH disconnects, not reboots/crashes; it is not an auto-restarting service manager.
 
 Hosted mode uses a shared access password for a small trusted beta, **not a full user-account system**. Each browser gets its own HttpOnly/SameSite/Secure cookie, random CSRF token, providers, roles and keys. Other browsers cannot read them. The same learner on another device must configure their providers again. Restarting the server clears everything. Scaling across instances needs sticky sessions or, preferably, a properly secured shared session store.
 
@@ -118,7 +121,7 @@ Before broad public launch: replace the shared password with real authentication
 - Browser sessions expire after one hour idle or twelve hours total; clear session removes user providers and keys and, in the bundled package, restores the included speech default. Expired sessions require reload/reconfiguration. In-flight provider requests are not undone by clearing a session or closing the browser.
 - Lesson input/output is transient on the server. Exported lessons can contain private original images/text; share them carefully. Provider retention policies still apply.
 - State-changing requests require same-origin checks and an unpredictable session token. API keys never go directly from browser to AI providers after setup.
-- Redirects from providers are not followed. In hosted mode only public HTTPS provider destinations are permitted; all resolved addresses are checked and the selected address is pinned to the outbound TLS connection. User-configured private/local provider access is available only in local mode. The sole hosted exception is the fixed internal Kokoro worker (or an explicit advanced operator override); browser input cannot choose or override its private destination.
+- Redirects from providers are not followed. In hosted mode only public HTTPS provider destinations are permitted; all resolved addresses are checked and the selected address is pinned to the outbound TLS connection. User-configured private/local provider access is available only in local mode. The sole hosted exception is the managed internal Kokoro worker (or an explicit advanced operator override); browser input cannot choose or override its private destination.
 - Model content is untrusted. Only validated lesson JSON is rendered; every text value is escaped. Exported files have a restrictive CSP and no network connections. Preview uses a sandboxed iframe without same-origin permission.
 - Inputs are bounded: 40,000 text characters; 5 images at most, 4 MB each / 8 MB combined; recordings at most 8 MB; HTTP request at most 13 MB. Generated audio is capped at 8 lines and 12 MB total embedded audio. One AI job per session, eight across the instance; 200 browser sessions max.
 - Natural narration is clearly AI-generated. Transcription does **not** establish pronunciation quality. No phoneme-scoring claims are made.
@@ -143,7 +146,7 @@ server.mjs           HTTP/session/security/routes
 lib/provider.mjs     Provider adapters, discovery, probes, media validation
 lib/lesson.mjs       Input validation, tutor prompt, lesson schema, demo
 lib/setup.mjs        Bounded recommendation catalog, validation, starter rule
-deploy/              Bundled speech startup, build warmup and offline smoke test
+deploy/              Native startup/cache/worker; optional Docker speech startup
 lib/render.mjs       Escaped standalone HTML and offline interactions
 public/              Responsive UI (vanilla ES modules, CSS, HTML)
 tests/               Local mock-provider integration and unit tests

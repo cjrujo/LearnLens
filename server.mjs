@@ -52,6 +52,7 @@ function roleFor(session, value, name) {
   if (value.engine === 'kokoro') {
     if (name !== 'speech' || !session.kokoro) throw new AppError('Kokoro is only available for speech when configured by the server operator.');
     const voice = boundedString(value.voice || session.kokoro.voice, 'Voice ID', 200);
+    if (session.kokoro.voices && !session.kokoro.voices.includes(voice)) throw new AppError('Choose an installed native English voice, such as af_heart or bf_emma.');
     if (!/^[a-z0-9_]+(?:\+[a-z0-9_]+)*$/i.test(voice)) throw new AppError('Choose a Kokoro voice ID, such as af_heart. Paths, URLs and markup are not voice IDs.');
     return { engine: 'kokoro', model: session.kokoro.model, api: 'auto', voice };
   }
@@ -72,17 +73,7 @@ function roleFor(session, value, name) {
   return role;
 }
 
-export function createApp(options = {}) {
-  const sessions = new Map();
-  // Operator-controlled endpoint only. Never accept a private Kokoro URL from browser input.
-  let kokoro = null;
-  if (options.kokoroBaseUrl) {
-    const url = new URL(boundedString(options.kokoroBaseUrl, 'Kokoro base URL', 2048));
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('KOKORO_BASE_URL must be an HTTP(S) API base URL without credentials or query parameters.');
-    kokoro = { baseUrl: url.toString().replace(/\/+$/, ''), apiKey: boundedString(options.kokoroApiKey || '', 'Kokoro API key', 4096, false), publicOnly: false, model: boundedString(options.kokoroModel || 'kokoro', 'Kokoro model', 200), voice: boundedString(options.kokoroVoice || 'af_heart', 'Kokoro voice', 200) };
-  }
-  const builtInSpeech = Boolean(kokoro && options.kokoroBuiltin);
-  const initialRoles = () => ({ ...emptyRoles(), ...(builtInSpeech ? { speech: { engine: 'kokoro', model: kokoro.model, api: 'auto', voice: kokoro.voice } } : {}) });
+function hostingOptions(options) {
   const accessPassword = options.accessPassword || '';
   let publicOrigin = options.publicOrigin || '';
   if (accessPassword && accessPassword.length < 16) throw new Error('Access password must contain at least 16 characters.');
@@ -92,6 +83,33 @@ export function createApp(options = {}) {
     publicOrigin = url.origin;
     if (!accessPassword) throw new Error('Hosted mode requires LEARNLENS_ACCESS_PASSWORD.');
   }
+  return { accessPassword, publicOrigin };
+}
+
+export function deploymentConfig(env = process.env) {
+  const host = env.HOST || '127.0.0.1', port = Number(env.PORT || 3210);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('PORT must be an integer between 0 and 65535.');
+  if (!['127.0.0.1', 'localhost', '::1'].includes(host) && (!env.PUBLIC_ORIGIN || !env.LEARNLENS_ACCESS_PASSWORD)) throw new Error('Remote binding requires HTTPS PUBLIC_ORIGIN and LEARNLENS_ACCESS_PASSWORD. See README.md for hosting.');
+  return { host, port, options: {
+    ...hostingOptions({ accessPassword: env.LEARNLENS_ACCESS_PASSWORD, publicOrigin: env.PUBLIC_ORIGIN }),
+    kokoroBaseUrl: env.KOKORO_BASE_URL, kokoroApiKey: env.KOKORO_API_KEY, kokoroModel: env.KOKORO_MODEL,
+    kokoroVoice: env.KOKORO_VOICE, kokoroBuiltin: env.KOKORO_BUILTIN === '1',
+  } };
+}
+
+export function createApp(options = {}) {
+  const sessions = new Map();
+  // Operator-controlled endpoint only. Never accept a private Kokoro URL from browser input.
+  let kokoro = null;
+  if (options.kokoroBaseUrl) {
+    const url = new URL(boundedString(options.kokoroBaseUrl, 'Kokoro base URL', 2048));
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('KOKORO_BASE_URL must be an HTTP(S) API base URL without credentials or query parameters.');
+    if (options.kokoroFormat && !['mp3', 'wav'].includes(options.kokoroFormat)) throw new Error('Unsupported managed speech format.');
+    kokoro = { baseUrl: url.toString().replace(/\/+$/, ''), apiKey: boundedString(options.kokoroApiKey || '', 'Kokoro API key', 4096, false), speechFormat: options.kokoroFormat || 'mp3', languages: options.kokoroLanguages || null, voices: options.kokoroVoices || null, publicOnly: false, model: boundedString(options.kokoroModel || 'kokoro', 'Kokoro model', 200), voice: boundedString(options.kokoroVoice || 'af_heart', 'Kokoro voice', 200) };
+  }
+  const builtInSpeech = Boolean(kokoro && options.kokoroBuiltin);
+  const initialRoles = () => ({ ...emptyRoles(), ...(builtInSpeech ? { speech: { engine: 'kokoro', model: kokoro.model, api: 'auto', voice: kokoro.voice } } : {}) });
+  const { accessPassword, publicOrigin } = hostingOptions(options);
   let activeJobs = 0, loginAttempts = 0, loginWindow = Date.now();
   function prune() {
     const now = Date.now();
@@ -152,7 +170,7 @@ export function createApp(options = {}) {
       };
       const readBody = async () => { const body = await bodyJson(request); ensureCurrent(); return body; };
       if (request.method === 'GET' && path === '/api/state') {
-        json(response, 200, { locked: !session.authorized, providers: session.authorized ? [...session.providers.values()].map(publicProvider) : [], roles: session.authorized ? session.roles : emptyRoles(), starter: session.authorized ? starterPrimary([...session.providers.values()]) : null, speechServices: { kokoro: { available: Boolean(kokoro), bundled: builtInSpeech, model: kokoro?.model || 'kokoro', voice: kokoro?.voice || 'af_heart', checks: session.authorized ? session.kokoroChecks : {} } } }); return;
+        json(response, 200, { locked: !session.authorized, providers: session.authorized ? [...session.providers.values()].map(publicProvider) : [], roles: session.authorized ? session.roles : emptyRoles(), starter: session.authorized ? starterPrimary([...session.providers.values()]) : null, speechServices: { kokoro: { available: Boolean(kokoro), bundled: builtInSpeech, languages: kokoro?.languages || null, voices: kokoro?.voices || null, model: kokoro?.model || 'kokoro', voice: kokoro?.voice || 'af_heart', checks: session.authorized ? session.kokoroChecks : {} } } }); return;
       }
       if (request.method === 'POST' && path === '/api/login') {
         const { password } = await readBody();
@@ -339,9 +357,7 @@ export function createApp(options = {}) {
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
-  const host = process.env.HOST || '127.0.0.1';
-  const port = Number(process.env.PORT || 3210);
-  if (!['127.0.0.1', 'localhost', '::1'].includes(host) && (!process.env.PUBLIC_ORIGIN || !process.env.LEARNLENS_ACCESS_PASSWORD)) throw new Error('Remote binding requires HTTPS PUBLIC_ORIGIN and LEARNLENS_ACCESS_PASSWORD. See README.md for hosting.');
-  const { server } = createApp({ accessPassword: process.env.LEARNLENS_ACCESS_PASSWORD, publicOrigin: process.env.PUBLIC_ORIGIN, kokoroBaseUrl: process.env.KOKORO_BASE_URL, kokoroApiKey: process.env.KOKORO_API_KEY, kokoroModel: process.env.KOKORO_MODEL, kokoroVoice: process.env.KOKORO_VOICE, kokoroBuiltin: process.env.KOKORO_BUILTIN === '1' });
+  const { host, port, options } = deploymentConfig();
+  const { server } = createApp(options);
   server.listen(port, host, () => console.log(`LearnLens ready at ${process.env.PUBLIC_ORIGIN || `http://${host}:${port}`}\nAPI keys stay in isolated, expiring browser sessions. Press Ctrl+C to stop.`));
 }
