@@ -59,8 +59,42 @@ export const transcriptText = 'Teach me about Newton’s laws in English. The re
 export const ocrText = 'Original screenshot English, not a source digest. Screenshot final sentinel survives.';
 // More than 500 characters, one sentence: exercises sequenced sentence pieces.
 export const longSentence = 'A ' + 'careful reader follows the original source and learns each word '.repeat(12) + 'until the long sentence final sentinel.';
-export function createQAProvider() {
-  const config = { status: 200, failKind: null, failAfter: null, speechDelay: 0, lessonDelay: 0, flushLessonHeaders: false, digestNotes: null, digestFaultAt: null, digestFaultRepeat: false, digestFault: 'oversized-notes' }, calls = [];
+// Entirely invented teaching material. Explicit metadata, not English-looking text,
+// decides Auto audio; slash pauses must change speech input without changing display.
+export const readingFixtures = Object.freeze({
+  body: 'We read / with care.', spokenBody: 'We read, with care.',
+  question: 'Why read / with care?', spokenQuestion: 'Why read, with care?',
+  answer: 'We learn / together.', spokenAnswer: 'We learn, together.',
+  audio: 'Speak slowly / and clearly.', spokenAudio: 'Speak slowly, and clearly.',
+  meaningful: 'Choose and / or for alternatives. Compare 3/4 and m/s.',
+  uploaded: 'Uploaded words / are not reading markup.',
+});
+export function englishAudioLesson(overrides = {}) {
+  return {
+    title: '合成英语阅读练习', subject: 'Language learning', englishLearning: true,
+    level: 'Primary', language: 'Chinese (Simplified)', summary: '用中文理解英语阅读。此内容只用于隔离测试。',
+    objectives: ['练习英语阅读并保留原始断句标记。'],
+    sections: [
+      { type: 'explanation', title: '阅读与停顿', body: readingFixtures.body, items: [], translation: '认真阅读。', readingPauses: true },
+      { type: 'quiz', title: '独立练习', body: 'Read the sentence.', items: [], question: readingFixtures.question, answer: readingFixtures.answer, readingPauses: true },
+      { type: 'example', title: '有意义的斜线不是停顿标记', body: readingFixtures.meaningful, items: [] },
+    ].map(section => ({ question: '', answer: '', translation: '', source: '', ...section })),
+    audio: [{ text: readingFixtures.audio, translation: '放慢语速，清楚表达。', readingPauses: true }],
+    warnings: ['Synthetic QA output; the generated audio is a test tone, not natural narration.'],
+    ...overrides,
+  };
+}
+export function mathAudioLesson() {
+  return {
+    title: 'Synthetic mathematics lesson', subject: 'Mathematics', englishLearning: false,
+    level: 'Primary', language: 'English', summary: 'Learn addition using English explanations, not English language study.',
+    objectives: ['Add small numbers.'],
+    sections: [{ type: 'quiz', title: 'Addition', body: 'Three plus four is seven.', items: [], question: 'What is two plus three?', answer: 'The answer is five.', translation: '', source: '' }],
+    audio: [], warnings: ['Invented mathematics fixture; no real learner material.'],
+  };
+}
+export function createQAProvider({ lesson: suppliedLesson } = {}) {
+  const config = { lesson: suppliedLesson && structuredClone(suppliedLesson), status: 200, failKind: null, failAfter: null, audioExtractFailAt: null, speechDelay: 0, lessonDelay: 0, flushLessonHeaders: false, digestNotes: null, digestFaultAt: null, digestFaultRepeat: false, digestFault: 'oversized-notes' }, calls = [];
   const lesson = structuredClone(demoLesson);
   lesson.title = 'Browser integration test';
   lesson.summary = 'Mock-provider output for testing, not AI tutoring. <script>window.__learnlensExportInjection=true</script>';
@@ -93,7 +127,7 @@ export function createQAProvider() {
       if (res.destroyed) return;
     }
     if (call.kind === 'speech' && config.speechDelay) await new Promise(resolve => setTimeout(resolve, config.speechDelay));
-    if (config.status !== 200 || config.failKind === call.kind || (call.kind === 'speech' && config.failAfter !== null && calls.filter(c => c.kind === 'speech').length > config.failAfter)) { call.failed = true; res.statusCode = config.status !== 200 ? config.status : 500; res.end('{}'); return; }
+    if (config.status !== 200 || config.failKind === call.kind || (call.kind === 'audio-extract' && config.audioExtractFailAt !== null && calls.filter(c => c.kind === 'audio-extract').length === config.audioExtractFailAt) || (call.kind === 'speech' && config.failAfter !== null && calls.filter(c => c.kind === 'speech').length > config.failAfter)) { call.failed = true; res.statusCode = config.status !== 200 ? config.status : 500; res.end('{}'); return; }
     if (req.url === '/v1/models') res.end(JSON.stringify({ data: ['test/vision', 'test/speech', 'test/transcribe', 'gpt-5.4-mini'].map(id => ({ id })) }));
     else if (req.url === '/v1/responses') {
       const input = JSON.parse(raw), prompt = JSON.stringify(input.input);
@@ -109,7 +143,7 @@ export function createQAProvider() {
         const catalog = JSON.parse(input.input[0].content[0].text).candidates;
         const roles = Object.fromEntries(Object.entries({ primary: 'test/vision', speech: 'test/speech', transcription: 'test/transcribe' }).map(([role, model]) => [role, { candidateId: catalog.find(c => c.model === model)?.candidateId ?? null, reason: 'QA fixture recommendation.', caveat: 'This is not real model advice.' }]));
         text = JSON.stringify({ summary: 'Mock setup advice', roles, warnings: ['Mock advisor; verify compatibility.'] });
-      } else text = input.instructions.includes('LearnLens') ? JSON.stringify(lesson) : prompt.includes('dominant color') ? 'green' : 'READY';
+      } else text = input.instructions.includes('LearnLens') ? JSON.stringify(config.lesson ?? lesson) : prompt.includes('dominant color') ? 'green' : 'READY';
       res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text }] }] }));
     } else if (req.url === '/v1/audio/speech') { res.setHeader('Content-Type', 'audio/wav'); res.end(wav); }
     else if (req.url === '/v1/audio/transcriptions') res.end(JSON.stringify({ text: config.transcriptText ?? transcriptText }));

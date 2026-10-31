@@ -3,6 +3,9 @@ import { AudioSourceCollector, isContiguousAudioText, validateVisionExtraction, 
 // Mirror lib/material-digest.mjs: decoded UTF-16 defensive cap, not the 2200
 // soft prompt target/local passthrough threshold. Retain accepted text exactly.
 const MODEL_DIGEST_NOTE_MAX_CHARS = 8000;
+// Two SHA-256 hex strings (stable identity -> pinned identity), counted as UTF-16.
+const SOURCE_INDEX_ENTRY_BYTES = 256;
+const orderedParts = items => JSON.stringify(items.map(item => [item.id, item.partCount]));
 const el = (tag, text, className) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; };
 const bytesOf = url => Math.ceil((url.split(',')[1]?.length || 0) * .75);
 const split = (text, size = 20000) => {
@@ -38,7 +41,10 @@ export class MaterialWorkspace {
   }
   get busy() { return this.pending > 0; }
   get partCount() { return this.items.reduce((n, item) => n + (item.partCount || 0), 0); }
-  get hasVisuals() { return this.items.some(item => item.kind === 'image' || item.kind === 'document' || item.preview?.images?.length); }
+  // Preview images are disposable (opening another attachment clears them).
+  // OCR consent must instead remember video capability from the durable manifest;
+  // unknown media is conservative, while a known audio-only file stays false.
+  get hasVisuals() { return this.items.some(item => item.kind === 'image' || item.kind === 'document' || (item.kind === 'media' && item.manifest?.hasVideo !== false) || item.preview?.images?.length); }
   get needsTranscription() { return this.items.some(item => item.kind === 'media' && item.manifest?.hasAudio !== false); }
   setLocked(value) { this.locked = value; this.list.querySelectorAll('button,select').forEach(node => node.disabled = value || this.busy); }
   check(epoch) { if (epoch !== this.epoch) throw new DOMException('Stopped. Your draft and completed work remain on this page.', 'AbortError'); }
@@ -188,14 +194,19 @@ export class MaterialWorkspace {
   }
   checkpointInfo() {
     const job = this.checkpoint;
-    if (!job || job.invalidated) return { available: false, complete: false, completedCalls: 0, completedParts: 0, totalParts: 0, stage: 'unavailable', unavailable: true };
-    return { available: true, complete: Boolean(job.result), completedCalls: job.pinned.size, completedParts: job.completedParts.size, totalParts: job.totalParts, stage: job.stage,
+    // Count/status only: complete still describes ordinary preparation, not the later inventory.
+    if (!job || job.invalidated) return { available: false, complete: false, audioSourceStarted: false, audioSourceComplete: false, completedCalls: 0, completedParts: 0, totalParts: 0, stage: 'unavailable', unavailable: true };
+    return { available: true, complete: Boolean(job.result), audioSourceStarted: Boolean(job.completeAudio || job.audioWork), audioSourceComplete: Array.isArray(job.completeAudio ? job.result?.audioSources : job.audioWork?.result), completedCalls: job.pinned.size, completedParts: job.completedParts.size, totalParts: job.totalParts, stage: job.stage,
       ...(job.part === undefined ? {} : { part: job.part }), ...(job.failed ? { failed: true } : {}), ...(job.unavailable ? { unavailable: true } : {}) };
   }
   discardCheckpoint() {
     const job = this.checkpoint;
     if (!job) return;
-    job.invalidated = true; job.pinned.clear(); job.pinnedBytes = 0; job.generator = null; job.pending = null; job.accepted = undefined; job.result = null;
+    job.invalidated = true; job.pinned.clear(); job.pinnedBytes = 0; job.sourceIndex.clear(); job.sourceIndexBytes = 0; job.generator = null; job.pending = null; job.accepted = undefined; job.result = null;
+    if (job.audioWork) {
+      // Drop our references, never clear a source array already transferred to the caller.
+      job.audioWork.generator = null; job.audioWork.pending = null; job.audioWork.accepted = undefined; job.audioWork.result = null; job.audioWork.completedParts.clear(); job.audioWork = null;
+    }
     this.checkpoint = null;
     this.checkpointProgress(job, 'Saved preparation discarded.');
   }
@@ -207,21 +218,43 @@ export class MaterialWorkspace {
   checkPreparation(job) {
     if (job.invalidated || this.checkpoint !== job) throw new DOMException('Saved preparation was discarded. Start a new request.', 'AbortError');
     this.check(job.epoch);
+    if (job.upgrading) this.checkAudioInputs(job);
   }
-  pinPreparation(job, key, result) {
-    if (job.pinned.has(key)) return;
-    const size = JSON.stringify(result).length * 2;
-    if (size > 1024 * 1024 || job.pinned.size >= 4096 || job.pinnedBytes + size > 64 * 1024 * 1024) {
+  checkAudioInputs(job) {
+    if (job.itemInputs !== orderedParts(this.items) || job.itemInputs !== orderedParts(job.items)) throw new Error('Audio sources require the same ordered materials and part counts as the completed lesson. Start a new lesson after changing attachments.');
+    if (this.busy || [...this.items, ...job.items].some(item => item.status !== 'ready' || item.needsUpload)) throw new Error('The retained local material session is not ready or was lost. Restore materials and start a new lesson.');
+  }
+  pinPreparation(job, key, result, sourceKey = null) {
+    const added = !job.pinned.has(key), indexed = sourceKey && !job.sourceIndex.has(sourceKey);
+    const size = added ? JSON.stringify(result).length * 2 : 0;
+    const indexSize = indexed ? SOURCE_INDEX_ENTRY_BYTES : 0;
+    if (size > 1024 * 1024 || (added && job.pinned.size >= 4096) || (indexed && job.sourceIndex.size >= 4096) || job.pinnedBytes + job.sourceIndexBytes + size + indexSize > 64 * 1024 * 1024) {
       job.unavailable = true;
-      throw new Error('Preparation checkpoint quota exceeded (64 MiB, 4096 results, 1 MiB per result). Earlier successes remain saved; no further paid calls were made.');
+      throw new Error('Preparation checkpoint quota exceeded (64 MiB, 4096 results/index entries, 1 MiB per result). Earlier successes remain saved; no further paid calls were made.');
     }
-    job.pinned.set(key, result); job.pinnedBytes += size;
+    if (added) { job.pinned.set(key, result); job.pinnedBytes += size; }
+    // No body, image, filename or raw stable identity is retained in this bounded index.
+    if (sourceKey) { job.sourceIndex.set(sourceKey, key); job.sourceIndexBytes += indexSize; }
+  }
+  async indexedSourceResult(job, path, stable) {
+    this.checkPreparation(job);
+    const sourceKey = await hash(JSON.stringify([path, stable]));
+    this.checkPreparation(job);
+    const key = job.sourceIndex.get(sourceKey);
+    if (!key) return undefined;
+    if (!job.pinned.has(key)) throw new Error('A saved source result is missing. No replacement request was dispatched; start a new lesson.');
+    return job.pinned.get(key);
   }
   async preparationRequest(job, request) {
     this.checkPreparation(job);
-    const key = await hash(JSON.stringify([request.path, request.stable, request.body]));
+    const [key, sourceKey] = await Promise.all([
+      hash(JSON.stringify([request.path, request.stable, request.body])),
+      request.path === '/transcribe' || request.path === '/audio/extract' ? hash(JSON.stringify([request.path, request.stable])) : null
+    ]);
     this.checkPreparation(job);
-    if (job.pinned.has(key)) return job.pinned.get(key);
+    if (job.pinned.has(key)) {
+      const result = job.pinned.get(key); this.pinPreparation(job, key, result, sourceKey); return result;
+    }
     if (!job.roles?.[request.role]) throw new Error(request.role === 'transcription' ? 'Assign a transcription model for attached audio or video.' : 'Assign a primary model for unfinished material preparation.');
     // Consent and current revision are attached only at dispatch, never captured by a suspended yield.
     const body = request.path === '/materials/summarize'
@@ -231,13 +264,14 @@ export class MaterialWorkspace {
     this.checkPreparation(job);
     const cached = this.cache.get(cacheKey);
     if (cached) {
-      this.pinPreparation(job, key, cached.value); this.checkpointProgress(job);
+      this.pinPreparation(job, key, cached.value, sourceKey); this.checkpointProgress(job);
       this.checkPreparation(job); return cached.value;
     }
     // Reserve worst-case response space before incurring any new billable request. Never evict a checkpoint.
-    if (job.pinned.size >= 4096 || job.pinnedBytes + 1024 * 1024 > 64 * 1024 * 1024) {
+    const indexSize = sourceKey && !job.sourceIndex.has(sourceKey) ? SOURCE_INDEX_ENTRY_BYTES : 0;
+    if (job.pinned.size >= 4096 || (indexSize && job.sourceIndex.size >= 4096) || job.pinnedBytes + job.sourceIndexBytes + indexSize + 1024 * 1024 > 64 * 1024 * 1024) {
       job.unavailable = true;
-      throw new Error('Preparation checkpoint quota reached (64 MiB / 4096 results). Earlier successes remain saved; no further paid calls were made.');
+      throw new Error('Preparation checkpoint quota reached (64 MiB / 4096 results/index entries). Earlier successes remain saved; no further paid calls were made.');
     }
     if (job.calls >= 512) throw new Error('The automatic preparation safety budget of 512 calls was reached. Completed work is saved in this page. Review with your app administrator before continuing.');
     job.calls++;
@@ -248,7 +282,7 @@ export class MaterialWorkspace {
       if (job.invalidated || this.checkpoint !== job) this.checkPreparation(job);
       if (request.path === '/audio/extract') validateVisionExtraction(result);
       else if (typeof result?.text !== 'string' || !result.text.trim() || (request.path.endsWith('/summarize') && result.text.length > MODEL_DIGEST_NOTE_MAX_CHARS)) throw new Error('The provider returned an invalid preparation result. No further paid calls were made.');
-      this.pinPreparation(job, key, result);
+      this.pinPreparation(job, key, result, sourceKey);
       this.cachePut(cacheKey, result);
       this.checkpointProgress(job);
       this.checkPreparation(job);
@@ -266,7 +300,7 @@ export class MaterialWorkspace {
     const approvedRoles = structuredClone(roles);
     if (!resume) {
       this.discardCheckpoint();
-      this.checkpoint = { inputs, items: [...this.items], goal, completeAudio, totalParts: this.partCount, pinned: new Map(), pinnedBytes: 0, completedParts: new Set(), stage: 'starting', message: 'Preparing materials…' };
+      this.checkpoint = { inputs, itemInputs: orderedParts(this.items), items: [...this.items], goal, completeAudio, totalParts: this.partCount, pinned: new Map(), pinnedBytes: 0, sourceIndex: new Map(), sourceIndexBytes: 0, completedParts: new Set(), stage: 'starting', message: 'Preparing materials…' };
     }
     const job = this.checkpoint;
     Object.assign(job, { epoch: this.epoch, roles: approvedRoles, revision: expectedSetupRevision, progress, calls: 0, failed: false, unavailable: false });
@@ -275,33 +309,8 @@ export class MaterialWorkspace {
       this.checkpointProgress(job);
       this.checkPreparation(job);
       if (job.result) return job.result;
-      for (;;) {
-        this.checkPreparation(job);
-        if (!job.pending) {
-          job.generator ||= this.preparationSteps(job);
-          let step;
-          try { step = await job.generator.next(job.accepted); }
-          catch (error) {
-            // Local failures close generators. Rebuild their collector from pinned successes, never paid replay.
-            job.generator = null; job.accepted = undefined;
-            throw error;
-          }
-          job.accepted = undefined;
-          if (job.invalidated || this.checkpoint !== job) this.checkPreparation(job);
-          if (step.done) {
-            job.result = step.value; job.generator = null; job.stage = 'complete';
-            this.checkpointProgress(job, 'Material preparation complete.');
-            this.checkPreparation(job); return job.result;
-          }
-          // Save the yielded position before checking an ordinary Stop race.
-          job.pending = step.value;
-          this.checkPreparation(job);
-        }
-        job.stage = job.pending.stage; this.checkpointProgress(job);
-        const result = await this.preparationRequest(job, job.pending);
-        this.checkPreparation(job);
-        job.pending = null; job.accepted = result;
-      }
+      const result = await this.drivePreparation(job, job);
+      this.checkPreparation(job); return result;
     } catch (error) {
       if (!job.invalidated) { job.failed = true; this.checkpointProgress(job); }
       throw error;
@@ -310,6 +319,109 @@ export class MaterialWorkspace {
       // Keep no approved setup or callback closure in a dormant checkpoint.
       job.roles = null; job.progress = null;
     }
+  }
+  /**
+   * Post-teaching inventory only; the caller owns subject policy, consent and UI locking.
+   * Returns AudioSource[] without replacing or amending job.result. Requires the completed
+   * checkpoint and its unchanged ordered attachments/local session; never creates a new job.
+   * Held STT/OCR ignores current roles. Only unfinished OCR uses approved primary/revision.
+   * resume:false shares prepare's remaining 512-call allowance. After interruption,
+   * resume:true explicitly renews consent/allowance and continues the suspended yield;
+   * it may also initialize audioWork after a renewed confirmation before the first upgrade.
+   * checkpointInfo.audioSourceStarted/Complete are content-free status flags (including
+   * eager completeAudio preparation); ordinary complete/completedParts keep their meaning.
+   */
+  async upgradeAudioSources({ consent, roles, expectedSetupRevision, progress = () => {}, resume = false }) {
+    if (this.preparing) throw new Error('A preparation request is already running. Stop or wait before continuing.');
+    if (!consent) throw new Error('Explicit paid consent is required.');
+    if (!Number.isInteger(expectedSetupRevision)) throw new Error('A confirmed AI setup revision is required. Refresh setup and confirm again.');
+    const job = this.checkpoint;
+    if (!job || job.invalidated || !job.result) throw new Error('A completed preparation checkpoint is required to upgrade audio sources. Start or finish lesson preparation first.');
+    this.checkAudioInputs(job);
+    if (job.completeAudio && Array.isArray(job.result.audioSources)) return job.result.audioSources;
+    if (job.audioWork && !job.audioWork.result && !resume) throw new Error('Audio source work was interrupted. Confirm consent and explicitly resume to continue; no automatic retry was made.');
+    const approvedRoles = structuredClone(roles);
+    const work = job.audioWork ||= { generator: null, pending: null, accepted: undefined, result: null, completedParts: new Set() };
+    Object.assign(job, { epoch: this.epoch, roles: approvedRoles, revision: expectedSetupRevision, progress, calls: resume ? 0 : job.calls, failed: false, unavailable: false, upgrading: true });
+    this.preparing = true;
+    try {
+      this.checkpointProgress(job, work.pending ? job.message : 'Collecting full audio sources…');
+      this.checkPreparation(job);
+      if (work.result) return work.result;
+      const result = await this.drivePreparation(job, work, true);
+      this.checkPreparation(job); return result;
+    } catch (error) {
+      if (!job.invalidated) { job.failed = true; this.checkpointProgress(job); }
+      throw error;
+    } finally {
+      this.preparing = false; job.upgrading = false; job.roles = null; job.progress = null;
+    }
+  }
+  async drivePreparation(job, work, audio = false) {
+    for (;;) {
+      this.checkPreparation(job);
+      if (!work.pending) {
+        work.generator ||= audio ? this.audioSourceSteps(job, work) : this.preparationSteps(job);
+        let step;
+        try { step = await work.generator.next(work.accepted); }
+        catch (error) {
+          // Local failures close generators. Rebuild collectors from pinned successes, never paid replay.
+          work.generator = null; work.accepted = undefined;
+          throw error;
+        }
+        work.accepted = undefined;
+        if (job.invalidated || this.checkpoint !== job) this.checkPreparation(job);
+        if (step.done) {
+          work.result = step.value; work.generator = null; job.stage = 'complete';
+          this.checkpointProgress(job, audio ? 'Audio source inventory complete.' : 'Material preparation complete.');
+          this.checkPreparation(job); return work.result;
+        }
+        // Save the yielded position before checking an ordinary Stop race.
+        work.pending = step.value;
+        this.checkPreparation(job);
+      }
+      job.stage = work.pending.stage; this.checkpointProgress(job);
+      const result = await this.preparationRequest(job, work.pending);
+      this.checkPreparation(job);
+      work.pending = null; work.accepted = result;
+    }
+  }
+  async * audioSourceSteps(job, work) {
+    const collector = new AudioSourceCollector();
+    let processed = 0;
+    for (const item of job.items) {
+      this.checkPreparation(job);
+      const key = await hash(item.id); this.checkPreparation(job);
+      collector.beginItem({ key, source: item.name, contiguous: isContiguousAudioText(item) });
+      for (let index = 0; index < item.partCount; index++) {
+        job.part = ++processed; job.stage = 'audio-reading';
+        this.checkpointProgress(job, `Collecting audio sources · part ${processed} of ${job.totalParts}`);
+        const part = await this.part(item, index, job.epoch); this.checkPreparation(job);
+        const stable = item.id + ':' + index;
+        const source = `${item.name} · ${part.label || `part ${index + 1}`} (${index + 1}/${item.partCount})`;
+        const warnings = [...item.warnings, ...(part.warnings || [])];
+        collector.addPart({ index, text: part.text || '', source, warnings, hasAlternativeExtraction: Boolean(part.audio || part.images?.length) });
+        if (part.audio) {
+          // An upgrade must NEVER retranscribe, even if the general cache was evicted or STT removed.
+          const result = await this.indexedSourceResult(job, '/transcribe', stable + ':transcription');
+          if (!result) throw new Error('The saved transcription needed for full audio is unavailable. No transcription was dispatched. Start a new lesson to prepare the original again.');
+          collector.addTranscription({ index, text: result.text, source: source + ' · speech', warnings: [...warnings, ...(result.warnings || [])] });
+          delete part.audio;
+        }
+        for (let imageIndex = 0; imageIndex < (part.images || []).length; imageIndex++) {
+          const original = part.images[imageIndex];
+          const image = await normalizeImage(original.dataUrl, (source.slice(0, 200) + ' · ' + original.name).slice(0, 180)); this.checkPreparation(job);
+          const imageStable = stable + ':audio-extract:' + imageIndex;
+          const held = await this.indexedSourceResult(job, '/audio/extract', imageStable);
+          const result = held ?? (yield { path: '/audio/extract', body: { image }, stable: imageStable, role: 'primary', stage: 'extraction' });
+          collector.addVision({ index, imageIndex, result, source: `Image ${imageIndex + 1} · ${source} · ${original.name || 'visual'}`, warnings: [...warnings, ...(image.dataUrl !== original.dataUrl ? ['Some extracted visuals were resized; fine detail may be lost.'] : [])] });
+        }
+        this.checkPreparation(job); work.completedParts.add(processed); this.checkpointProgress(job);
+      }
+      collector.endItem();
+    }
+    this.checkPreparation(job);
+    return collector.finish();
   }
   async * preparationSteps(job) {
     const { goal, completeAudio } = job;

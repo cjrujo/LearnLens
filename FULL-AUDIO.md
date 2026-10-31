@@ -1,6 +1,14 @@
 # Complete English audio
 
-**The composer no longer selects eight spoken examples.** Enable complete English audio to include word targets and sentence/phrase targets from both the uploaded material and the generated lesson.
+**The composer no longer selects eight spoken examples.** Complete English audio includes word targets and sentence/phrase targets from both the uploaded material and the generated lesson.
+
+## Automatic English lessons
+
+**Audio defaults to Auto · English-subject lessons only.** An explicitly selected English-learning subject enables audio; other selected subjects leave it off. With **Subject: Auto**, the normal teaching response supplies `englishLearning` metadata; older responses use a conservative subject-label fallback. No extra classifier request is made. This is model-reported classification, not independent verification: English explanations for mathematics do not by themselves request audio. English practice explained in Chinese or another language can still include English audio.
+
+Choose **On** or **Off** to override Auto. The choice is saved with the generation checkpoint; editing the form does not change an interrupted request. Audio still requires separate exact-count speech confirmation. Non-English/Off requests make no extra audio-recognition, audio-preflight, plan or speech calls; transcription needed to understand an uploaded recording is separate.
+
+For auto-detected English, teaching finishes first. The app then rereads local original parts, reuses pinned transcripts and performs only missing audio image recognition. This inventory-only upgrade never repeats transcription, teaching digests, merges or teaching. While its inventory is unfinished, attachments and new lesson/demo creation are locked; finish it or explicitly discard remaining audio first. Missing speech setup retains the text and preparation checkpoint so speech can be configured before continuing. Once the source inventory transfers to the audio context, normal two-lesson history resumes.
 
 ## Coverage, not highlights
 
@@ -17,17 +25,23 @@
 ## Creation and recovery
 
 1. Confirm source preparation and teaching. The dialog discloses transcription, digests and extra image-recognition calls. Uploads/local previews alone do not call AI.
-2. Local preflight verifies the managed audio encoder/capacity before those paid steps. Missing media assets can download automatically; offline mode requires a verified cache.
+2. Local preflight verifies the managed audio encoder/capacity before audio-source recognition or speech. Explicit audio with configured speech may preflight before teaching; auto-detected English preflights after the text is retained. Missing media assets can download automatically; offline mode requires a verified cache.
 3. The text lesson is retained before audio preparation. Full source descriptors are added to a private, session-owned plan, separately from the bounded final teaching request.
 4. A second confirmation shows the **exact unique clip count**, speech model/voice, whether speech is local or potentially billable, completed clips and recognition uncertainties.
 5. Clips run serially per session, with completed/total progress. Stop prevents later requests; an already submitted request may still finish or be billed.
-6. **Continue audio** reads the existing plan and asks for fresh consent. It never repeats teaching, OCR or transcription. Completed clips are reused. Failed/unknown attempts are not automatically replayed; repeated attempt IDs never dispatch another provider request.
+6. **Continue audio** never repeats teaching or transcription. If original-source inventory is still pending, it shows current primary settings and asks for renewed consent before missing/failed OCR only; successful recognition and transcripts are reused from the pinned checkpoint even if the ordinary cache was evicted. Once the inventory is complete, continuation reads the existing plan without any OCR. Completed clips are reused. Failed/unknown attempts are not automatically replayed; repeated attempt IDs never dispatch another provider request.
 7. If speech succeeds but local MP3 encoding fails, one bounded raw result is retained for local encoding recovery rather than paying for speech again. Other new speech waits until that result is resolved.
 8. Download a complete or explicitly partial HTML file. Missing controls remain disabled, not silently omitted. Local export reads statuses/files only; it does not generate speech.
 
 The page retains the current lesson plus one previous lesson. Starting another lesson cannot silently evict an unfinished audio plan. Finish it or explicitly discard remaining audio first; discard retains the last HTML but removes resume work. Completed server plans can be released once their HTML is retained.
 
 **This is session-only recovery, not durable jobs.** Reloading loses page state; logout, expiry and host restart remove plan ownership. A known lost plan is never silently recreated and billed again. Settings changes require reconfirmation; a different speech provider/model/voice cannot silently retarget an old plan. Download before refreshing or restarting.
+
+## Reading-pause marks versus literal slashes
+
+New generated chunked-reading sections/audio entries can declare `readingPauses:true`. In those explicitly marked fields, a spaced single `/` becomes punctuation in the speech input, not the spoken word “slash”. Existing commas/dashes supply the pause without duplicate punctuation. Visible text, source spans, word targets and answer reveals are unchanged; clip IDs/deduplication use the actual spoken pieces.
+
+This is **not global slash removal**. Unmarked prose and uploaded originals remain literal. Compact URLs/paths/IPA, numeric fractions and single-letter ratios are protected; word alternatives must remain unmarked because text alone cannot reliably distinguish them from reading pauses. The model prompt requires the annotation when it inserts reading-pause marks. A model that omits or misuses the annotation may still need correction. Existing downloaded audio is not rewritten; the new behavior applies when new clips are generated. Punctuation requests a pause but does not guarantee its precise duration or pronunciation quality.
 
 ## Offline controls
 

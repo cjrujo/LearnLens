@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AppError } from '../lib/provider.mjs';
-import { buildSpeechBlock, lessonSpeechBlocks, speechWords } from '../lib/speech-inventory.mjs';
+import { createHash } from 'node:crypto';
+import * as inventory from '../lib/speech-inventory.mjs';
+const { buildSpeechBlock, lessonSpeechBlocks, speechWords, normalizeReadingPauses } = inventory;
 
 const build = (text, extra = {}) => buildSpeechBlock({ key: 'upload.page.1', source: 'Uploaded page 1', text, ...extra });
 const sentences = result => result.units.filter(unit => unit.kind === 'sentence');
@@ -187,6 +189,128 @@ test('block metadata and optional translation are preserved exactly', () => {
     assert.equal(unit.blockKey, result.block.key);
     assert.equal(Object.hasOwn(unit, 'translation'), false);
   }
+});
+
+test('reading-pause flags are optional booleans for generated blocks only', () => {
+  assert.equal(Object.hasOwn(build('The fox / rests.').block, 'readingPauses'), false);
+  for (const readingPauses of [true, false]) {
+    assert.equal(build('The fox / rests.', { origin: 'generated', readingPauses }).block.readingPauses, readingPauses);
+    assert.throws(() => build('The fox / rests.', { readingPauses }), /generated/i);
+  }
+  for (const readingPauses of [null, 'true', 'false', 0, 1, [], {}]) {
+    assert.throws(() => build('The fox / rests.', { origin: 'generated', readingPauses }), AppError);
+    assert.throws(() => lessonSpeechBlocks({ sections: [{ readingPauses }] }), AppError);
+    assert.throws(() => lessonSpeechBlocks({ audio: [{ readingPauses }] }), AppError);
+  }
+});
+
+test('generated reading pauses reach prose and explicit audio only, without changing reveal flags', () => {
+  const text = 'The fox / rests.';
+  const lesson = {
+    title: text, summary: text, objectives: [text],
+    sections: [
+      { title: text, body: text, items: [text], question: text, answer: text, translation: text, readingPauses: true },
+      { body: text, items: [text], readingPauses: false },
+      { body: text, items: [text] },
+    ],
+    audio: [{ text, translation: text, readingPauses: true }, { text, readingPauses: false }, { text }],
+  };
+  const marked = new Set(['lesson.sections.0.body', 'lesson.sections.0.items.0', 'lesson.sections.0.question', 'lesson.sections.0.answer', 'lesson.audio.0.text']);
+  const explicitlyFalse = new Set(['lesson.sections.1.body', 'lesson.sections.1.items.0', 'lesson.audio.1.text']);
+  for (const block of lessonSpeechBlocks(lesson)) {
+    assert.equal(block.readingPauses, marked.has(block.key) ? true : explicitlyFalse.has(block.key) ? false : undefined, block.key);
+    assert.equal(block.answer, block.key === 'lesson.sections.0.answer');
+    const result = buildSpeechBlock(block);
+    assert.equal(result.block.text, text);
+    assert.deepEqual(clipTexts(result, sentences(result)[0]), [marked.has(block.key) ? 'The fox, rests.' : text]);
+    for (const unit of result.units) assert.equal(unit.answer, block.answer);
+  }
+});
+
+test('marked sentence speech changes, but exact source, offsets and every word survive', () => {
+  const text = '  😀The fox / rests beside reeds.\nThe hare, / waits / nearby.  ';
+  const options = { origin: 'generated', answer: true, translation: ' Instruction / translation ' };
+  const marked = build(text, { ...options, readingPauses: true });
+  const original = build(text, options);
+  assert.equal(marked.block.text, text);
+  assert.equal(marked.block.translation, options.translation);
+  assert.deepEqual(sentences(marked).map(unit => ({ ...unit, clipIds: [] })), sentences(original).map(unit => ({ ...unit, clipIds: [] })));
+  assert.deepEqual(sentences(marked).flatMap(unit => clipTexts(marked, unit)), ['The fox, rests beside reeds.', 'The hare, waits, nearby.']);
+  assert.deepEqual(words(marked), words(original));
+  for (const unit of words(marked)) assert.deepEqual(clipTexts(marked, unit), [unit.text]);
+  assertCoverage(marked);
+});
+
+test('exported speech normalizer is explicitly opt-in and preserves existing punctuation at pauses', () => {
+  assert.equal(typeof normalizeReadingPauses, 'function');
+  const examples = [
+    ['The fox / rests / beside reeds.', 'The fox, rests, beside reeds.'],
+    ['The fox, / rests.', 'The fox, rests.'],
+    ['The fox / , rests.', 'The fox, rests.'],
+    ['The fox; / rests.', 'The fox; rests.'],
+    ['The fox / ; rests.', 'The fox; rests.'],
+    ['The fox... / rests.', 'The fox... rests.'],
+    ['“The fox,” / said the hare.', '“The fox,” said the hare.'],
+    ['The fox / “rests nearby.”', 'The fox, “rests nearby.”'],
+    ['/ The fox / rests /', 'The fox, rests'],
+    [' / The fox rests. / ', 'The fox rests.'],
+    ['The fox / .', 'The fox.'],
+    [' / ', ''],
+    ['The fox\t/\tkeeps the word slash.', 'The fox, keeps the word slash.'],
+    ['The fox\u00a0/\u00a0rests.', 'The fox, rests.'],
+  ];
+  for (const [source, expected] of examples) {
+    assert.equal(normalizeReadingPauses(source, true), expected, source);
+    assert.equal(normalizeReadingPauses(source), source);
+    assert.equal(normalizeReadingPauses(source, false), source);
+    assert.equal(normalizeReadingPauses(expected, true), expected, 'idempotent punctuation');
+  }
+});
+
+test('meaningful slashes and unaffected IDs are preserved even in marked prose', () => {
+  const examples = [
+    'The fox eats 1 / 2 of a berry.',
+    'The fox eats (12 / 24) of the berries.',
+    'The ratio is A / B and x / y.',
+    'The fox uses cat/dog and and/or as alternatives.',
+    'The fox visits https://animals.test/fox?q=a/b.',
+    'The fox reads /srv/fox/notes and C:\\animals\\fox.txt.',
+    'The fox reads ../animals / notes and C: / animals.',
+    'The fox reads /kæt/ and /ˈkæt/ and /dɒɡ/.',
+    'Say / kæt / clearly.',
+    'The fox keeps // and / / literal.',
+    'The word slash is an ordinary word.',
+    '  The fox\t rests,  beside reeds.  ',
+  ];
+  const hashClip = text => createHash('sha256').update(JSON.stringify(['clip', text])).digest('hex');
+  for (const text of examples) {
+    assert.equal(normalizeReadingPauses(text, true), text, text);
+    const base = build(text);
+    const marked = build(text, { origin: 'generated', readingPauses: true });
+    assert.deepEqual(marked.clips, base.clips, text);
+    for (const clip of base.clips) assert.equal(clip.id, hashClip(clip.text));
+    assertCoverage(marked);
+  }
+  for (const text of ['cat / dog', 'yes / no', 'I / you / we / they']) {
+    assert.equal(normalizeReadingPauses(text), text, 'alternatives must not be opted in');
+    assert.deepEqual(build(text).clips, build(text, { origin: 'generated', readingPauses: false }).clips);
+  }
+});
+
+test('normalized speech pieces dedupe with ordinary prose, including long bounded splits', () => {
+  const markedText = 'The fox / rests beside reeds and the hare / waits nearby; '.repeat(35) + 'the otter / swims home.';
+  const spokenText = 'The fox, rests beside reeds and the hare, waits nearby; '.repeat(35) + 'the otter, swims home.';
+  const marked = build(markedText, { origin: 'generated', readingPauses: true });
+  const ordinary = build(spokenText, { key: 'other' });
+  assert.equal(marked.block.text, markedText);
+  assert.deepEqual(marked.clips, ordinary.clips);
+  assert.deepEqual(sentences(marked).map(unit => unit.clipIds), sentences(ordinary).map(unit => unit.clipIds));
+  const pieces = sentences(marked).flatMap(unit => clipTexts(marked, unit));
+  assert.ok(pieces.length > 3);
+  assert.equal(pieces.join(' '), spokenText);
+  assertCoverage(marked);
+  assert.deepEqual(words(marked).map(unit => unit.text), words(ordinary).map(unit => unit.text));
+  assert.throws(() => build('x'.repeat(501) + ' / fox', { origin: 'generated', readingPauses: true }), error => error.status === 422);
 });
 
 test('strict bounds, types, controls and Unicode validation use AppError without truncation', () => {

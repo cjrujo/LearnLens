@@ -7,6 +7,7 @@ import { AppError, boundedString, normalizeBaseUrl, publicProvider, discoverMode
 import { validateLessonInput, lessonPrompt, parseLesson, demoLesson } from './lib/lesson.mjs';
 import { renderLesson, renderScriptHash, fullAudioRenderScriptHash } from './lib/render.mjs';
 import { createAudioPlanStore } from './lib/audio-plans.mjs';
+import { normalizeReadingPauses } from './lib/speech-inventory.mjs';
 import { prepareAudioEncoder } from './lib/audio-encode.mjs';
 import { audioExtractionPrompt, parseAudioExtraction } from './lib/audio-extract.mjs';
 import { documentName, documentBody, importDocument } from './lib/document-import.mjs';
@@ -115,7 +116,7 @@ export function createApp(options = {}) {
   // Snapshot a coherent UI at startup: editing source files cannot break live tabs.
   const publicDirectory = options.publicDirectory || resolve(root, 'public');
   const indexHtml = readFileSync(resolve(publicDirectory, 'index.html'), 'utf8');
-  const assets = new Map(['/app.js', '/materials.js', '/audio-sources.js', '/audio-client.js', '/media.js', '/styles.css', '/favicon.svg'].flatMap(path => {
+  const assets = new Map(['/app.js', '/materials.js', '/audio-sources.js', '/audio-client.js', '/audio-policy.js', '/media.js', '/styles.css', '/favicon.svg'].flatMap(path => {
     const file = resolve(publicDirectory, path.slice(1));
     return existsSync(file) ? [[path, readFileSync(file)]] : [];
   }));
@@ -483,7 +484,9 @@ export function createApp(options = {}) {
             for (const line of lesson.audio) {
               try {
                 ensureCurrent();
-                const generated = await generateSpeech(speechProvider, speech, line.text);
+                const spoken = normalizeReadingPauses(line.text, line.readingPauses);
+                if (!spoken.trim()) continue; // A pause marker alone is not narration.
+                const generated = await generateSpeech(speechProvider, speech, spoken);
                 ensureCurrent();
                 audioBytes += generated.bytes;
                 if (audioBytes > 12 * 1024 * 1024) { warnings.push('Audio size limit reached; remaining sentences were not embedded.'); break; }

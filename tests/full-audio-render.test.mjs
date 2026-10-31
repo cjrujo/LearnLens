@@ -157,6 +157,48 @@ test('answers stay inside closed details, with no always-visible audio answer ba
   assert.equal(depth, 0);
 });
 
+test('reading-pause audio preserves rendered slashes, word controls, source offsets and hidden answers', () => {
+  const value = lesson();
+  value.sections[0] = section({
+    title: 'Read / listen', body: 'The fox / rests beside reeds.',
+    items: ['The hare / waits nearby.'], question: 'Where does the otter / swim?',
+    answer: 'The otter / swims home.', translation: 'Instruction / translation', readingPauses: true,
+  });
+  value.audio = [{ text: value.sections[0].answer, translation: 'Answer / translation', readingPauses: true }];
+  const before = structuredClone(value);
+  const course = courseFor(lessonSpeechBlocks(value));
+  const html = renderLesson(value, { audioCourse: course });
+  assert.deepEqual(value, before);
+  for (const field of ['body', 'question', 'answer']) {
+    const block = course.blocks.find(block => block.key === 'lesson.sections.0.' + field);
+    const unit = course.units.find(unit => unit.blockKey === block.key && unit.kind === 'sentence');
+    assert.equal(block.text, value.sections[0][field]);
+    assert.equal(block.text.slice(unit.start, unit.end), unit.text);
+    assert.equal(unit.answer, field === 'answer');
+    assert.ok(html.includes(escapeHtml('Play sentence: ' + unit.text)));
+    const clip = course.clips.find(clip => clip.id === unit.clipIds[0]);
+    assert.equal(clip.text, unit.text.replace(' / ', ', '));
+  }
+  const sectionHtml = /<section class="lesson-section type-quiz">([\s\S]*?)<\/section>/.exec(html)[1];
+  const body = /<p>([\s\S]*?)<\/p>/.exec(sectionHtml)[1];
+  assert.equal(withoutTags(body), escapeHtml(value.sections[0].body));
+  assert.ok(body.includes(' / '));
+  for (const word of ['The', 'fox', 'rests', 'beside', 'reeds']) assert.ok(body.includes(escapeHtml('Play word: ' + word)));
+  const tokens = html.match(/<[^>]+>|[^<]+/g);
+  let depth = 0, answerControls = 0;
+  for (const token of tokens) {
+    if (/^<details(?:\s|>)/.test(token)) { assert.ok(!/\sopen(?:\s|=|>)/.test(token)); depth++; }
+    if (token.includes('Play sentence: The otter / swims home.') || token.includes('Play word: swims')) {
+      answerControls++;
+      assert.ok(depth > 0, token);
+    }
+    if (token === '</details>') depth--;
+  }
+  assert.ok(answerControls >= 2);
+  assert.equal(depth, 0);
+  assert.equal('sha256-' + createHash('sha256').update(scriptOf(html)).digest('base64'), fullAudioRenderScriptHash);
+});
+
 test('missing matching blocks render unchanged; legacy audio and CSP remain compatible', () => {
   const value = lesson();
   const legacy = renderLesson(value, { audio: [{ text: 'Legacy.', dataUrl }] });

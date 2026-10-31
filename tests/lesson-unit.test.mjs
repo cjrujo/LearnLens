@@ -35,6 +35,82 @@ test('lesson JSON is constrained to safe known component types', () => {
   assert.throws(() => validateLesson(quiz));
 });
 
+test('English-learning metadata is optional, boolean-only and retained without inferring from language', () => {
+  assert.equal(Object.hasOwn(validateLesson(demoLesson), 'englishLearning'), false);
+  for (const englishLearning of [true, false]) {
+    for (const language of ['English', 'Chinese']) {
+      const value = { ...structuredClone(demoLesson), englishLearning, language };
+      assert.equal(validateLesson(value).englishLearning, englishLearning);
+      assert.equal(parseLesson(JSON.stringify(value)).englishLearning, englishLearning);
+    }
+  }
+  for (const englishLearning of [null, 'true', 'false', 0, 1, [], {}]) {
+    const value = { ...structuredClone(demoLesson), englishLearning };
+    assert.throws(() => validateLesson(value), /englishLearning/);
+    assert.throws(() => parseLesson(JSON.stringify(value)), /invalid lesson structure/);
+  }
+});
+
+test('prompt distinguishes English learning from merely using English to explain other subjects', () => {
+  const prompt = lessonPrompt(validateLessonInput({ text: 'The fox rests.', subject: 'Auto', language: 'Chinese' }));
+  const schema = JSON.parse(/Schema:\n([^\n]+)/.exec(prompt.instructions)[1]);
+  assert.equal(typeof schema.englishLearning, 'boolean');
+  assert.match(prompt.instructions, /englishLearning:true/);
+  assert.match(prompt.instructions, /English-language skills or literature/i);
+  assert.match(prompt.instructions, /English.*explained in Chinese/);
+  assert.match(prompt.instructions, /englishLearning:false/);
+  assert.match(prompt.instructions, /math.*science/i);
+  assert.match(prompt.instructions, /even if.*explanation.*English/i);
+});
+
+test('lesson reading-pause flags validate without changing legacy or displayed text', () => {
+  const legacy = structuredClone(demoLesson);
+  legacy.audio = [{ text: 'The fox / rests.', translation: 'The hare / waits.' }];
+  const original = structuredClone(legacy);
+  const unmarked = validateLesson(legacy);
+  assert.ok(unmarked.sections.every(section => !Object.hasOwn(section, 'readingPauses')));
+  assert.equal(Object.hasOwn(unmarked.audio[0], 'readingPauses'), false);
+  assert.deepEqual(legacy, original);
+  for (const readingPauses of [true, false]) {
+    const value = structuredClone(legacy);
+    value.sections[0].body = 'The fox / rests.';
+    value.sections[0].readingPauses = readingPauses;
+    value.audio[0].readingPauses = readingPauses;
+    const result = parseLesson(JSON.stringify(value));
+    assert.equal(result.sections[0].readingPauses, readingPauses);
+    assert.equal(result.audio[0].readingPauses, readingPauses);
+    assert.equal(result.sections[0].body, value.sections[0].body);
+    assert.equal(result.audio[0].text, value.audio[0].text);
+    assert.equal(result.audio[0].translation, value.audio[0].translation);
+  }
+  for (const readingPauses of [null, 'true', 'false', 0, 1, [], {}]) {
+    for (const field of ['sections', 'audio']) {
+      const value = structuredClone(legacy);
+      value[field][0].readingPauses = readingPauses;
+      assert.throws(() => validateLesson(value), /readingPauses/);
+      assert.throws(() => parseLesson(JSON.stringify(value)), /invalid lesson structure/);
+    }
+  }
+});
+
+test('lesson prompt defines optional pause markup narrowly for sections and explicit audio', () => {
+  for (const includeAudio of [true, false]) {
+    const prompt = lessonPrompt(validateLessonInput({ text: 'The fox rests.', includeAudio }));
+    const schema = JSON.parse(/Schema:\n([^\n]+)/.exec(prompt.instructions)[1]);
+    assert.equal(typeof schema.sections[0].readingPauses, 'boolean');
+    assert.equal(typeof schema.audio[0].readingPauses, 'boolean');
+    assert.match(prompt.instructions, /optional boolean/i);
+    assert.match(prompt.instructions, /readingPauses:true/);
+    assert.match(prompt.instructions, /chunked read-aloud prose/i);
+    assert.match(prompt.instructions, /spaced.*slash/i);
+    for (const term of ['math', 'fractions', 'ratios', 'URLs', 'paths', 'IPA', 'phonetics', 'alternatives', 'body', 'items', 'question', 'answer', 'titles', 'translations']) {
+      assert.ok(prompt.instructions.includes(term), term);
+    }
+    assert.doesNotMatch(prompt.instructions, /text and translation only/);
+    if (!includeAudio) assert.match(prompt.instructions, /Return audio: \[\]/);
+  }
+});
+
 test('offline renderer escapes all model/source fields and uses only a trusted hashed script', () => {
   const lesson = structuredClone(demoLesson);
   const payload = '</script><script>alert("INJECTED")</script><img src="https://evil.test" onerror="alert(1)">';

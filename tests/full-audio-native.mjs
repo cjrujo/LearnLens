@@ -7,13 +7,15 @@ import { startNativeApplication } from '../deploy/native-start.mjs';
 import { browserClient, ok } from './helpers.mjs';
 process.env.LEARNLENS_MEDIA_OFFLINE = '1';
 const originalFetch = globalThis.fetch;
+const spokenInputs = [];
 globalThis.fetch = (input, options) => {
   const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
   if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) throw new Error('Full-audio native test forbids non-loopback networking.');
+  if (url.pathname.endsWith('/audio/speech') && typeof options?.body === 'string') spokenInputs.push(JSON.parse(options.body).input);
   return originalFetch(input, options);
 };
 const lesson = { title: 'Animals', subject: 'English', level: 'Primary', language: 'English', summary: 'Read and listen.', objectives: ['Listen carefully.'],
-  sections: [{ type: 'quiz', title: 'Practice', body: 'A bird can fly.', items: [], question: 'Which animal can fly?', answer: 'A bird.', translation: '鸟会飞。', source: 'Synthetic test content' }], audio: [], warnings: ['Hand-authored test lesson, not a cloud-generated teaching assessment.'] };
+  sections: [{ type: 'quiz', title: 'Practice', body: 'A bright bird / rests in the shade.', readingPauses: true, items: [], question: 'Which animal can fly?', answer: 'A bird.', translation: '鸟会飞。', source: 'Synthetic test content' }], audio: [], warnings: ['Hand-authored test lesson, not a cloud-generated teaching assessment.'] };
 let app;
 try {
   app = await startNativeApplication({ env: { PATH: process.env.PATH, HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, SYSTEMROOT: process.env.SYSTEMROOT,
@@ -36,11 +38,14 @@ try {
   assert.equal(exported.audioSummary.status, 'complete'); assert.equal(exported.audioSummary.completedClips, plan.clips.length);
   assert.ok(exported.audioSummary.bytes > 10000); assert.ok(exported.audioSummary.bytes < 4 * 1024 * 1024);
   assert.match(exported.html, /data:audio\/mpeg;base64,/); assert.doesNotMatch(exported.html, /data:audio\/wav;base64,/);
+  assert.ok(spokenInputs.includes('A bright bird, rests in the shade.'), 'Native speech receives the pause-normalized sentence');
+  assert.ok(!spokenInputs.some(text => text.includes(' / ')), 'No visible reading separator is submitted to native speech');
+  assert.ok(exported.html.includes('A bright bird / rests in the shade.'), 'The original sentence remains in the sentence control label');
   assert.doesNotMatch(exported.html, /(?:src|href)="https?:/); assert.match(exported.html, /Synthetic original word list/);
   const first = plan.clips[0]; const reused = ok(await client.request(root + '/clips/' + first.id, { method: 'POST', json: { consent: true, expectedSetupRevision: state.setupRevision, attemptId: randomUUID() }, timeout: 120000 }));
   assert.equal(reused.clip.attempts, 1, 'Successful clip is reused, not resynthesized');
   await mkdir('artifacts', { recursive: true }); await writeFile('artifacts/native-full-audio-lesson.html', exported.html);
-  await writeFile('artifacts/native-full-audio-summary.json', JSON.stringify({ ...exported.audioSummary, voice: state.roles.speech.voice, cloudCalls: 0, pronunciation: 'NOT_TESTED', decoder: 'Full FFmpeg MP3 decode per clip', htmlBytes: Buffer.byteLength(exported.html) }, null, 2));
+  await writeFile('artifacts/native-full-audio-summary.json', JSON.stringify({ ...exported.audioSummary, voice: state.roles.speech.voice, cloudCalls: 0, readingPauseInputVerified: true, pronunciation: 'NOT_TESTED', decoder: 'Full FFmpeg MP3 decode per clip', htmlBytes: Buffer.byteLength(exported.html) }, null, 2));
   ok(await client.request('/api/logout', { method: 'POST', json: {} }));
   const missing = await client.request(root); assert.equal(missing.status, 404);
   console.log(`PASS: ${plan.clips.length} real native source/generated word/sentence clips, ${exported.audioSummary.bytes} MP3 bytes; cache reuse, private cleanup, single-file export. No cloud calls. Playback and pronunciation require separate evidence.`);

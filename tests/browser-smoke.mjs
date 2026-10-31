@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { createApp } from '../server.mjs';
 import { probeImage } from '../lib/provider.mjs';
 import { prepareAudioEncoder } from '../lib/audio-encode.mjs';
-import { createQAProvider, wav, listen, close, importFixtures, sourceText, transcriptText, ocrText, longSentence } from './browser-fixtures.mjs';
+import { createQAProvider, wav, listen, close, importFixtures, sourceText, transcriptText, ocrText, longSentence, englishAudioLesson, mathAudioLesson, readingFixtures } from './browser-fixtures.mjs';
 const publicDirectory = resolve(process.env.LEARNLENS_TEST_UI || 'public');
 process.env.LEARNLENS_MEDIA_OFFLINE = '1';
 // Node-side provider calls and tool acquisition must stay loopback/offline.
@@ -31,7 +31,7 @@ ws.onmessage = event => {
   if (msg.method === 'Fetch.requestPaused') {
     const url = new URL(msg.params.request.url);
     const request = msg.params.request;
-    browserRequests.push({ path: url.pathname, method: request.method, ...(url.pathname === '/api/lessons' && request.postData ? { includeAudio: JSON.parse(request.postData).includeAudio } : {}) });
+    browserRequests.push({ session: msg.sessionId, path: url.pathname, method: request.method, ...(url.pathname === '/api/lessons' && request.postData ? { includeAudio: JSON.parse(request.postData).includeAudio } : {}) });
     const allowed = ['about:', 'data:', 'blob:', 'file:'].includes(url.protocol) || ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
     if (!allowed) errors.push('Blocked unexpected non-loopback browser request');
     void call(allowed ? 'Fetch.continueRequest' : 'Fetch.failRequest', { requestId: msg.params.requestId, ...(allowed ? {} : { errorReason: 'BlockedByClient' }) }, msg.sessionId).catch(() => {});
@@ -64,7 +64,7 @@ async function attachments(session, count) {
   await wait(session, `document.querySelectorAll('#material-list > li').length === ${count} && document.getElementById('material-list').getAttribute('aria-busy') === 'false'`);
   assert.equal(await evaluate(session, 'document.querySelectorAll("#material-list .inline-message.error").length'), 0, await evaluate(session, 'document.getElementById("material-list").innerText'));
 }
-async function shot(session, name) { await call('Page.bringToFront', {}, session); const { data } = await call('Page.captureScreenshot', { format: 'png' }, session); await writeFile(resolve('artifacts/timeout-notes-browser', name), Buffer.from(data, 'base64')); }
+async function shot(session, name) { await call('Page.bringToFront', {}, session); const { data } = await call('Page.captureScreenshot', { format: 'png' }, session); await writeFile(resolve('artifacts/english-audio-browser', name), Buffer.from(data, 'base64')); }
 async function upload(session, selector, files) { const { root } = await call('DOM.getDocument', {}, session); const { nodeId } = await call('DOM.querySelector', { nodeId: root.nodeId, selector }, session); await call('DOM.setFileInputFiles', { nodeId, files: files.map(file => resolve(file)) }, session); }
 async function gesture(session, expression) {
   const result = await call('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true }, session);
@@ -110,6 +110,394 @@ async function verifyFullPlayer(session, { synthetic = false } = {}) {
   assert.deepEqual(await evaluate(session, 'performance.getEntriesByType("resource").filter(r=>/^https?:/.test(r.name)).map(r=>r.name)'), []);
   passed('full offline player: actual MP3 decode/playback, single player, speeds, natural ended repeat progression, Stop/rapid replacement, hidden answers/collapse, long sentence pieces and 320px');
 }
+async function setAudioMode(session, mode) {
+  await evaluate(session, `document.getElementById('audio-mode').value=${JSON.stringify(mode)};document.getElementById('audio-mode').dispatchEvent(new Event('input'));document.getElementById('audio-mode').dispatchEvent(new Event('change'))`);
+  assert.equal(await evaluate(session, 'document.getElementById("audio-mode").value'), mode);
+}
+async function audioFixtureTab(origin, providerOrigin, { speech = true } = {}) {
+  const original = browserContextId;
+  ({ browserContextId } = await call('Target.createBrowserContext'));
+  const context = browserContextId; extraContexts.push(context);
+  let session;
+  try { session = await tab(origin); } finally { browserContextId = original; }
+  await wait(session, 'document.getElementById("setup-label")?.textContent === "Connect your AI"');
+  assert.deepEqual(await evaluate(session, `(()=>{const n=document.getElementById('audio-mode');return [n.tagName,n.value,[...n.options].map(o=>o.value),document.getElementById('include-audio')===null]})()`), ['SELECT', 'auto', ['auto', 'on', 'off'], true]);
+  await evaluate(session, `document.querySelector('[data-page="providers"]').click();document.getElementById('provider-name').value='English audio synthetic QA';document.getElementById('provider-url').value=${JSON.stringify(providerOrigin + '/v1')};document.getElementById('provider-form').requestSubmit()`);
+  await wait(session, '!!document.querySelector(".provider-name")');
+  await evaluate(session, 'document.querySelector(".discover-button").click()');
+  await wait(session, 'document.querySelector(".provider-model-count")?.textContent === "4 listed models"');
+  await evaluate(session, `document.getElementById('role-speech-engine').value='provider';document.getElementById('role-speech-engine').dispatchEvent(new Event('change'));for(const [role,model] of ${JSON.stringify([['primary','test/vision'], ['transcription','test/transcribe'], ...(speech ? [['speech','test/speech']] : [])])}){const p=document.getElementById('role-'+role+'-provider');p.selectedIndex=1;p.dispatchEvent(new Event('change'));const m=document.getElementById('role-'+role+'-model');m.value=model;m.dispatchEvent(new Event('change'))}document.getElementById('roles-form').requestSubmit()`);
+  await wait(session, `document.getElementById('setup-count').textContent === '${speech ? 3 : 2}/3' && !document.getElementById('roles-fields').disabled`);
+  await evaluate(session, 'document.querySelector("[data-page=lesson]").click();document.getElementById("tab-compose").click()');
+  return { session, context };
+}
+async function tabInContext(origin, context) {
+  const previous = browserContextId; browserContextId = context;
+  try { return await tab(origin); } finally { browserContextId = previous; }
+}
+const audioCounts = qa => Object.fromEntries(['transcription', 'digest', 'lesson', 'audio-extract', 'speech'].map(kind => [kind, qa.calls.filter(c => c.kind === kind).length]));
+const audioRequests = (session, from = 0) => browserRequests.slice(from).filter(r => r.session === session && /^\/api\/audio\//.test(r.path));
+async function retainedAudioIdle(session) {
+  await wait(session, '!document.getElementById("preview-result").hidden && document.getElementById("preview-loading").hidden && !document.getElementById("continue-audio").hidden && !document.getElementById("continue-audio").disabled && !document.getElementById("confirm-dialog").open');
+  assert.equal(await evaluate(session, 'document.getElementById("preview-error").hidden'), true, 'An audio failure cannot discard the text lesson');
+  assert.match(await evaluate(session, 'document.getElementById("download-lesson").href'), /^blob:/);
+}
+async function spyRetainedText(session, title) {
+  // Passive observation only: forward the same request/arguments and unmodified response.
+  await evaluate(session, `window.__audioDispatch=[];window.__audioOriginalFetch=window.fetch;window.fetch=function(input,options){const path=new URL(typeof input==='string'?input:input.url,location.href).pathname;if(path.startsWith('/api/audio/'))window.__audioDispatch.push({path,retained:!document.getElementById('preview-result').hidden&&document.getElementById('lesson-frame').srcdoc.includes(${JSON.stringify(title)})});return window.__audioOriginalFetch.call(this,input,options)}`);
+}
+async function initialAudioConsent(session, qa, requestStart) {
+  const before = qa.calls.length;
+  await evaluate(session, 'document.getElementById("lesson-form").requestSubmit()');
+  await wait(session, 'document.getElementById("confirm-dialog").open');
+  assert.equal(qa.calls.length, before, 'Opening initial consent dispatches no provider call');
+  assert.deepEqual(audioRequests(session, requestStart), [], 'No audio preflight, extraction or plan before initial consent');
+  await evaluate(session, 'document.getElementById("confirm-cancel").click()');
+  await wait(session, '!document.getElementById("generate-button").disabled');
+  assert.equal(qa.calls.length, before, 'Cancelling initial consent is AI-free');
+  assert.deepEqual(audioRequests(session, requestStart), []);
+  await evaluate(session, 'document.getElementById("lesson-form").requestSubmit()');
+  await consent(session);
+}
+async function releaseAudioFixtureSession(session) {
+  // Tests share an app instance with real global reservations: free this synthetic
+  // session's finished plans/originals rather than raising production quota limits.
+  await evaluate(session, 'document.getElementById("clear-session").click()');
+  await wait(session, 'document.getElementById("confirm-dialog").open');
+  await evaluate(session, 'document.getElementById("confirm-accept").click()');
+  await wait(session, 'document.getElementById("setup-label").textContent === "Connect your AI" && !document.getElementById("confirm-dialog").open');
+}
+async function exactAudioCount(session) {
+  const exactOpen = 'document.getElementById("confirm-dialog").open && /complete English audio/.test(document.getElementById("confirm-title").textContent)';
+  await wait(session, `(${exactOpen}) || (!document.getElementById('confirm-dialog').open && !document.getElementById('preview-result').hidden && !document.getElementById('continue-audio').hidden && !document.getElementById('continue-audio').disabled && document.getElementById('audio-message').textContent.length>0)`);
+  if (!await evaluate(session, exactOpen)) {
+    const failure = await evaluate(session, '({notice:document.getElementById("audio-message").textContent,operation:document.getElementById("audio-operation").textContent,report:JSON.parse(document.getElementById("diagnostic-report").textContent)})');
+    await writeFile(resolve('artifacts/english-audio-browser/exact-consent-failure.json'), JSON.stringify(failure, null, 2));
+    await shot(session, 'exact-consent-failure.png');
+    throw new Error('Expected exact-count consent; audio paused: ' + failure.notice);
+  }
+  assert.equal(await evaluate(session, 'document.getElementById("confirm-accept").disabled'), true, 'Remote exact-count consent is required before any clip');
+  const description = await evaluate(session, 'document.getElementById("confirm-description").textContent');
+  const count = Number(description.match(/(\d+) unique clips exactly/)?.[1]);
+  assert.ok(Number.isSafeInteger(count) && count > 0, 'Exact unique clip count is displayed');
+  return count;
+}
+async function checkSpeechCount(session, qa, count) {
+  await wait(session, '!document.getElementById("generate-button").disabled && document.getElementById("continue-audio").hidden');
+  const inputs = qa.calls.filter(c => c.kind === 'speech').map(c => c.body.input);
+  assert.equal(inputs.length, count, 'Consent count equals actual speech request count');
+  assert.equal(new Set(inputs).size, count, 'Every exact unique clip is sent once, including reused word forms');
+  assert.match(await evaluate(session, 'document.getElementById("audio-count").textContent'), new RegExp(`^${count}/${count}.*complete`));
+  return inputs;
+}
+async function assertSourceLock(session, qa) {
+  const before = qa.calls.length, html = await evaluate(session, 'document.getElementById("lesson-frame").srcdoc');
+  const ids = await evaluate(session, '[...document.querySelectorAll("#material-list details")].map(n=>n.dataset.id)');
+  assert.equal(await evaluate(session, 'document.getElementById("generate-button").disabled && document.getElementById("material-input").disabled && document.getElementById("dropzone").disabled && document.getElementById("record-button").disabled'), true, 'Pending source inventory locks creation and attachment entry points');
+  assert.equal(await evaluate(session, '[...document.querySelectorAll("#material-list button,[data-action=demo]")].every(n=>n.disabled)'), true, 'Pending source inventory locks remove/retry and demo');
+  // requestSubmit bypasses a disabled submit button: the handler still must reject it.
+  await evaluate(session, 'document.getElementById("lesson-form").requestSubmit();document.querySelector("[data-action=demo]").click();document.querySelector("#material-list button")?.click()');
+  assert.equal(await evaluate(session, 'document.getElementById("confirm-dialog").open'), false);
+  assert.equal(await evaluate(session, 'document.getElementById("lesson-frame").srcdoc'), html);
+  assert.deepEqual(await evaluate(session, '[...document.querySelectorAll("#material-list details")].map(n=>n.dataset.id)'), ids);
+  assert.equal(qa.calls.length, before, 'Blocked replacement makes no provider request');
+}
+async function verifyReadingPausesOffline(session, qa, count) {
+  const inputs = qa.calls.filter(c => c.kind === 'speech').map(c => c.body.input);
+  for (const [raw, spoken] of [[readingFixtures.body, readingFixtures.spokenBody], [readingFixtures.question, readingFixtures.spokenQuestion], [readingFixtures.answer, readingFixtures.spokenAnswer], [readingFixtures.audio, readingFixtures.spokenAudio]]) {
+    assert.ok(inputs.includes(spoken), 'Actual speech wire contains normalized pause: ' + spoken);
+    assert.ok(!inputs.includes(raw), 'Marked spaced slash is not sent to speech: ' + raw);
+  }
+  assert.ok(inputs.includes('Choose and / or for alternatives.'), 'Unmarked alternatives keep meaningful spaced slashes');
+  assert.ok(inputs.includes('Compare 3/4 and m/s.'), 'Fractions and units remain unchanged on speech wire');
+  assert.ok(inputs.includes(readingFixtures.uploaded), 'Uploaded slashes are not guessed to be reading markup');
+  const html = await evaluate(session, 'document.getElementById("lesson-frame").srcdoc');
+  const file = resolve('artifacts/english-audio-browser/english-auto-pauses-offline.html');
+  await writeFile(file, html);
+  const offline = await tab(pathToFileURL(file).href);
+  await call('Network.enable', {}, offline);
+  await call('Network.emulateNetworkConditions', { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 }, offline);
+  await call('Page.reload', {}, offline);
+  await wait(offline, '!!document.getElementById("course-player")');
+  assert.equal(await evaluate(offline, 'document.documentElement.lang'), 'zh', 'English-subject audio does not change Chinese explanation language');
+  for (const raw of [readingFixtures.body, readingFixtures.question, readingFixtures.answer, readingFixtures.meaningful, readingFixtures.uploaded]) assert.equal(await evaluate(offline, `document.body.textContent.includes(${JSON.stringify(raw)})`), true, 'Offline display preserves original: ' + raw);
+  const answerSelector = `.sentence-play[aria-label=${JSON.stringify('Play sentence: ' + readingFixtures.answer)}]`;
+  const answerState = await evaluate(offline, `(()=>{const b=document.querySelector(${JSON.stringify(answerSelector)});return {exists:!!b,disabled:b?.disabled,open:b?.closest('details')?.open,visible:b?.checkVisibility()}})()`);
+  assert.deepEqual(answerState, { exists: true, disabled: false, open: false, visible: false }, 'Answer and its playback remain concealed until reveal');
+  assert.equal(await evaluate(offline, 'document.getElementById("course-player").hasAttribute("src")'), false, 'No autoplay');
+  await gesture(offline, `const b=document.querySelector(${JSON.stringify(answerSelector)});b.closest('details').open=true;b.click()`);
+  await wait(offline, 'document.getElementById("course-player").currentTime > .05');
+  assert.ok(await evaluate(offline, 'document.getElementById("course-player").duration > 0'), 'Normalized sentence uses a decodable MP3');
+  await evaluate(offline, `document.querySelector(${JSON.stringify(answerSelector)}).closest('details').open=false`);
+  await wait(offline, 'document.getElementById("course-player").paused && !document.getElementById("course-player").hasAttribute("src")');
+  for (const width of [390, 320]) {
+    await call('Emulation.setDeviceMetricsOverride', { width, height: 800, deviceScaleFactor: 1, mobile: true }, offline);
+    assert.equal(await evaluate(offline, 'document.documentElement.scrollWidth <= innerWidth'), true, width + 'px reading pause/answer layout');
+  }
+  assert.deepEqual(await evaluate(offline, 'performance.getEntriesByType("resource").filter(r=>/^https?:/.test(r.name)).map(r=>r.name)'), []);
+  await shot(offline, 'english-auto-pauses-offline.png');
+  englishAudioEvidence.push({ case: 'reading-pauses-wire-offline', count, normalizedInputs: [readingFixtures.spokenBody, readingFixtures.spokenQuestion, readingFixtures.spokenAnswer, readingFixtures.spokenAudio], unmarkedInputs: [readingFixtures.uploaded, 'Choose and / or for alternatives.', 'Compare 3/4 and m/s.'], export: file });
+  passed('reading pauses: marked sections/questions/answers/audio normalize actual provider input to commas; unmarked meaningful/uploaded slashes stay; original offline markers and concealed answers retained; MP3 playback/collapse, Chinese language and 320px');
+}
+async function verifyVideoSourceConsent(origin, textFile) {
+  const fixtures = await importFixtures(resolve('artifacts/english-audio-browser/english-video-fixtures'), { media: true });
+  const video = fixtures.media.find(file=>file.endsWith('movie.mp4'));
+  assert.ok(video, 'Generic native video fixture exists');
+  const qa = createQAProvider({ lesson: englishAudioLesson() }); englishAudioProviders.push(qa);
+  const { session } = await audioFixtureTab(origin, await listen(qa.server));
+  await upload(session, '#material-input', [video]); await attachments(session, 1);
+  const visuals = await evaluate(session, 'document.querySelectorAll("#material-list > li:first-child .material-visuals img").length');
+  assert.ok(visuals > 0, 'Video prepares real stills before text preview clears them');
+  await upload(session, '#material-input', [textFile]); await attachments(session, 2);
+  assert.equal(await evaluate(session, 'document.querySelectorAll("#material-list > li:first-child .material-visuals img").length'), 0, 'Loading text preview clears disposable video previews');
+  const start = browserRequests.length;
+  qa.config.audioExtractFailAt = 1;
+  await initialAudioConsent(session, qa, start); await retainedAudioIdle(session);
+  assert.deepEqual(audioCounts(qa), { transcription: 1, digest: 1, lesson: 1, 'audio-extract': 1, speech: 0 });
+  await evaluate(session, 'document.getElementById("continue-audio").click()');
+  await wait(session, 'document.getElementById("confirm-dialog").open');
+  assert.equal(await evaluate(session, 'document.getElementById("confirm-title").textContent'), 'Prepare remaining English audio sources?');
+  assert.equal(await evaluate(session, 'document.getElementById("confirm-consent").closest("[hidden]") === null && !document.getElementById("confirm-consent").checked && document.getElementById("confirm-accept").disabled'), true, 'Durable video manifest requires explicit paid OCR consent even with no retained preview images');
+  const before = qa.calls.length;
+  await evaluate(session, 'document.getElementById("confirm-accept").click()');
+  assert.equal(await evaluate(session, 'document.getElementById("confirm-dialog").open'), true);
+  assert.equal(qa.calls.length, before, 'Disabled acceptance cannot dispatch paid video OCR');
+  await shot(session, 'video-text-cleared-preview-paid-consent.png');
+  await evaluate(session, 'document.getElementById("confirm-cancel").click()'); await retainedAudioIdle(session);
+  assert.equal(qa.calls.length, before);
+  qa.config.audioExtractFailAt = null;
+  await evaluate(session, 'document.getElementById("continue-audio").click()'); await consent(session);
+  const count = await exactAudioCount(session);
+  assert.deepEqual(audioCounts(qa), { transcription: 1, digest: 1, lesson: 1, 'audio-extract': visuals + 1, speech: 0 }, 'Only failed/remaining video OCR is dispatched after checkbox consent');
+  await exactConsent(session, false); await retainedAudioIdle(session);
+  englishAudioEvidence.push({ case: 'video-source-consent', originalVisualCount: visuals, previewVisualsAfterText: 0, paidCheckboxRequired: true, exactClips: count, counts: audioCounts(qa) });
+  passed('video + text: clearing disposable video preview images cannot hide the paid pending-OCR checkbox; cancelled/unchecked consent dispatches nothing; only remaining OCR resumes, with no STT/digest/teaching replay');
+  await releaseAudioFixtureSession(session);
+}
+async function verifyRetentionResumeGuard(origin) {
+  const qa = createQAProvider({ lesson: englishAudioLesson({ title: 'First retained audio lesson' }) }); englishAudioProviders.push(qa);
+  const { session } = await audioFixtureTab(origin, await listen(qa.server));
+  await setAudioMode(session, 'on');
+  await evaluate(session, 'document.getElementById("learning-goal").value="First retained audio fixture";document.getElementById("learning-goal").dispatchEvent(new Event("input"))');
+  await initialAudioConsent(session, qa, browserRequests.length);
+  const count = await exactAudioCount(session);
+  await exactConsent(session, false); await retainedAudioIdle(session);
+  const firstHtml = await evaluate(session, 'document.getElementById("lesson-frame").srcdoc');
+  assert.deepEqual(audioCounts(qa), { transcription: 0, digest: 0, lesson: 1, 'audio-extract': 0, speech: 0 });
+  await setAudioMode(session, 'off');
+  qa.config.failKind = 'lesson';
+  await evaluate(session, 'document.getElementById("tab-compose").click();document.getElementById("learning-goal").value="Second failed lesson fixture";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("lesson-form").requestSubmit()');
+  await consent(session);
+  await wait(session, '!document.getElementById("preview-error").hidden && !document.getElementById("generate-button").disabled');
+  assert.equal(audioCounts(qa).lesson, 2);
+  qa.config.failKind = null; qa.config.lesson.title = 'Recovered second text lesson';
+  await evaluate(session, 'document.querySelector("[data-action=demo]").click()'); await created(session);
+  const demoHtml = await evaluate(session, 'document.getElementById("lesson-frame").srcdoc');
+  assert.match(await evaluate(session, 'document.getElementById("result-kind").textContent'), /HAND-AUTHORED/);
+  await wait(session, '!document.getElementById("continue-generation").hidden && !document.getElementById("continue-generation").disabled');
+  const before = qa.calls.length, requests = browserRequests.length;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await evaluate(session, 'document.getElementById("continue-generation").click()');
+    assert.equal(await evaluate(session, 'document.getElementById("confirm-dialog").open'), false, 'Retention guard blocks paid teaching resume before confirmation');
+    assert.match(await evaluate(session, 'document.getElementById("generation-error").textContent'), /oldest.*unfinished audio/i);
+    assert.equal(await evaluate(session, 'document.getElementById("lesson-frame").srcdoc'), demoHtml);
+    assert.equal(qa.calls.length, before, 'Repeated Continue cannot pay for teaching that cannot be retained');
+  }
+  assert.equal(browserRequests.slice(requests).filter(r=>r.session===session && r.path==='/api/lessons').length, 0);
+  await shot(session, 'retention-blocked-teaching-resume.png');
+  await evaluate(session, 'document.getElementById("switch-previous").click()');
+  assert.equal(await evaluate(session, 'document.getElementById("lesson-frame").srcdoc'), firstHtml);
+  await evaluate(session, 'document.getElementById("continue-audio").click()');
+  await wait(session, 'document.getElementById("confirm-dialog").open');
+  assert.match(await evaluate(session, 'document.getElementById("confirm-title").textContent'), /Resume this retained/);
+  await evaluate(session, 'document.getElementById("confirm-accept").click()');
+  assert.equal(await exactAudioCount(session), count, 'Audio-only recovery is still allowed while new lesson retention is blocked');
+  await exactConsent(session, false); await retainedAudioIdle(session);
+  assert.equal(qa.calls.length, before);
+  await evaluate(session, 'document.getElementById("discard-audio").click()');
+  await wait(session, 'document.getElementById("confirm-dialog").open');
+  await evaluate(session, 'document.getElementById("confirm-accept").click()');
+  await wait(session, 'document.getElementById("continue-audio").hidden && !document.getElementById("generate-button").disabled');
+  await evaluate(session, 'document.getElementById("continue-generation").click()');
+  await wait(session, 'document.getElementById("confirm-dialog").open');
+  assert.equal(await evaluate(session, 'document.getElementById("confirm-title").textContent'), 'Continue generation from the last checkpoint?');
+  await consent(session); await created(session);
+  assert.equal(await evaluate(session, 'document.getElementById("result-title").textContent'), 'Recovered second text lesson');
+  assert.deepEqual(audioCounts(qa), { transcription: 0, digest: 0, lesson: 3, 'audio-extract': 0, speech: 0 }, 'After explicit discard, exactly one B teaching retry can be retained');
+  englishAudioEvidence.push({ case: 'retention-resume-guard', blockedTeachingAttempts: 2, audioOnlyContinuationAllowed: true, counts: audioCounts(qa) });
+  passed('retention guard: A unfinished audio + failed B + demo cannot pay for unretainable B on repeated Continue; A audio-only recovery remains allowed; Discard unlocks exactly one B teaching retry');
+  await releaseAudioFixtureSession(session);
+}
+async function runEnglishAudioChecks(origin) {
+  const selectedCases = (process.env.LEARNLENS_BROWSER_CASES || '').split(',').filter(Boolean);
+  const wanted = name => !selectedCases.length || selectedCases.includes(name);
+  const screenshot = resolve('artifacts/english-audio-browser/test-screenshot.png');
+  const screenshot2 = resolve('artifacts/english-audio-browser/second-synthetic-image.png');
+  const text = resolve('artifacts/english-audio-browser/reading-pauses-source.md');
+  const audio = resolve('artifacts/english-audio-browser/test-audio.wav');
+  await writeFile(text, readingFixtures.uploaded);
+  const matrix = [
+    { name: 'auto-english-chinese', lesson: englishAudioLesson(), mode: 'auto', subject: 'Auto', audio: true, deferred: true },
+    { name: 'auto-math-english', lesson: mathAudioLesson(), mode: 'auto', subject: 'Auto', audio: false },
+    { name: 'auto-legacy-muffin', lesson: { ...mathAudioLesson(), title: 'Synthetic baking lesson', subject: 'English muffin baking', englishLearning: undefined, summary: 'Learn to bake muffins, not study the English language.', objectives: ['Mix dough.'], sections: [{ type: 'steps', title: 'Mix dough', body: 'Mix flour and milk. Cook the shaped dough.', items: [], question: '', answer: '', translation: '', source: '' }] }, mode: 'auto', subject: 'Auto', audio: false },
+    { name: 'on-nonenglish', lesson: mathAudioLesson(), mode: 'on', subject: 'Mathematics', audio: true },
+    { name: 'off-english', lesson: englishAudioLesson(), mode: 'off', subject: 'English', audio: false },
+    { name: 'selected-english-false-metadata', lesson: englishAudioLesson({ englishLearning: false, subject: 'Unclassified material' }), mode: 'auto', subject: 'English', audio: true },
+    { name: 'selected-math-true-metadata', lesson: englishAudioLesson(), mode: 'auto', subject: 'Mathematics', audio: false },
+  ];
+  const allowed = [...matrix.map(c=>c.name), 'deferred-ocr-resume', 'missing-speech', 'pending-discard', 'video-source-consent', 'retention-resume-guard'];
+  assert.ok(selectedCases.every(name=>allowed.includes(name)), 'Unknown LEARNLENS_BROWSER_CASES value');
+  for (const spec of matrix.filter(c=>wanted(c.name))) {
+    const qa = createQAProvider({ lesson: spec.lesson }); englishAudioProviders.push(qa);
+    const providerOrigin = await listen(qa.server);
+    const { session } = await audioFixtureTab(origin, providerOrigin);
+    await setAudioMode(session, spec.mode);
+    await evaluate(session, `document.getElementById('learning-goal').value='Synthetic subject policy evidence';document.getElementById('learning-goal').dispatchEvent(new Event('input'));document.getElementById('language').value=${JSON.stringify(spec.lesson.language)};document.getElementById('language').dispatchEvent(new Event('change'));${spec.subject === 'Auto' ? '' : `document.getElementById('subject').value='custom';document.getElementById('subject').dispatchEvent(new Event('change'));document.getElementById('custom-subject').value=${JSON.stringify(spec.subject)};document.getElementById('custom-subject').dispatchEvent(new Event('input'));`}`);
+    await spyRetainedText(session, spec.lesson.title);
+    const beforeUpload = qa.calls.length, requestStart = browserRequests.length;
+    await upload(session, '#material-input', [screenshot, text, audio]); await attachments(session, 3);
+    assert.equal(qa.calls.length, beforeUpload, 'Synthetic imports are AI-free');
+    await initialAudioConsent(session, qa, requestStart);
+    let clips = 0;
+    if (spec.audio) {
+      clips = await exactAudioCount(session);
+      assert.equal(audioCounts(qa).speech, 0, 'All speech waits for exact unique clip consent');
+      assert.equal(await evaluate(session, 'document.getElementById("preview-result").hidden'), false, 'Text retained before speech consent');
+      assert.equal(audioCounts(qa)['audio-extract'], 1);
+      if (spec.deferred) {
+        assert.equal(qa.calls.slice(0, qa.calls.findIndex(c=>c.kind==='lesson')).filter(c=>c.kind==='audio-extract').length, 0, 'Subject Auto performs no extra OCR before normal teaching');
+        const requests = browserRequests.slice(requestStart).filter(r=>r.session===session);
+        const teachingIndex = requests.findIndex(r=>r.path==='/api/lessons');
+        assert.ok(teachingIndex >= 0);
+        assert.equal(requests.slice(0, teachingIndex).filter(r=>r.path.startsWith('/api/audio/')).length, 0, 'Auto has no preflight, extraction or plan before classification');
+        assert.ok(requests.slice(teachingIndex + 1).some(r=>/\/parts$/.test(r.path)), 'Inventory-only upgrade rereads local media parts, while reusing the paid transcript');
+        assert.equal(await evaluate(session, 'window.__audioDispatch.every(e=>e.retained)'), true, 'Every deferred audio request sees the retained text lesson');
+      } else assert.ok(qa.calls.findIndex(c=>c.kind==='audio-extract') < qa.calls.findIndex(c=>c.kind==='lesson'), 'Manual On/selected English retains consented eager complete-audio preparation');
+      await exactConsent(session); await checkSpeechCount(session, qa, clips);
+      if (spec.name === 'auto-english-chinese') await verifyReadingPausesOffline(session, qa, clips);
+    } else {
+      await created(session);
+      assert.deepEqual(audioRequests(session, requestStart), [], 'Off/non-English dispatches no audio preflight, OCR, plan or speech');
+      assert.equal(await evaluate(session, 'document.getElementById("audio-progress-panel").hidden'), true);
+    }
+    assert.deepEqual({ ...audioCounts(qa), speech: 0 }, { transcription: 1, digest: 1, lesson: 1, 'audio-extract': spec.audio ? 1 : 0, speech: 0 }, 'Normal teaching preparation is neither skipped nor replayed');
+    assert.equal(audioCounts(qa).speech, clips);
+    const teachingRequests = browserRequests.slice(requestStart).filter(r=>r.session===session && r.path==='/api/lessons');
+    assert.equal(teachingRequests.length, 1); assert.equal(teachingRequests[0].includeAudio, false);
+    const teaching = qa.calls.find(c=>c.kind==='lesson').body.input[0].content[0].text;
+    assert.ok(teaching.includes(spec.lesson.language), 'Explanation language reaches teaching independently');
+    englishAudioEvidence.push({ case: spec.name, subject: spec.lesson.subject, ...(typeof spec.lesson.englishLearning === 'boolean' ? { englishLearning: spec.lesson.englishLearning } : { metadataAbsent: true }), counts: audioCounts(qa), uniqueClips: clips, includeAudio: teachingRequests[0].includeAudio });
+    passed(spec.name + ': explicit subject/metadata/mode precedence, explanation-language independence, normal teaching once, paid consent and exact clip accounting');
+    await releaseAudioFixtureSession(session);
+  }
+  for (const name of ['deferred-ocr-resume', 'missing-speech', 'pending-discard'].filter(wanted)) {
+    const qa = createQAProvider({ lesson: englishAudioLesson() }); englishAudioProviders.push(qa);
+    const providerOrigin = await listen(qa.server);
+    const missing = name !== 'deferred-ocr-resume';
+    const { session, context } = await audioFixtureTab(origin, providerOrigin, { speech: !missing });
+    const secondImage = await evaluate(session, `(()=>{const canvas=document.createElement('canvas');canvas.width=16;canvas.height=16;const context=canvas.getContext('2d');context.fillStyle='#2345cd';context.fillRect(0,0,16,16);return canvas.toDataURL('image/png')})()`);
+    await writeFile(screenshot2, Buffer.from(secondImage.split(',')[1], 'base64'));
+    const requestStart = browserRequests.length;
+    await spyRetainedText(session, qa.config.lesson.title);
+    await evaluate(session, 'document.getElementById("learning-goal").value="Pinned synthetic inventory";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("language").value="Chinese (Simplified)";document.getElementById("language").dispatchEvent(new Event("change"))');
+    await upload(session, '#material-input', [audio, screenshot, screenshot2, text]); await attachments(session, 4);
+    if (!missing) qa.config.audioExtractFailAt = 2;
+    await initialAudioConsent(session, qa, requestStart); await retainedAudioIdle(session);
+    const retained = await evaluate(session, 'document.getElementById("lesson-frame").srcdoc');
+    assert.ok(retained.includes(qa.config.lesson.title)); assert.doesNotMatch(retained, /data:audio\//);
+    assert.deepEqual(audioCounts(qa), { transcription: 1, digest: 2, lesson: 1, 'audio-extract': missing ? 0 : 2, speech: 0 });
+    assert.equal(await evaluate(session, 'document.getElementById("audio-mode").value'), 'auto', 'Missing speech never coerces the user preference to Off');
+    assert.equal(await evaluate(session, 'window.__audioDispatch.every(e=>e.retained)'), true);
+    assert.equal(audioRequests(session, requestStart).filter(r=>r.path.startsWith('/api/audio/plans')).length, 0, 'Incomplete source inventory cannot create a plan');
+    if (missing) assert.deepEqual(audioRequests(session, requestStart), [], 'Missing speech retains text before audio preflight or extra paid OCR');
+    const pendingReport = await evaluate(session, 'JSON.parse(document.getElementById("diagnostic-report").textContent)');
+    assert.doesNotMatch(JSON.stringify(pendingReport), /Pinned synthetic inventory|Uploaded words|Screenshot final|test-screenshot|second-synthetic-image|data:image|data:audio|Bearer/);
+    if (!missing) {
+      assert.equal(pendingReport.checkpoint.phase, 'audio_sources');
+      assert.equal(pendingReport.checkpoint.preparationComplete, true);
+      assert.equal(pendingReport.checkpoint.audioSourceStarted, true);
+      assert.equal(pendingReport.checkpoint.audioSourceComplete, false);
+      assert.equal(pendingReport.lastOperation.automaticRetry, false);
+    }
+    await assertSourceLock(session, qa);
+    await shot(session, name + '-text-retained.png');
+    if (name === 'pending-discard') {
+      const before = qa.calls.length;
+      await evaluate(session, 'document.getElementById("discard-audio").click()');
+      await wait(session, 'document.getElementById("confirm-dialog").open');
+      assert.equal(await evaluate(session, 'document.getElementById("confirm-title").textContent'), 'Discard remaining audio?');
+      await evaluate(session, 'document.getElementById("confirm-accept").click()');
+      await wait(session, '!document.getElementById("generate-button").disabled && !document.getElementById("material-input").disabled');
+      assert.equal(await evaluate(session, 'document.getElementById("lesson-frame").srcdoc'), retained);
+      assert.equal(qa.calls.length, before);
+      assert.equal(await evaluate(session, '[...document.querySelectorAll("#material-list button,[data-action=demo]")].every(n=>!n.disabled)'), true);
+      await evaluate(session, 'document.querySelector("[data-action=demo]").click()'); await created(session);
+      assert.match(await evaluate(session, 'document.getElementById("result-kind").textContent'), /HAND-AUTHORED/);
+      englishAudioEvidence.push({ case: name, counts: audioCounts(qa), discardedWithoutChangingText: true });
+      passed('pending source inventory locks attachments/new lesson/demo; explicit Discard preserves HTML, makes no AI call and unlocks creation');
+      await releaseAudioFixtureSession(session);
+      continue;
+    }
+    // A second tab changes saved settings while the lesson tab intentionally stays stale.
+    const settings = await tabInContext(origin, context);
+    await wait(settings, '!!document.getElementById("role-primary-model") && !document.getElementById("roles-fields").disabled');
+    const beforeSettings = qa.calls.length;
+    await evaluate(settings, `document.querySelector('[data-page="providers"]').click();document.getElementById('role-primary-model').value='gpt-5.4-mini';document.getElementById('role-primary-model').dispatchEvent(new Event('change'));document.getElementById('role-primary-timeout').value='450';document.getElementById('role-primary-timeout').dispatchEvent(new Event('input'));document.getElementById('role-transcription-provider').value='';document.getElementById('role-transcription-provider').dispatchEvent(new Event('change'));${missing ? `document.getElementById('role-speech-engine').value='provider';document.getElementById('role-speech-engine').dispatchEvent(new Event('change'));document.getElementById('role-speech-provider').selectedIndex=1;document.getElementById('role-speech-provider').dispatchEvent(new Event('change'));document.getElementById('role-speech-model').value='test/speech';document.getElementById('role-speech-model').dispatchEvent(new Event('change'));` : ''}document.getElementById('roles-form').requestSubmit()`);
+    await wait(settings, 'document.getElementById("roles-message").textContent.startsWith("Model roles saved") && !document.getElementById("roles-fields").disabled');
+    assert.equal(qa.calls.length, beforeSettings, 'Setup changes never infer');
+    assert.equal(await evaluate(session, 'document.getElementById("role-primary-model").value'), 'test/vision', 'Lesson tab is deliberately stale before Continue');
+    const beforeContinue = browserRequests.length;
+    await evaluate(session, 'document.getElementById("learning-goal").value="Edited after teaching - must not replay";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("continue-audio").click()');
+    await wait(session, 'document.getElementById("confirm-dialog").open');
+    assert.equal(await evaluate(session, 'document.getElementById("confirm-title").textContent'), 'Prepare remaining English audio sources?');
+    const detail = await evaluate(session, 'document.getElementById("confirm-detail").textContent');
+    assert.match(detail, /gpt-5\.4-mini/); assert.match(detail, /Primary request wait: 450 seconds/); assert.match(detail, /test\/speech/);
+    assert.ok(browserRequests.slice(beforeContinue).some(r=>r.session===session && r.path==='/api/state' && r.method==='GET'), 'Continue refreshed setup before rendering new paid OCR consent');
+    assert.equal(qa.calls.length, beforeSettings, 'No missing OCR before renewed consent');
+    await evaluate(session, 'document.getElementById("confirm-cancel").click()'); await retainedAudioIdle(session);
+    assert.equal(qa.calls.length, beforeSettings, 'Cancelling source retry sends no AI request');
+    qa.config.audioExtractFailAt = null;
+    await evaluate(session, 'document.getElementById("continue-audio").click()');
+    await wait(session, 'document.getElementById("confirm-dialog").open');
+    assert.equal(await evaluate(session, 'document.getElementById("confirm-title").textContent'), 'Prepare remaining English audio sources?');
+    await consent(session);
+    const exact = await exactAudioCount(session);
+    assert.deepEqual(audioCounts(qa), { transcription: 1, digest: 2, lesson: 1, 'audio-extract': missing ? 2 : 3, speech: 0 }, 'Only missing/failed OCR runs; pinned transcript survives role removal');
+    const extracts = qa.calls.filter(c=>c.kind==='audio-extract');
+    assert.deepEqual(extracts.map(c=>c.body.model), missing ? ['gpt-5.4-mini','gpt-5.4-mini'] : ['test/vision','test/vision','gpt-5.4-mini']);
+    if (!missing) {
+      assert.equal(extracts[1].failed, true);
+      assert.deepEqual(extracts[2].body.input, extracts[1].body.input, 'Only failed second image repeats, not successful first OCR');
+      assert.notDeepEqual(extracts[0].body.input, extracts[2].body.input);
+    }
+    await exactConsent(session, false); await retainedAudioIdle(session);
+    assert.equal(await evaluate(session, 'document.getElementById("lesson-frame").srcdoc'), retained, 'Exact-count cancellation retains the original text result');
+    assert.equal(await evaluate(session, 'document.getElementById("material-input").disabled'), false, 'Completed inventory releases attachment lock');
+    const completeInventoryCounts = audioCounts(qa), inventoryRequests = browserRequests.length;
+    await evaluate(session, 'document.getElementById("continue-audio").click()');
+    await wait(session, 'document.getElementById("confirm-dialog").open');
+    assert.match(await evaluate(session, 'document.getElementById("confirm-title").textContent'), /Resume this retained/);
+    assert.deepEqual(audioCounts(qa), completeInventoryCounts, 'First ordinary audio confirmation does not repeat preparation');
+    await evaluate(session, 'document.getElementById("confirm-accept").click()');
+    assert.equal(await exactAudioCount(session), exact);
+    assert.deepEqual(audioCounts(qa), completeInventoryCounts, 'Exact confirmation is still required after inventory completed');
+    await exactConsent(session); await checkSpeechCount(session, qa, exact);
+    assert.deepEqual({ ...audioCounts(qa), speech: 0 }, completeInventoryCounts, 'Audio-only continuation never reruns OCR/STT/digests/teaching');
+    assert.equal(browserRequests.slice(inventoryRequests).filter(r=>r.session===session && (/^\/api\/(?:lessons|transcribe|materials\/summarize|audio\/extract|audio\/preflight)$/.test(r.path) || /\/parts$/.test(r.path))).length, 0, 'Completed inventory resume has no preparation or local source rereads');
+    const textInput = qa.calls.find(c=>c.kind==='lesson').body.input[0].content[0].text;
+    assert.ok(textInput.includes('Pinned synthetic inventory')); assert.ok(!textInput.includes('Edited after teaching'));
+    const lessonRequests = browserRequests.slice(requestStart).filter(r=>r.session===session && r.path==='/api/lessons');
+    assert.equal(lessonRequests.length, 1); assert.equal(lessonRequests[0].includeAudio, false);
+    await shot(session, name + '-recovered.png');
+    englishAudioEvidence.push({ case: name, counts: audioCounts(qa), uniqueClips: exact, refreshedConsent: detail, includesLessonReplay: false });
+    passed(name + ': text/download retained, source locks, fresh setup before renewed OCR consent, pinned STT and successful OCR reused across model/role change, no teaching replay, ordinary two-confirmation exact-count audio continuation');
+    await releaseAudioFixtureSession(session);
+  }
+  if (wanted('video-source-consent')) await verifyVideoSourceConsent(origin, text);
+  if (wanted('retention-resume-guard')) await verifyRetentionResumeGuard(origin);
+}
+
+const englishAudioEvidence = [], englishAudioProviders = [];
 const provider = createQAProvider(), kokoro = createQAProvider(), gated = createApp({ publicDirectory, accessPassword: 'test-private-beta-password' }).server;
 let app, longWaitRun;
 const longWaitProviders = [];
@@ -129,7 +517,7 @@ async function startLongWaitChecks(origin) {
     await wait(session, '!!document.querySelector(".provider-name")');
     await evaluate(session, `const p=document.getElementById('role-primary-provider');p.selectedIndex=1;p.dispatchEvent(new Event('change'));const m=document.getElementById('role-primary-model');m.value='__manual__';m.dispatchEvent(new Event('change'));document.getElementById('role-primary-manual').value='test/vision';document.getElementById('role-primary-manual').dispatchEvent(new Event('input'));document.getElementById('role-primary-timeout').value='${seconds}';document.getElementById('role-primary-timeout').dispatchEvent(new Event('input'));document.getElementById('roles-form').requestSubmit()`);
     await wait(session, '!document.getElementById("roles-fields").disabled && document.getElementById("roles-message").textContent.startsWith("Model roles saved")');
-    await evaluate(session, `document.querySelector('[data-page="lesson"]').click();document.getElementById('learning-goal').value='Synthetic long wait lesson ${phase}';document.getElementById('learning-goal').dispatchEvent(new Event('input'));document.getElementById('include-audio').checked=false;document.getElementById('include-audio').dispatchEvent(new Event('input'));document.getElementById('lesson-form').requestSubmit()`);
+    await evaluate(session, `document.querySelector('[data-page="lesson"]').click();document.getElementById('learning-goal').value='Synthetic long wait lesson ${phase}';document.getElementById('learning-goal').dispatchEvent(new Event('input'));document.getElementById('audio-mode').value='off';document.getElementById('audio-mode').dispatchEvent(new Event('input'));document.getElementById('lesson-form').requestSubmit()`);
     await wait(session, 'document.getElementById("confirm-dialog").open');
     assert.match(await evaluate(session, 'document.getElementById("confirm-dialog").textContent'), new RegExp(`Primary request wait: ${seconds} seconds`));
     await consent(session);
@@ -182,14 +570,16 @@ try {
   app = createApp({ publicDirectory, audioEncoderFactory: async () => async () => fixtureMP3, kokoroBaseUrl: kokoroOrigin + '/v1', kokoroBuiltin: true, kokoroFormat: 'wav', kokoroLanguages: ['en'] }).server;
   const origin = await listen(app), gatedOrigin = await listen(gated);
   ({ browserContextId } = await call('Target.createBrowserContext'));
-  await mkdir('artifacts/timeout-notes-browser', { recursive: true });
-  await writeFile('artifacts/timeout-notes-browser/test-screenshot.png', Buffer.from(probeImage().dataUrl.split(',')[1], 'base64'));
-  await writeFile('artifacts/timeout-notes-browser/test-audio.wav', wav);
-  await writeFile('artifacts/timeout-notes-browser/test-notes.md', sourceText + '\n' + longSentence);
-  const downloads = resolve('artifacts/timeout-notes-browser', 'downloads-' + Date.now());
+  await mkdir('artifacts/english-audio-browser', { recursive: true });
+  await writeFile('artifacts/english-audio-browser/test-screenshot.png', Buffer.from(probeImage().dataUrl.split(',')[1], 'base64'));
+  await writeFile('artifacts/english-audio-browser/test-audio.wav', wav);
+  await writeFile('artifacts/english-audio-browser/test-notes.md', sourceText + '\n' + longSentence);
+  const downloads = resolve('artifacts/english-audio-browser', 'downloads-' + Date.now());
   await mkdir(downloads);
   await call('Browser.setDownloadBehavior', { behavior: 'allow', browserContextId, downloadPath: downloads, eventsEnabled: true });
   if (process.env.LEARNLENS_LONG_WAIT_TEST === '1') longWaitRun = (await startLongWaitChecks(origin)).completion;
+  await runEnglishAudioChecks(origin);
+  if (process.env.LEARNLENS_BROWSER_SUITE !== 'english-audio') {
   const s = await tab(origin);
   await wait(s, 'document.getElementById("setup-label")?.textContent === "Connect your AI"');
   await call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false }, s);
@@ -284,9 +674,9 @@ try {
   await wait(s, 'document.getElementById("role-primary-timeout")?.value === "600"');
   assert.equal(await evaluate(s, 'document.getElementById("role-primary-effort").value'), 'low', 'Wait changes preserve thinking');
   passed('primary wait number/default/bounds; hidden speech/STT; starter/advisor preserve wait; save/reload roundtrip; verification scoped to wait');
-  await evaluate(s, `document.querySelector('[data-page="lesson"]').click();document.getElementById('tab-compose').click();document.getElementById('learning-goal').value='Explain this screenshot with examples.';document.getElementById('learning-goal').dispatchEvent(new Event('input'));document.getElementById('include-audio').checked=true;document.getElementById('include-audio').dispatchEvent(new Event('input'))`);
+  await evaluate(s, `document.querySelector('[data-page="lesson"]').click();document.getElementById('tab-compose').click();document.getElementById('learning-goal').value='Explain this screenshot with examples.';document.getElementById('learning-goal').dispatchEvent(new Event('input'));document.getElementById('audio-mode').value='on';document.getElementById('audio-mode').dispatchEvent(new Event('input'))`);
   const beforeUpload = provider.calls.length;
-  await upload(s, '#material-input', ['artifacts/timeout-notes-browser/test-screenshot.png', 'artifacts/timeout-notes-browser/test-notes.md', 'artifacts/timeout-notes-browser/test-audio.wav']);
+  await upload(s, '#material-input', ['artifacts/english-audio-browser/test-screenshot.png', 'artifacts/english-audio-browser/test-notes.md', 'artifacts/english-audio-browser/test-audio.wav']);
   await attachments(s, 3);
   assert.equal(provider.calls.length, beforeUpload, 'Uploads and local preparation never call a provider');
   assert.match(await evaluate(s, 'document.querySelector("#material-list .material-text-preview").textContent'), /Markdown source/);
@@ -349,7 +739,7 @@ try {
   finally { clearTimeout(downloadTimer); }
   const downloaded = await readFile(downloadedPath, 'utf8');
   assert.equal(downloaded, html, 'Actual browser download matches the preview document');
-  await writeFile('artifacts/timeout-notes-browser/browser-export.html', downloaded);
+  await writeFile('artifacts/english-audio-browser/browser-export.html', downloaded);
   await shot(s, 'app-generated.png');
   await shot(s, 'app-full-audio.png');
   assert.ok(provider.calls.some(c => c.path === '/v1/audio/speech'), 'Online speech method used');
@@ -367,7 +757,7 @@ try {
   assert.ok(kokoro.calls.some(c => c.body?.model === 'kokoro' && c.body.voice === 'af_heart'));
   assert.equal(provider.calls.filter(c => c.path === '/v1/audio/speech').length, beforeCloud, 'Kokoro never silently calls cloud speech');
   // The rest of the legacy import suite exercises text-only creation; full-audio recovery is separate below.
-  await evaluate(s, 'document.getElementById("include-audio").checked=false;document.getElementById("include-audio").dispatchEvent(new Event("input"))');
+  await evaluate(s, 'document.getElementById("audio-mode").value="off";document.getElementById("audio-mode").dispatchEvent(new Event("input"))');
   await call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true }, s);
   await evaluate(s, 'document.getElementById("tab-compose").click();scrollTo(0,0)');
   assert.equal(await evaluate(s, 'document.documentElement.scrollWidth <= innerWidth'), true, 'mobile horizontal overflow');
@@ -403,7 +793,7 @@ try {
   passed('provider failure preserves previous lesson and explicit retry succeeds');
   // Genuine PDF/Office originals and a native browser recording: all enter the
   // same file input, never an API-only import or a forged extension.
-  const fixtures = await importFixtures(resolve('artifacts/timeout-notes-browser/browser-import-fixtures'), { media: process.env.LEARNLENS_MEDIA_INTEGRATION === '1' });
+  const fixtures = await importFixtures(resolve('artifacts/english-audio-browser/browser-import-fixtures'), { media: process.env.LEARNLENS_MEDIA_INTEGRATION === '1' });
   const nativeRecording = await call('Runtime.evaluate', { userGesture: true, awaitPromise: true, returnByValue: true, expression: `(async()=>{
     if (!MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) throw new Error('Native WebM recording unsupported in this disposable Chromium');
     const context = new AudioContext(); await context.resume();
@@ -418,7 +808,7 @@ try {
     } finally {destination.stream.getTracks().forEach(t=>t.stop());await context.close()}
   })()` }, s);
   assert.equal(nativeRecording.exceptionDetails, undefined, 'Microphone-free MediaRecorder fixture created');
-  const recordingPath = resolve('artifacts/timeout-notes-browser/browser-import-fixtures/browser-recording.webm');
+  const recordingPath = resolve('artifacts/english-audio-browser/browser-import-fixtures/browser-recording.webm');
   await writeFile(recordingPath, Buffer.from(nativeRecording.result.value.split(',')[1], 'base64'));
   const beforeDocuments = provider.calls.length;
   await evaluate(s, 'document.getElementById("tab-compose").click()');
@@ -484,9 +874,9 @@ try {
   await evaluate(checkpointTab, 'document.querySelector("[data-page=lesson]").click();document.querySelector("[data-action=demo]").click()'); await created(checkpointTab);
   const checkpointPrevious = await evaluate(checkpointTab, 'document.getElementById("lesson-frame").srcdoc');
   const checkpointGoal = 'CHECKPOINT_PRIVATE_INSTRUCTIONS retain original science examples';
-  await writeFile('artifacts/timeout-notes-browser/checkpoint-second.wav', wav);
-  await evaluate(checkpointTab, `document.getElementById('tab-compose').click();document.getElementById('learning-goal').value=${JSON.stringify(checkpointGoal)};document.getElementById('learning-goal').dispatchEvent(new Event('input'));document.getElementById('include-audio').checked=true;document.getElementById('include-audio').dispatchEvent(new Event('input'));document.getElementById('level').value='Primary'`);
-  await upload(checkpointTab, '#material-input', ['artifacts/timeout-notes-browser/test-audio.wav', 'artifacts/timeout-notes-browser/test-screenshot.png', fixtures.documents[0], 'artifacts/timeout-notes-browser/test-notes.md', 'artifacts/timeout-notes-browser/checkpoint-second.wav']);
+  await writeFile('artifacts/english-audio-browser/checkpoint-second.wav', wav);
+  await evaluate(checkpointTab, `document.getElementById('tab-compose').click();document.getElementById('learning-goal').value=${JSON.stringify(checkpointGoal)};document.getElementById('learning-goal').dispatchEvent(new Event('input'));document.getElementById('audio-mode').value='on';document.getElementById('audio-mode').dispatchEvent(new Event('input'));document.getElementById('level').value='Primary'`);
+  await upload(checkpointTab, '#material-input', ['artifacts/english-audio-browser/test-audio.wav', 'artifacts/english-audio-browser/test-screenshot.png', fixtures.documents[0], 'artifacts/english-audio-browser/test-notes.md', 'artifacts/english-audio-browser/checkpoint-second.wav']);
   await attachments(checkpointTab, 5);
   const checkpointAttachments = await evaluate(checkpointTab, '[...document.querySelectorAll("#material-list details")].map(n=>n.dataset.id)');
   const checkpointStart = provider.calls.length, checkpointRequests = browserRequests.length;
@@ -506,7 +896,9 @@ try {
   const assertCheckpointPrivacy = async () => {
     const report = JSON.parse(await evaluate(checkpointTab, 'document.getElementById("diagnostic-report").textContent'));
     assert.doesNotMatch(JSON.stringify(report), /CHECKPOINT_PRIVATE|EDITED_PRIVATE|Markdown source|Gemini-native synthetic transcript|Screenshot final|test-audio|test-screenshot|five-pages|test-notes|checkpoint-second|data:audio|Bearer|"(?:requestBody|responseBody|filename|sourceText|goal)"/);
-    assert.deepEqual(Object.keys(report.checkpoint).sort(), ['completedCalls','completedParts','phase','preparationComplete','totalParts']);
+    assert.deepEqual(Object.keys(report.checkpoint).sort(), ['audioSourceComplete','audioSourceStarted','completedCalls','completedParts','phase','preparationComplete','totalParts']);
+    assert.equal(typeof report.checkpoint.audioSourceStarted, 'boolean');
+    assert.equal(typeof report.checkpoint.audioSourceComplete, 'boolean');
     return report;
   };
   const acceptedNote = 'NOTE_2473_BEGIN_' + 'n'.repeat(2443) + '_NOTE2473_END!';
@@ -573,9 +965,9 @@ try {
   assert.equal(timeoutRevisionReport.checkpoint.completedCalls, 10);
   assert.equal(timeoutRevisionReport.checkpoint.completedParts, 3);
   // Changed attachment identity/count blocks Continue before any provider access.
-  await writeFile('artifacts/timeout-notes-browser/checkpoint-added.md', 'Synthetic attachment identity change.');
+  await writeFile('artifacts/english-audio-browser/checkpoint-added.md', 'Synthetic attachment identity change.');
   await evaluate(checkpointTab, 'document.getElementById("error-back-draft").click()');
-  await upload(checkpointTab, '#material-input', ['artifacts/timeout-notes-browser/checkpoint-added.md']); await attachments(checkpointTab, 6);
+  await upload(checkpointTab, '#material-input', ['artifacts/english-audio-browser/checkpoint-added.md']); await attachments(checkpointTab, 6);
   assert.equal(await evaluate(checkpointTab, 'document.getElementById("continue-generation").disabled'), true);
   await evaluate(checkpointTab, 'document.getElementById("continue-generation").click();document.getElementById("lesson-form").requestSubmit()');
   await wait(checkpointTab, 'document.getElementById("confirm-dialog").open');
@@ -598,7 +990,7 @@ try {
   await evaluate(checkpointTab, 'document.querySelector("[data-page=providers]").click();document.getElementById("role-primary-model").value="gpt-5.4-mini";document.getElementById("role-primary-model").dispatchEvent(new Event("change"));document.getElementById("roles-form").requestSubmit()');
   await wait(checkpointTab, 'document.getElementById("roles-message").textContent.startsWith("Model roles saved") && !document.getElementById("roles-fields").disabled');
   assert.equal(provider.calls.length, beforeCheckpointSettings);
-  await evaluate(checkpointTab, 'document.querySelector("[data-page=lesson]").click();document.getElementById("tab-compose").click();document.getElementById("learning-goal").value="EDITED_PRIVATE_NOT_FOR_RESUME";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("include-audio").checked=false;document.getElementById("include-audio").dispatchEvent(new Event("input"));document.getElementById("level").value="College/University";document.getElementById("tab-preview").click();document.getElementById("retry-preview").click()');
+  await evaluate(checkpointTab, 'document.querySelector("[data-page=lesson]").click();document.getElementById("tab-compose").click();document.getElementById("learning-goal").value="EDITED_PRIVATE_NOT_FOR_RESUME";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("audio-mode").value="off";document.getElementById("audio-mode").dispatchEvent(new Event("input"));document.getElementById("level").value="College/University";document.getElementById("tab-preview").click();document.getElementById("retry-preview").click()');
   await checkpointDialog(false); assertCheckpointCounts(4);
   provider.config.digestFaultAt = null; provider.config.digestFaultRepeat = false; provider.config.failKind = 'lesson';
   await evaluate(checkpointTab, 'document.getElementById("retry-preview").click()'); await checkpointDialog(); await checkpointFailed();
@@ -642,7 +1034,7 @@ try {
   await wait(clearedCheckpointTab, 'document.getElementById("setup-count")?.textContent === "3/3"');
   provider.config.failKind = 'lesson';
   const beforeClearFailure = provider.calls.length;
-  await evaluate(clearedCheckpointTab, 'document.getElementById("learning-goal").value="Synthetic clear-session checkpoint";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("lesson-form").requestSubmit()');
+  await evaluate(clearedCheckpointTab, 'document.getElementById("learning-goal").value="Synthetic clear-session checkpoint";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("audio-mode").value="off";document.getElementById("audio-mode").dispatchEvent(new Event("input"));document.getElementById("lesson-form").requestSubmit()');
   await consent(clearedCheckpointTab);
   await wait(clearedCheckpointTab, '!document.getElementById("preview-error").hidden && !document.getElementById("generate-button").disabled');
   assert.deepEqual(provider.calls.slice(beforeClearFailure).map(c=>c.kind), ['lesson']);
@@ -660,9 +1052,10 @@ try {
   const diagnosticTab = await tab(origin);
   await wait(diagnosticTab, 'document.getElementById("setup-count")?.textContent === "3/3"');
   const diagnosticSource = 'DIAGNOSTIC_PRIVATE_LONG_SOURCE ' + 'Synthetic bounded digest evidence. '.repeat(90) + ' DIAGNOSTIC_PRIVATE_TAIL';
+  await setAudioMode(diagnosticTab, 'off');
   assert.ok(diagnosticSource.length > 2200);
-  await writeFile('artifacts/timeout-notes-browser/diagnostic-long-source.md', diagnosticSource);
-  await upload(diagnosticTab, '#material-input', ['artifacts/timeout-notes-browser/diagnostic-long-source.md', 'artifacts/timeout-notes-browser/test-audio.wav']);
+  await writeFile('artifacts/english-audio-browser/diagnostic-long-source.md', diagnosticSource);
+  await upload(diagnosticTab, '#material-input', ['artifacts/english-audio-browser/diagnostic-long-source.md', 'artifacts/english-audio-browser/test-audio.wav']);
   await attachments(diagnosticTab, 2);
   for (const [kind, stage, part] of [['digest', 'source_preparation', 1], ['transcription', 'transcription', 2]]) {
     provider.config.failKind = kind;
@@ -700,9 +1093,9 @@ try {
   assert.equal(tinyTranscript.length, 2110);
   provider.config.transcriptText = tinyTranscript;
   const beforeLocal = provider.calls.length;
-  await upload(localTab, '#material-input', ['artifacts/timeout-notes-browser/test-audio.wav', 'artifacts/timeout-notes-browser/test-notes.md']); await attachments(localTab, 2);
+  await upload(localTab, '#material-input', ['artifacts/english-audio-browser/test-audio.wav', 'artifacts/english-audio-browser/test-notes.md']); await attachments(localTab, 2);
   assert.equal(provider.calls.length, beforeLocal, 'Local imports never infer');
-  await evaluate(localTab, 'document.getElementById("include-audio").checked=false;document.getElementById("include-audio").dispatchEvent(new Event("input"));document.getElementById("lesson-form").requestSubmit()');
+  await evaluate(localTab, 'document.getElementById("audio-mode").value="off";document.getElementById("audio-mode").dispatchEvent(new Event("input"));document.getElementById("lesson-form").requestSubmit()');
   await wait(localTab, 'document.getElementById("confirm-dialog").open');
   await evaluate(localTab, 'document.getElementById("confirm-cancel").click()');
   await wait(localTab, '!document.getElementById("generate-button").disabled');
@@ -751,6 +1144,7 @@ try {
     const silent = await tab(origin);
     await wait(silent, 'document.getElementById("setup-count")?.textContent === "2/3"');
     const beforeSilent = provider.calls.length;
+    await setAudioMode(silent, 'off');
     await upload(silent, '#material-input', [fixtures.media[3]]); await attachments(silent, 1);
     assert.equal(provider.calls.length, beforeSilent, 'Silent video local preparation is AI-free');
     await evaluate(silent, 'document.getElementById("learning-goal").value="Explain these video stills";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("lesson-form").requestSubmit()');
@@ -766,6 +1160,7 @@ try {
   const nativeTab = await tab(origin);
   await wait(nativeTab, '!!document.getElementById("role-transcription-api") && !document.getElementById("roles-fields").disabled');
   const primaryBeforeNative = await evaluate(nativeTab, '["model","api","effort"].map(k=>document.getElementById("role-primary-"+k).value)');
+  await setAudioMode(nativeTab, 'off');
   const setNativeMode = async (mode, model = null) => {
     await evaluate(nativeTab, `document.querySelector('[data-page="providers"]').click();${model ? `document.getElementById('role-transcription-provider').selectedIndex=1;document.getElementById('role-transcription-provider').dispatchEvent(new Event('change'));document.getElementById('role-transcription-model').value='__manual__';document.getElementById('role-transcription-model').dispatchEvent(new Event('change'));document.getElementById('role-transcription-manual').value=${JSON.stringify(model)};document.getElementById('role-transcription-manual').dispatchEvent(new Event('input'));` : ''}document.getElementById('role-transcription-api').value=${JSON.stringify(mode)};document.getElementById('role-transcription-api').dispatchEvent(new Event('change'))`);
     assert.match(await evaluate(nativeTab, 'document.querySelector("[data-role=transcription] .check-badges").textContent'), /Untested/, 'Other protocol sample check cannot verify this selection');
@@ -781,7 +1176,7 @@ try {
     await consent(nativeTab);
   };
   await setNativeMode('auto', 'gemini-audio-fixture');
-  await upload(nativeTab, '#material-input', ['artifacts/timeout-notes-browser/test-audio.wav']); await attachments(nativeTab, 1);
+  await upload(nativeTab, '#material-input', ['artifacts/english-audio-browser/test-audio.wav']); await attachments(nativeTab, 1);
   await submitNative(); await created(nativeTab);
   await setNativeMode('gemini');
   await evaluate(nativeTab, 'document.getElementById("lesson-form").requestSubmit()');
@@ -842,8 +1237,8 @@ try {
   await evaluate(full, 'document.querySelector("[data-page=lesson]").click()');
   await evaluate(full, 'document.querySelector("[data-action=demo]").click()'); await created(full);
   const priorFull = await evaluate(full, 'document.getElementById("lesson-frame").srcdoc');
-  await evaluate(full, 'document.getElementById("tab-compose").click();document.getElementById("include-audio").checked=true;document.getElementById("include-audio").dispatchEvent(new Event("input"))');
-  await upload(full, '#material-input', ['artifacts/timeout-notes-browser/test-notes.md', 'artifacts/timeout-notes-browser/test-screenshot.png', 'artifacts/timeout-notes-browser/test-audio.wav']); await attachments(full, 3);
+  await evaluate(full, 'document.getElementById("tab-compose").click();document.getElementById("audio-mode").value="on";document.getElementById("audio-mode").dispatchEvent(new Event("input"))');
+  await upload(full, '#material-input', ['artifacts/english-audio-browser/test-notes.md', 'artifacts/english-audio-browser/test-screenshot.png', 'artifacts/english-audio-browser/test-audio.wav']); await attachments(full, 3);
   const beforeFull = provider.calls.length, beforeFullSpeech = kokoro.calls.filter(c=>c.kind==='speech').length;
   await evaluate(full, 'document.getElementById("lesson-form").requestSubmit()'); await consent(full); await exactConsent(full, false); await created(full);
   assert.equal(kokoro.calls.filter(c=>c.kind==='speech').length, beforeFullSpeech, 'Exact-count cancellation dispatches no TTS');
@@ -869,7 +1264,7 @@ try {
   assert.match(await evaluate(full, 'document.getElementById("audio-count").textContent'), /^2\/\d+.*partial/);
   const partial = await evaluate(full, 'document.getElementById("lesson-frame").srcdoc');
   assert.match(partial, /data:audio\/mpeg;base64/); assert.match(partial, /Incomplete/);
-  await writeFile('artifacts/timeout-notes-browser/browser-partial-audio.html', partial);
+  await writeFile('artifacts/english-audio-browser/browser-partial-audio.html', partial);
   const diagnostics = await evaluate(full, 'document.getElementById("diagnostic-report").textContent');
   assert.doesNotMatch(diagnostics, /Original text|Screenshot final|Newton|test-notes|test-screenshot|test-audio|data:audio|Bearer|"(?:requestBody|responseBody|filename|sourceText)"/);
   assert.deepEqual(JSON.parse(diagnostics).lastOperation.input, { clips: 1 }, 'Diagnostic input is counts only, never provider request body');
@@ -903,7 +1298,7 @@ try {
     const notice = await evaluate(full, 'document.getElementById("audio-message").textContent');
     const failure = 'Immediate Stop/Continue cannot reach exact-count consent or GET clip polling: ' + notice;
     lifecycleFailures.push(failure); testLog.push('FAIL: ' + failure);
-    await writeFile('artifacts/timeout-notes-browser/full-audio-stop-failure.json', JSON.stringify({ notice, requests: browserRequests.slice(stoppedRequests) }, null, 2));
+    await writeFile('artifacts/english-audio-browser/full-audio-stop-failure.json', JSON.stringify({ notice, requests: browserRequests.slice(stoppedRequests) }, null, 2));
     await shot(full, 'app-full-audio-stop-failure.png');
   } else {
     await exactConsent(full);
@@ -966,21 +1361,23 @@ try {
   if (longWaitRun) {
     const outcome = await longWaitRun;
     if (outcome.error) throw outcome.error;
-    await writeFile('artifacts/timeout-notes-browser/timeout-notes-long-wait.json', JSON.stringify(outcome.result, null, 2));
+    await writeFile('artifacts/english-audio-browser/timeout-notes-long-wait.json', JSON.stringify(outcome.result, null, 2));
+  }
   }
   assert.deepEqual(errors.filter(error => !/Failed to load resource:.*502/.test(error) && !(longWaitRun && /Failed to load resource:.*504.*\/api\/lessons/.test(error))), [], 'Unexpected browser console/CSP errors');
   assert.deepEqual(lifecycleFailures, [], 'Full audio lifecycle failures (recorded while allowing offline/native checks to finish)');
-  passed('1440/390/320px layouts; sandbox; discovery/roles/consented probe; unified imports; generation/failure recovery; actual download; OpenAI preset; consented model advisor + thinking controls; online/Kokoro speech routing; password gate; offline audio playback/speed/answers.');
+  passed(process.env.LEARNLENS_BROWSER_SUITE === 'english-audio' ? 'Targeted English-audio checks finished; legacy/full/native replay intentionally not run.' : '1440/390/320px layouts; sandbox; discovery/roles/consented probe; unified imports; generation/failure recovery; actual download; OpenAI preset; consented model advisor + thinking controls; online/Kokoro speech routing; password gate; offline audio playback/speed/answers.');
 } catch (error) {
   testLog.push('FAIL: ' + error.message);
   throw error;
 } finally {
-  await writeFile(resolve('artifacts/timeout-notes-browser/browser-smoke.log'), testLog.join('\n') + '\n');
-  await writeFile(resolve('artifacts/timeout-notes-browser/full-audio-browser.log'), testLog.join('\n') + '\n');
-  await writeFile(resolve('artifacts/timeout-notes-browser/checkpoint-browser.log'), testLog.join('\n') + '\n');
-  await writeFile(resolve('artifacts/timeout-notes-browser/preparation-browser.log'), testLog.join('\n') + '\n');
+  await writeFile(resolve('artifacts/english-audio-browser/english-audio-evidence.json'), JSON.stringify(englishAudioEvidence, null, 2));
+  await writeFile(resolve('artifacts/english-audio-browser/browser-smoke.log'), testLog.join('\n') + '\n');
+  await writeFile(resolve('artifacts/english-audio-browser/full-audio-browser.log'), testLog.join('\n') + '\n');
+  await writeFile(resolve('artifacts/english-audio-browser/checkpoint-browser.log'), testLog.join('\n') + '\n');
+  await writeFile(resolve('artifacts/english-audio-browser/preparation-browser.log'), testLog.join('\n') + '\n');
   for (const targetId of targets) await call('Target.closeTarget', { targetId }).catch(() => {});
   for (const context of [browserContextId, ...extraContexts].filter(Boolean)) await call('Target.disposeBrowserContext', { browserContextId: context });
   ws.close();
-  await Promise.all([app, provider.server, kokoro.server, gated, ...longWaitProviders.map(p=>p.server)].filter(Boolean).map(close));
+  await Promise.all([app, provider.server, kokoro.server, gated, ...longWaitProviders.map(p=>p.server), ...englishAudioProviders.map(p=>p.server)].filter(Boolean).map(close));
 }

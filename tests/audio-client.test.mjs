@@ -29,6 +29,24 @@ function fixture(statuses = ['pending', 'pending']) {
   return { context, manifest, api, calls };
 }
 
+test('pending source inventory cannot silently seal a lesson-only plan; explicit discard releases its references', async () => {
+  const { context, api, calls } = fixture();
+  context.sourcePending = true; context.sourceMaterials = 'opaque-material-signature';
+  await assert.rejects(prepareAudioPlan(api, context), /Finish the original audio-source inventory/);
+  assert.equal(calls.length, 0);
+  assert.equal(context.createAttempted, false);
+  assert.equal(unfinishedAudio(context), true);
+  await assert.rejects(discardAudioContext(api, context), /Explicit discard/);
+  assert.equal(context.sourcePending, true);
+  await discardAudioContext(api, context, { consent: true });
+  assert.equal(context.sourcePending, false);
+  assert.equal(context.sourceMaterials, null);
+  assert.equal(context.input, null);
+  assert.equal(context.result, null);
+  assert.deepEqual(context.sources, []);
+  assert.equal(calls.length, 0, 'Discarding an uncreated inventory makes no provider or plan call');
+});
+
 test('plan uses a single stable ID and sources are uploaded separately, then sealed locally', async () => {
   const { context, api, calls } = fixture();
   await prepareAudioPlan(api, context);

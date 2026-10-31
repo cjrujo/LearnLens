@@ -405,7 +405,7 @@ test('checkpoint: repeated invalid digest keeps STT/OCR and dispatches unfinishe
   const progress = (text, info) => updates.push({ text, info });
   const options = { ...settings, completeAudio: true, progress };
   await assert.rejects(value.prepare(options), /invalid preparation/);
-  assert.deepEqual(value.checkpointInfo(), { available: true, complete: false, completedCalls: 2, completedParts: 0, totalParts: 2, stage: 'digest', part: 1, failed: true });
+  assert.deepEqual(value.checkpointInfo(), { available: true, complete: false, audioSourceStarted: true, audioSourceComplete: false, completedCalls: 2, completedParts: 0, totalParts: 2, stage: 'digest', part: 1, failed: true });
   evictGeneralCache(value);
   await assert.rejects(value.prepare({ ...options, resume: true }), /invalid preparation/);
   assert.equal(calls.length, 4);
@@ -423,7 +423,7 @@ test('checkpoint: repeated invalid digest keeps STT/OCR and dispatches unfinishe
   assert.equal(value.checkpointInfo().complete, true);
   assert.ok(updates.some(({ info }) => info.stage === 'transcription' && info.completedCalls === 1 && info.completedParts === 0));
   assert.ok(updates.some(({ info }) => info.stage === 'extraction' && info.completedCalls === 2));
-  const allowed = ['available', 'complete', 'completedCalls', 'completedParts', 'totalParts', 'stage', 'part', 'failed', 'unavailable'];
+  const allowed = ['available', 'complete', 'audioSourceStarted', 'audioSourceComplete', 'completedCalls', 'completedParts', 'totalParts', 'stage', 'part', 'failed', 'unavailable'];
   assert.ok(updates.every(({ info }) => Object.keys(info).every(key => allowed.includes(key))));
   assert.ok(!JSON.stringify(updates.map(update => update.info)).includes('scans'));
   assert.equal(value.checkpoint.roles, null, 'dormant checkpoints retain no approved setup');
@@ -846,4 +846,607 @@ test('checkpoint: missing primary blocks an unfinished digest but not completed 
   const result = await value.prepare({ ...settings, resume: true });
   assert.strictEqual(await value.prepare({ ...settings, resume: true, roles: { primary: null, transcription: null } }), result);
   assert.equal(calls, 5);
+});
+
+// Dedicated post-teaching upgrades: invented originals, local reads and paid stubs only.
+const audioOnlyRoles = { primary: { model: 'approved-ocr' }, transcription: null };
+const mixedUpgradeWorkspace = () => {
+  const text = ' TXT FIRST mid' + 'dle sentence. '.repeat(4100) + '\nTXT TAIL  ';
+  const office = ' Office FIRST mid' + 'dle words. '.repeat(4200) + '\nOFFICE TAIL  ';
+  const transcript = ' Speech FIRST. ' + 'Exact spoken words. '.repeat(3100) + '\nSPEECH TAIL  ';
+  const slices = value => Array.from({ length: Math.ceil(value.length / 20000) }, (_, index) => value.slice(index * 20000, (index + 1) * 20000));
+  const texts = slices(text), offices = slices(office), calls = [], reads = [];
+  const items = [
+    { id: 'synthetic-text', name: 'Notes.txt', kind: 'text', textParts: texts, partCount: texts.length },
+    ...['docx', 'pptx'].map(ext => ({ id: 'synthetic-' + ext, name: 'Examples.' + ext, kind: 'document', partCount: offices.length })),
+    { id: 'synthetic-media', name: 'Example.mp4', kind: 'media', partCount: 2 },
+    { id: 'synthetic-empty', name: 'Blank.pdf', kind: 'document', partCount: 1 }
+  ].map(item => ({ ...item, status: 'ready', warnings: ['Synthetic import limitation.'] }));
+  const value = workspace(items, async (path, { body }) => {
+    calls.push({ path, body });
+    if (path === '/transcribe') return { text: transcript + body.dataUrl + '\n', warnings: ['Synthetic speech uncertainty.'] };
+    if (path === '/audio/extract') return { text: body.image.dataUrl.endsWith('-0') ? '' : ' IMAGE FIRST. '.repeat(50) + 'IMAGE TAIL  ', coverage: body.image.dataUrl.endsWith('-0') ? 'no_english' : 'complete', warnings: ['Synthetic image uncertainty.'] };
+    assert.equal(path, '/materials/summarize');
+    return { text: 'SYNTHETIC LOSSY DIGEST', warnings: [] };
+  });
+  value.render = () => {};
+  value.part = async (item, index) => {
+    reads.push([item.id, index]);
+    const base = { label: `local part ${index + 1}`, warnings: ['Synthetic part limitation.'], images: [] };
+    if (item.kind === 'text') return { ...base, text: texts[index] };
+    if (/synthetic-(docx|pptx)/.test(item.id)) return { ...base, text: offices[index], images: index ? [] : [{ name: 'Office example', dataUrl: 'data:image/png;base64,office' }] };
+    if (item.kind === 'media') return { ...base, text: ` RAW ${index} FIRST. ` + 'Raw local words. '.repeat(2600) + `RAW ${index} TAIL  `, audio: 'audio-' + index, images: Array.from({ length: 3 }, (_, imageIndex) => ({ name: 'Frame ' + imageIndex, dataUrl: `data:image/png;base64,${index}-${imageIndex}` })) };
+    return { ...base, text: ' \n\t' };
+  };
+  return { value, calls, reads, text, office, transcript };
+};
+
+test('upgrade: only new OCR after ordinary teaching preparation; all raw tails and eager provenance match', async t => {
+  stubImage(t);
+  const { value, calls, reads, text, office, transcript } = mixedUpgradeWorkspace();
+  const ordinary = await value.prepare(settings), job = value.checkpoint;
+  const snapshot = structuredClone(ordinary), baseCalls = calls.length;
+  assert.ok(calls.every(call => call.path !== '/audio/extract'));
+  assert.equal(ordinary.audioSources, undefined);
+  assert.equal(job.sourceIndex.size, 2);
+  assert.equal(value.checkpointInfo().audioSourceStarted, false);
+  assert.equal(value.checkpointInfo().audioSourceComplete, false);
+  assert.equal(ordinary.images.length, 5);
+  reads.length = 0;
+  evictGeneralCache(value);
+  const sources = await value.upgradeAudioSources({ ...settings, roles: audioOnlyRoles, expectedSetupRevision: 7 });
+  assert.ok(Array.isArray(sources));
+  assert.strictEqual(value.checkpoint, job);
+  assert.strictEqual(job.result, ordinary);
+  assert.deepEqual(ordinary, snapshot, 'ordinary preparation and its teaching inputs are untouched');
+  assert.equal(job.calls, baseCalls + 8, 'the original approval budget carries across teaching');
+  assert.equal(reads.length, value.partCount);
+  assert.equal(calls.length, baseCalls + 8);
+  for (const call of calls.slice(baseCalls)) {
+    assert.equal(call.path, '/audio/extract');
+    assert.deepEqual(Object.keys(call.body).sort(), ['consent', 'expectedSetupRevision', 'image']);
+    assert.equal(call.body.consent, true);
+    assert.equal(call.body.expectedSetupRevision, 7);
+  }
+  const selectedText = pattern => sources.filter(source => pattern.test(source.source) && source.extraction === 'text').map(source => source.text).join('');
+  assert.equal(selectedText(/^Notes\.txt/), text);
+  for (const ext of ['docx', 'pptx']) assert.equal(selectedText(new RegExp('^Examples\\.' + ext)), office);
+  for (let index = 0; index < 2; index++) assert.equal(sources.filter(source => source.extraction === 'transcription' && source.source.includes(`local part ${index + 1}`)).map(source => source.text).join(''), transcript + 'audio-' + index + '\n');
+  assert.equal(sources.filter(source => source.extraction === 'vision').length, 8);
+  assert.equal(sources.filter(source => source.coverage === 'no_english').length, 2);
+  assert.equal(sources.find(source => source.extraction === 'unavailable').text, ' \n\t');
+  assert.ok(!JSON.stringify(sources).includes('LOSSY DIGEST'));
+  assert.ok(!JSON.stringify(sources).includes(settings.goal));
+  assertDescriptors(sources);
+  const eager = mixedUpgradeWorkspace();
+  assert.deepEqual(sources, (await eager.value.prepare({ ...settings, completeAudio: true })).audioSources, 'same collector, coverage, warnings, identities and full raw content as eager extraction');
+  assert.equal(value.checkpointInfo().complete, true);
+  assert.equal(value.checkpointInfo().audioSourceStarted, true);
+  assert.equal(value.checkpointInfo().audioSourceComplete, true);
+  assert.equal(job.completedParts.size, value.partCount);
+  assert.equal(job.audioWork.completedParts.size, value.partCount);
+  assert.equal(job.roles, null);
+  assert.equal(job.progress, null);
+  assert.equal(job.audioWork.generator, null);
+  assert.equal(job.audioWork.pending, null);
+  assert.strictEqual(await value.upgradeAudioSources({ ...settings, roles: {} }), sources);
+  assert.equal(reads.length, value.partCount);
+  assert.equal(calls.length, baseCalls + 8);
+});
+
+test('upgrade: cached and pinned acknowledgements populate an opaque bounded source index before progress', async () => {
+  const calls = [];
+  const value = checkpointAudio(async (path, { body }) => { calls.push({ path, body }); return { text: path === '/transcribe' ? ' Entire synthetic speech tail.\n' : 'Digest', warnings: [] }; });
+  await value.prepare(settings);
+  let indexedAtStop = 0, stopped = false;
+  await assert.rejects(value.prepare({
+    ...settings,
+    progress: (_text, info) => {
+      if (!stopped && info.completedCalls === 1) { stopped = true; indexedAtStop = value.checkpoint.sourceIndex.size; value.cancelPending(); }
+    }
+  }), { name: 'AbortError' });
+  assert.equal(indexedAtStop, 1, 'cache hits are indexed before a progress callback can stop work');
+  assert.equal(calls.length, 4);
+  // Force the pinned-hit branch to rebuild its index, independent of the general cache.
+  const job = value.checkpoint;
+  job.sourceIndex.clear(); job.sourceIndexBytes = 0;
+  await value.prepare({ ...settings, resume: true });
+  assert.equal(calls.length, 4);
+  assert.equal(job.sourceIndex.size, 2);
+  assert.equal(job.sourceIndexBytes, 512);
+  assert.equal(job.pinnedBytes, [...job.pinned.values()].reduce((bytes, result) => bytes + JSON.stringify(result).length * 2, 0));
+  for (const [stableKey, pinnedKey] of job.sourceIndex) {
+    assert.match(stableKey, /^[a-f0-9]{64}$/);
+    assert.match(pinnedKey, /^[a-f0-9]{64}$/);
+    assert.ok(job.pinned.has(pinnedKey));
+  }
+  evictGeneralCache(value);
+  const sources = await value.upgradeAudioSources({ ...settings, roles: {} });
+  assert.equal(calls.length, 4, 'saved transcripts need neither a current STT role nor a cache entry');
+  assert.deepEqual(sources.map(source => source.text), Array(2).fill(' Entire synthetic speech tail.\n'));
+});
+
+test('upgrade: failed or unknown later OCR requires explicit resume and does not reread or repay earlier images', async t => {
+  stubImage(t);
+  for (const mode of ['unknown', 'invalid']) {
+    let fail = true, reads = 0;
+    const calls = [], updates = [];
+    const value = visualWorkspace(3, async (path, { body }) => {
+      calls.push({ path, body });
+      if (fail && calls.length === 2) {
+        if (mode === 'unknown') throw new Error('Synthetic unknown OCR outcome');
+        return { text: 'Invalid OCR', warnings: [], coverage: 'not-valid' };
+      }
+      return { text: ` IMAGE ${body.image.dataUrl} TAIL\n`, warnings: [], coverage: 'complete' };
+    });
+    const read = value.part;
+    value.part = async (...args) => { reads++; return read(...args); };
+    const ordinary = await value.prepare(settings);
+    reads = 0;
+    await assert.rejects(value.upgradeAudioSources({ ...settings, progress: (_text, info) => updates.push(info) }), /Synthetic unknown|invalid English-text extraction/);
+    const work = value.checkpoint.audioWork, pending = work.pending, generator = work.generator;
+    assert.equal(calls.length, 2);
+    assert.equal(reads, 1);
+    assert.equal(value.checkpoint.sourceIndex.size, 1);
+    assert.equal(value.checkpointInfo().audioSourceComplete, false);
+    assert.equal(value.checkpointInfo().complete, true);
+    await assert.rejects(value.upgradeAudioSources(settings), /explicitly resume/);
+    await assert.rejects(value.upgradeAudioSources({ ...settings, resume: true, consent: false }), /Explicit paid consent/);
+    await assert.rejects(value.upgradeAudioSources({ ...settings, resume: true, expectedSetupRevision: undefined }), /confirmed AI setup revision/);
+    await assert.rejects(value.upgradeAudioSources({ ...settings, resume: true, roles: {} }), /Assign a primary model/);
+    assert.strictEqual(work.pending, pending);
+    assert.strictEqual(work.generator, generator);
+    assert.equal(calls.length, 2);
+    evictGeneralCache(value); fail = false;
+    const sources = await value.upgradeAudioSources({ ...settings, resume: true, roles: audioOnlyRoles, expectedSetupRevision: 8 });
+    assert.equal(calls.length, 4);
+    assert.ok(calls.every(call => call.path === '/audio/extract'));
+    assert.deepEqual(calls.slice(2).map(call => call.body.expectedSetupRevision), [8, 8]);
+    assert.equal(reads, 1, 'the suspended collector keeps the current part and already collected originals');
+    assert.equal(sources.length, 3);
+    assert.strictEqual(value.checkpoint.result, ordinary);
+    assert.equal(value.checkpointInfo().completedCalls, 3);
+    assert.ok(updates.every(info => Object.values(info).every(value => typeof value === 'boolean' || typeof value === 'number' || ['complete', 'audio-reading', 'extraction'].includes(value))), 'checkpoint diagnostics contain counts/status only');
+    assertDescriptors(sources);
+  }
+});
+
+test('upgrade: local errors, aborts, Stop and collector errors reconstruct using all indexed STT/OCR', async t => {
+  stubImage(t);
+  for (const failure of ['error', 'abort', 'stop', 'collector']) {
+    const calls = [], reads = [];
+    let upgrading = false, fail = true;
+    const value = visualWorkspace(2, async path => {
+      calls.push(path);
+      return path === '/audio/extract' ? { text: 'Image tail\n', coverage: 'complete', warnings: [] } : { text: path === '/transcribe' ? 'Speech tail\n' : 'Digest', warnings: [] };
+    }, 2);
+    value.render = () => {};
+    const read = value.part;
+    value.part = async (...args) => {
+      reads.push(args[1]);
+      const part = { ...await read(...args), audio: 'synthetic-audio-' + args[1] };
+      if (upgrading && args[1] === 1 && fail) {
+        fail = false;
+        if (failure === 'stop') value.cancelPending();
+        else if (failure === 'abort') throw new DOMException('Synthetic local abort', 'AbortError');
+        else if (failure === 'collector') part.text = { invalid: true };
+        else throw new Error('Synthetic local read error');
+      }
+      return part;
+    };
+    await value.prepare(settings);
+    const before = calls.length;
+    upgrading = true; reads.length = 0;
+    await assert.rejects(value.upgradeAudioSources({ ...settings, roles: audioOnlyRoles }), /Synthetic|Stopped|trim/);
+    const work = value.checkpoint.audioWork;
+    assert.equal(work.generator, null);
+    assert.equal(work.pending, null);
+    assert.equal(work.result, null);
+    assert.equal(work.completedParts.size, 1);
+    assert.equal(value.checkpoint.sourceIndex.size, 4, 'both original transcripts and first part OCR survive');
+    assert.equal(calls.length, before + 2);
+    await assert.rejects(value.upgradeAudioSources(settings), /explicitly resume/);
+    evictGeneralCache(value);
+    const sources = await value.upgradeAudioSources({ ...settings, resume: true, expectedSetupRevision: 6, roles: audioOnlyRoles });
+    assert.equal(calls.length, before + 4, 'only unread images need new OCR; no STT, digest or held OCR replay');
+    assert.ok(calls.slice(before).every(path => path === '/audio/extract'));
+    assert.deepEqual(reads, [0, 1, 0, 1]);
+    assert.deepEqual(sources.map(source => source.text), ['Speech tail\n', 'Image tail\n', 'Image tail\n', 'Speech tail\n', 'Image tail\n', 'Image tail\n']);
+    assertDescriptors(sources);
+  }
+});
+
+test('upgrade: acknowledged OCR is indexed before Stop checks, including a Stop from progress', async t => {
+  stubImage(t);
+  for (const stopAt of ['response', 'progress']) {
+    const entered = deferred(), response = deferred(), calls = [], indexedBeforeCache = [];
+    const value = visualWorkspace(1, async (path, { body, signal }) => {
+      calls.push({ path, body });
+      if (path === '/transcribe') return { text: 'Saved speech tail\n', warnings: [] };
+      entered.resolve(signal);
+      return response.promise;
+    });
+    value.render = () => {};
+    const read = value.part; let reads = 0;
+    value.part = async (...args) => { reads++; return { ...await read(...args), audio: 'synthetic-audio' }; };
+    const ordinary = await value.prepare(settings);
+    reads = 0;
+    const cachePut = value.cachePut.bind(value);
+    value.cachePut = (key, result) => { indexedBeforeCache.push(value.checkpoint.sourceIndex.size); cachePut(key, result); };
+    let stopped = false;
+    const running = value.upgradeAudioSources({ ...settings, progress: (_text, info) => {
+      if (stopAt === 'progress' && !stopped && info.completedCalls === 2) { stopped = true; value.cancelPending(); }
+    } });
+    const signal = await entered.promise;
+    await assert.rejects(value.upgradeAudioSources({ ...settings, resume: true }), /already running/);
+    await assert.rejects(value.prepare(settings), /already running/);
+    if (stopAt === 'response') value.cancelPending();
+    response.resolve({ text: 'Saved image tail\n', warnings: [], coverage: 'complete' });
+    await assert.rejects(running, { name: 'AbortError' });
+    assert.equal(signal.aborted, true);
+    assert.deepEqual(indexedBeforeCache, [2]);
+    assert.equal(value.checkpoint.sourceIndex.size, 2);
+    assert.equal(value.checkpointInfo().completedCalls, 2);
+    assert.equal(value.checkpoint.audioWork.pending.path, '/audio/extract');
+    assert.strictEqual(value.checkpoint.result, ordinary);
+    evictGeneralCache(value);
+    const sources = await value.upgradeAudioSources({ ...settings, resume: true, roles: {} });
+    assert.equal(reads, 1);
+    assert.deepEqual(calls.map(call => call.path), ['/transcribe', '/audio/extract']);
+    assert.deepEqual(sources.map(source => source.text), ['Saved speech tail\n', 'Saved image tail\n']);
+  }
+});
+
+test('upgrade: discard or session loss cannot resurrect late OCR or a suspended local collector', async t => {
+  stubImage(t);
+  for (const stage of ['ocr', 'local']) for (const session of [false, true]) {
+    const entered = deferred(), response = deferred(); let calls = 0, upgrading = false;
+    const value = visualWorkspace(1, async path => {
+      calls++;
+      if (path === '/transcribe') return { text: 'Retained ordinary speech', warnings: [] };
+      entered.resolve(); return response.promise;
+    });
+    value.render = () => {};
+    const read = value.part;
+    value.part = async (...args) => {
+      const part = { ...await read(...args), audio: 'synthetic-audio' };
+      if (stage === 'local' && upgrading) { entered.resolve(); await response.promise; }
+      return part;
+    };
+    const ordinary = await value.prepare(settings), saved = structuredClone(ordinary), job = value.checkpoint;
+    upgrading = true;
+    const running = value.upgradeAudioSources(settings);
+    await entered.promise;
+    const work = job.audioWork;
+    if (session) value.cancelPending({ session: true }); else value.discardCheckpoint();
+    assert.equal(value.checkpoint, null);
+    assert.equal(job.sourceIndex.size, 0);
+    assert.equal(job.sourceIndexBytes, 0);
+    assert.equal(job.audioWork, null);
+    response.resolve({ text: 'Late image must not survive', warnings: [], coverage: 'complete' });
+    await assert.rejects(running, { name: 'AbortError' });
+    assert.equal(job.pinned.size, 0);
+    assert.equal(job.sourceIndex.size, 0);
+    assert.equal(job.audioWork, null);
+    assert.equal(work.generator, null);
+    assert.equal(work.pending, null);
+    assert.equal(work.result, null);
+    assert.equal(value.cache.size, 1, 'late invalidated acknowledgements are not cached');
+    assert.deepEqual(ordinary, saved);
+    assert.equal(value.checkpointInfo().audioSourceComplete, false);
+    assert.equal(value.checkpointInfo().audioSourceStarted, false);
+    await assert.rejects(value.upgradeAudioSources({ ...settings, resume: true }), /completed preparation checkpoint/);
+    assert.equal(calls, stage === 'ocr' ? 2 : 1);
+  }
+});
+
+test('shared driver: a late Stop or discard after completion cannot escape the outer current check', async () => {
+  for (const upgrade of [false, true]) for (const discard of [false, true]) {
+    let calls = 0;
+    const value = checkpointAudio(async () => { calls++; return { text: 'Original speech', warnings: [] }; });
+    value.items[0].partCount = 1;
+    if (upgrade) await value.prepare(settings);
+    const drive = value.drivePreparation.bind(value);
+    let completed;
+    value.drivePreparation = async (...args) => {
+      completed = await drive(...args);
+      if (discard) value.discardCheckpoint(); else value.cancelPending();
+      return completed;
+    };
+    await assert.rejects(upgrade ? value.upgradeAudioSources(settings) : value.prepare(settings), { name: 'AbortError' });
+    assert.equal(calls, 1);
+    if (discard) {
+      assert.equal(value.checkpoint, null);
+      assert.ok(upgrade ? completed.length : completed.text, 'discard only drops references, never mutates a transferred result');
+    } else {
+      value.drivePreparation = drive;
+      const resumed = upgrade ? await value.upgradeAudioSources({ ...settings, resume: true, roles: {} }) : await value.prepare({ ...settings, resume: true, roles: {} });
+      assert.strictEqual(resumed, completed, 'a late Stop saves completed work without replay');
+      assert.equal(calls, 1);
+    }
+  }
+});
+
+test('upgrade: no checkpoint or unfinished ordinary work cannot create a fresh source job', async () => {
+  let calls = 0;
+  const value = checkpointAudio(async () => { calls++; throw new Error('Synthetic ordinary failure'); });
+  for (const resume of [false, true]) await assert.rejects(value.upgradeAudioSources({ ...settings, resume }), /completed preparation checkpoint/);
+  assert.equal(value.checkpoint, null);
+  assert.equal(calls, 0);
+  await assert.rejects(value.prepare(settings), /Synthetic ordinary failure/);
+  const job = value.checkpoint, pending = job.pending;
+  await assert.rejects(value.upgradeAudioSources(settings), /completed preparation checkpoint/);
+  assert.strictEqual(value.checkpoint, job);
+  assert.strictEqual(job.pending, pending);
+  assert.equal(job.audioWork, undefined);
+  assert.equal(calls, 1);
+});
+
+test('upgrade: ordered IDs, part counts, attachment changes and lost local sessions reject without work', async () => {
+  const changes = [
+    value => value.items.reverse(),
+    value => value.items.pop(),
+    value => value.items.push({ ...value.items[0], id: 'extra-item' }),
+    value => { value.items[0].id = 'replaced-id'; },
+    value => { value.items[0].partCount++; },
+    value => { value.items[0].status = 'error'; },
+    value => { value.items[0].needsUpload = true; },
+    value => { value.pending++; }
+  ];
+  for (const change of changes) {
+    let calls = 0;
+    const value = workspace(['one', 'two'].map(id => ({ id, name: id + '.txt', kind: 'text', status: 'ready', partCount: 1, textParts: ['Synthetic original'], warnings: [] })), async () => { calls++; return { text: 'Digest', warnings: [] }; });
+    const ordinary = await value.prepare(settings), job = value.checkpoint;
+    value.part = async () => { assert.fail('Changed attachments must not be read'); };
+    change(value);
+    for (const resume of [false, true]) await assert.rejects(value.upgradeAudioSources({ ...settings, resume }), /same ordered materials|local material session/);
+    assert.strictEqual(value.checkpoint, job);
+    assert.strictEqual(job.result, ordinary);
+    assert.equal(job.audioWork, undefined);
+    assert.equal(calls, 2);
+  }
+});
+
+test('upgrade: attachment mutation during OCR pins its acknowledgement but stops before another request', async t => {
+  stubImage(t);
+  const entered = deferred(), response = deferred(); let calls = 0;
+  const value = visualWorkspace(2, async () => { calls++; entered.resolve(); return response.promise; });
+  await value.prepare(settings);
+  const running = value.upgradeAudioSources(settings);
+  await entered.promise;
+  value.items[0].partCount++;
+  response.resolve({ text: 'Acknowledged before mutation check', warnings: [], coverage: 'complete' });
+  await assert.rejects(running, /same ordered materials/);
+  assert.equal(calls, 1);
+  assert.equal(value.checkpoint.sourceIndex.size, 1);
+  assert.equal(value.checkpoint.pinned.size, 1);
+  assert.equal(value.checkpointInfo().audioSourceComplete, false);
+});
+
+test('upgrade: consent, revision and unfinished primary role gates; roles are cloned for a live approval', async t => {
+  stubImage(t);
+  const calls = [], entered = deferred(), response = deferred(); let reads = 0;
+  const value = visualWorkspace(2, async (path, { body }) => {
+    calls.push({ path, body });
+    if (calls.length === 1) { entered.resolve(); await response.promise; }
+    return { text: 'Image text', warnings: [], coverage: 'complete' };
+  });
+  await value.prepare(settings);
+  const read = value.part;
+  value.part = async (...args) => { reads++; return read(...args); };
+  for (const invalid of [{ consent: false }, { expectedSetupRevision: undefined }, { expectedSetupRevision: '1' }, { expectedSetupRevision: 1.5 }]) await assert.rejects(value.upgradeAudioSources({ ...settings, ...invalid }), /Explicit paid consent|confirmed AI setup revision/);
+  assert.equal(reads, 0);
+  assert.equal(value.checkpoint.audioWork, undefined);
+  await assert.rejects(value.upgradeAudioSources({ ...settings, roles: {} }), /Assign a primary model/);
+  assert.equal(calls.length, 0);
+  assert.equal(reads, 1);
+  const pending = value.checkpoint.audioWork.pending;
+  assert.deepEqual(Object.keys(pending.body), ['image'], 'a suspended yield does not capture consent or revision');
+  const roles = { primary: { model: 'approved' }, transcription: null };
+  const running = value.upgradeAudioSources({ ...settings, resume: true, roles, expectedSetupRevision: 9 });
+  await entered.promise;
+  roles.primary.model = 'mutated-after-approval';
+  assert.equal(value.checkpoint.roles.primary.model, 'approved');
+  response.resolve();
+  await running;
+  assert.equal(reads, 1);
+  assert.deepEqual(calls.map(call => [call.path, call.body.consent, call.body.expectedSetupRevision]), [['/audio/extract', true, 9], ['/audio/extract', true, 9]]);
+  assert.equal(value.checkpoint.roles, null);
+});
+
+test('upgrade: missing indexed speech fails explicitly, never retranscribes even with a usable cache and STT role', async () => {
+  for (const missing of ['index', 'pinned']) {
+    let calls = 0;
+    const value = checkpointAudio(async () => { calls++; return { text: 'Held speech', warnings: [] }; });
+    value.items[0].partCount = 1;
+    const ordinary = await value.prepare(settings), job = value.checkpoint;
+    if (missing === 'index') { job.sourceIndex.clear(); job.sourceIndexBytes = 0; }
+    else job.pinned.delete([...job.sourceIndex.values()][0]);
+    await assert.rejects(value.upgradeAudioSources(settings), /saved transcription.*unavailable|saved source result is missing/);
+    assert.equal(calls, 1);
+    assert.equal(value.cache.size, 1);
+    assert.strictEqual(job.result, ordinary);
+    assert.equal(job.audioWork.generator, null);
+    assert.equal(job.audioWork.pending, null);
+    assert.equal(job.audioWork.result, null);
+  }
+});
+
+test('upgrade: first call shares the original 512-call allowance; renewed resume gets a new budget without rereading', async t => {
+  stubImage(t);
+  const calls = []; let reads = 0;
+  const value = visualWorkspace(513, async path => {
+    calls.push(path);
+    return path === '/audio/extract' ? { text: 'Image words', warnings: [], coverage: 'complete' } : { text: 'Digest', warnings: [] };
+  });
+  const read = value.part;
+  value.part = async (...args) => { reads++; return read(...args); };
+  await value.prepare(settings);
+  assert.equal(calls.length, 103, 'ordinary preparation digests 103 visual batches, without OCR');
+  assert.equal(value.checkpoint.calls, 103);
+  await assert.rejects(value.upgradeAudioSources(settings), /512 calls/);
+  assert.equal(calls.length, 512);
+  assert.equal(value.checkpoint.calls, 512);
+  assert.equal(value.checkpoint.sourceIndex.size, 409);
+  assert.equal(value.checkpoint.audioWork.completedParts.size, 0);
+  assert.equal(value.checkpointInfo().complete, true);
+  await assert.rejects(value.upgradeAudioSources(settings), /explicitly resume/);
+  assert.equal(calls.length, 512);
+  evictGeneralCache(value);
+  const sources = await value.upgradeAudioSources({ ...settings, resume: true, roles: audioOnlyRoles, expectedSetupRevision: 3 });
+  assert.equal(calls.length, 616, '103 ordinary digests + 513 once-only OCR results');
+  assert.equal(value.checkpoint.calls, 104);
+  assert.equal(reads, 2, 'one ordinary read and one upgrade read; no resume reread');
+  assert.equal(sources.length, 513);
+  assert.equal(value.checkpoint.sourceIndex.size, 513);
+  assert.equal(value.checkpointInfo().audioSourceComplete, true);
+});
+
+test('upgrade: renewed confirmation may initialize audio work before its first call', async t => {
+  stubImage(t);
+  const calls = [];
+  const value = visualWorkspace(6, async path => {
+    calls.push(path);
+    return path === '/audio/extract' ? { text: 'Image tail', warnings: [], coverage: 'complete' } : { text: 'Digest', warnings: [] };
+  });
+  const ordinary = await value.prepare(settings), job = value.checkpoint;
+  assert.equal(job.calls, 2);
+  assert.equal(job.audioWork, undefined, 'speech configuration or preflight may have stopped the caller before any upgrade');
+  const sources = await value.upgradeAudioSources({ ...settings, resume: true, roles: audioOnlyRoles, expectedSetupRevision: 4 });
+  assert.equal(sources.length, 6);
+  assert.equal(job.calls, 6, 'renewed confirmation resets the allowance even before the first upgrade');
+  assert.equal(calls.length, 8);
+  assert.strictEqual(job.result, ordinary);
+});
+
+test('upgrade: checkpoint bytes, result entries and stable index headroom are reserved before new OCR', async t => {
+  stubImage(t);
+  for (const quota of ['bytes', 'results', 'index']) {
+    let calls = 0;
+    const value = visualWorkspace(1, async () => { calls++; return { text: 'Held speech', warnings: [] }; });
+    const read = value.part;
+    value.part = async (...args) => ({ ...await read(...args), audio: 'synthetic-audio' });
+    await value.prepare(settings);
+    const job = value.checkpoint, retained = [...job.pinned.entries()][0];
+    if (quota === 'bytes') job.pinnedBytes = 64 * 1024 * 1024 - 1024 * 1024 - job.sourceIndexBytes;
+    else if (quota === 'results') for (let index = job.pinned.size; index < 4096; index++) job.pinned.set('synthetic-' + index, { text: 'Reserved' });
+    else {
+      for (let index = job.sourceIndex.size; index < 4096; index++) job.sourceIndex.set('synthetic-' + index, retained[0]);
+      job.sourceIndexBytes = 4096 * 256;
+    }
+    const entries = job.pinned.size, indexes = job.sourceIndex.size;
+    await assert.rejects(value.upgradeAudioSources(settings), /checkpoint quota/);
+    assert.equal(calls, 1, 'even 256 bytes of new index headroom must fit before dispatch');
+    assert.equal(job.pinned.size, entries);
+    assert.equal(job.sourceIndex.size, indexes);
+    assert.strictEqual(job.pinned.get(retained[0]), retained[1]);
+    assert.equal(value.checkpointInfo().unavailable, true);
+  }
+});
+
+test('upgrade: over-1-MiB OCR is neither pinned nor indexed and earlier accepted OCR stays saved', async t => {
+  stubImage(t);
+  let calls = 0;
+  const value = visualWorkspace(2, async () => ({ text: ++calls === 1 ? 'Accepted image' : 'x'.repeat(524288), warnings: [], coverage: 'complete' }));
+  await value.prepare(settings);
+  await assert.rejects(value.upgradeAudioSources(settings), /1 MiB per result/);
+  assert.equal(calls, 2);
+  assert.equal(value.checkpoint.pinned.size, 1);
+  assert.equal(value.checkpoint.sourceIndex.size, 1);
+  assert.equal(value.checkpoint.sourceIndexBytes, 256);
+  assert.equal(value.cache.size, 1);
+  assert.equal(value.checkpoint.audioWork.pending.path, '/audio/extract');
+  assert.equal(value.checkpointInfo().unavailable, true);
+});
+
+test('upgrade: collector retention failure is explicit and reconstructs from held OCR without paid replay', async t => {
+  stubImage(t);
+  let calls = 0;
+  const value = visualWorkspace(1, async path => {
+    calls++;
+    return path === '/transcribe' ? { text: 'Speech tail\n', warnings: [] } : { text: 'Image tail\n', warnings: [], coverage: 'complete' };
+  });
+  const read = value.part;
+  value.part = async (...args) => ({ ...await read(...args), text: 'Raw tail\n', audio: 'synthetic-audio' });
+  await value.prepare(settings);
+  const reserve = AudioSourceCollector.prototype.reserve;
+  t.after(() => { AudioSourceCollector.prototype.reserve = reserve; });
+  AudioSourceCollector.prototype.reserve = function (...args) { this.maxBytes = 24; return reserve.apply(this, args); };
+  await assert.rejects(value.upgradeAudioSources(settings), /64 MiB.*No text was truncated/);
+  assert.equal(calls, 2);
+  assert.equal(value.checkpoint.sourceIndex.size, 2, 'OCR is acknowledged before the local collector fails');
+  assert.equal(value.checkpoint.audioWork.generator, null);
+  assert.equal(value.checkpoint.audioWork.result, null);
+  AudioSourceCollector.prototype.reserve = reserve;
+  evictGeneralCache(value);
+  const sources = await value.upgradeAudioSources({ ...settings, resume: true, roles: {} });
+  assert.equal(calls, 2);
+  assert.deepEqual(sources.map(source => source.text), ['Raw tail\n', 'Speech tail\n', 'Image tail\n']);
+  assert.equal(AUDIO_SOURCE_MAX_BYTES, 64 * 1024 * 1024);
+});
+
+test('upgrade: all images are normalized before OCR and local reconstruction also normalizes indexed images', async t => {
+  stubImage(t);
+  let normalized = 0, upgrading = false, fail = true;
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  Object.defineProperty(globalThis, 'Image', { configurable: true, value: class {
+    width = 6000; height = 5000;
+    async decode() {}
+  } });
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: {
+    createElement(tag) {
+      assert.equal(tag, 'canvas');
+      return { getContext: () => ({ fillRect() {}, drawImage() {} }), toDataURL: () => { normalized++; return 'data:image/jpeg;base64,normalized'; } };
+    }
+  } });
+  t.after(() => { if (previousDocument) Object.defineProperty(globalThis, 'document', previousDocument); else delete globalThis.document; });
+  const calls = [];
+  const value = visualWorkspace(1, async (path, { body }) => {
+    calls.push({ path, body });
+    return path === '/audio/extract' ? { text: 'Image tail', warnings: [], coverage: 'complete' } : { text: 'Digest', warnings: [] };
+  }, 2);
+  const read = value.part;
+  value.part = async (...args) => {
+    if (upgrading && args[1] === 1 && fail) { fail = false; throw new Error('Synthetic local failure'); }
+    return read(...args);
+  };
+  await value.prepare(settings);
+  assert.equal(normalized, 2);
+  upgrading = true;
+  await assert.rejects(value.upgradeAudioSources(settings), /Synthetic local failure/);
+  assert.equal(normalized, 3);
+  evictGeneralCache(value);
+  const sources = await value.upgradeAudioSources({ ...settings, resume: true });
+  assert.equal(normalized, 5, 'reconstructed held OCR still gets the same normalization and provenance');
+  const ocr = calls.filter(call => call.path === '/audio/extract');
+  assert.equal(ocr.length, 2);
+  assert.ok(ocr.every(call => call.body.image.dataUrl === 'data:image/jpeg;base64,normalized'));
+  assert.ok(sources.every(source => source.warnings.includes('Some extracted visuals were resized; fine detail may be lost.')));
+});
+
+test('upgrade: eager inventory is returned directly and discard never mutates transferred source arrays', async t => {
+  stubImage(t);
+  for (const eager of [false, true]) {
+    const value = visualWorkspace(1, async () => ({ text: 'Exact image tail\n', warnings: [], coverage: 'complete' }));
+    const ordinary = await value.prepare({ ...settings, completeAudio: eager });
+    if (eager) {
+      value.part = async () => { assert.fail('Completed eager inventory must not reread originals'); };
+      value.api = async () => { assert.fail('Completed eager inventory must not dispatch'); };
+      assert.equal(value.checkpointInfo().audioSourceComplete, true);
+    }
+    const sources = await value.upgradeAudioSources({ ...settings, roles: eager ? {} : audioOnlyRoles });
+    const saved = structuredClone(sources), job = value.checkpoint;
+    if (eager) { assert.strictEqual(sources, ordinary.audioSources); assert.equal(job.audioWork, undefined); }
+    else assert.strictEqual(sources, job.audioWork.result);
+    value.discardCheckpoint();
+    assert.deepEqual(sources, saved);
+    assert.equal(job.sourceIndex.size, 0);
+    assert.equal(job.sourceIndexBytes, 0);
+    assert.equal(job.audioWork, eager ? undefined : null);
+    assert.equal(value.checkpointInfo().audioSourceComplete, false);
+  }
+  const empty = workspace([]);
+  const ordinary = await empty.prepare({ ...settings, completeAudio: true });
+  assert.strictEqual(await empty.upgradeAudioSources({ ...settings, roles: {} }), ordinary.audioSources);
+  assert.deepEqual(ordinary.audioSources, []);
 });

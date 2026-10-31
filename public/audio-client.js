@@ -17,6 +17,7 @@ export function retainLesson(history, lesson) {
 }
 export function releaseAudioSnapshots(context) {
   context.sources = []; context.input = null; context.result = null;
+  context.sourcePending = false; context.sourceMaterials = null;
 }
 export async function discardAudioContext(api, context, { consent = false, canContact = true, signal } = {}) {
   if (!consent) throw new Error('Explicit discard confirmation is required.');
@@ -54,6 +55,7 @@ export async function readAudioPlan(api, context, signal) {
 export async function prepareAudioPlan(api, context, { resume = false, revision = context.revision, signal, changed = () => {} } = {}) {
   check(signal);
   if (context.discarded || context.unavailable) throw new Error('This audio context cannot resume. Keep its retained HTML or explicitly discard remaining audio.');
+  if (context.sourcePending) throw new Error('Finish the original audio-source inventory before creating a speech plan. No source was silently omitted.');
   const path = audioPath(context);
   let exists = false;
   if (context.createAttempted || context.planKnown || context.attempts.length) {

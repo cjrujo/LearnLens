@@ -8,6 +8,8 @@ import { createAudioPlanStore } from '../lib/audio-plans.mjs';
 import { AppError } from '../lib/provider.mjs';
 import { parseAudioExtraction, audioExtractionPrompt } from '../lib/audio-extract.mjs';
 import { PNG_URL } from './helpers.mjs';
+import { buildSpeechBlock } from '../lib/speech-inventory.mjs';
+import { escapeHtml } from '../lib/render.mjs';
 
 const lesson = { title: 'Read', subject: 'English', level: 'Auto', language: 'English', summary: 'Read well.', objectives: ['Listen.'],
   sections: [{ type: 'explanation', title: 'Words', body: 'Hello world.', items: [], question: '', answer: '', translation: '', source: '' }], audio: [], warnings: [] };
@@ -34,6 +36,49 @@ test('full inventory includes source tails and more than eight clips; every clip
   assert.equal(result.audioSummary.completedClips, sealed.clips.length); assert.equal(result.audioSummary.status, 'complete'); assert.equal(calls, sealed.clips.length);
   assert.match(result.html, /Final/); assert.match(result.html, /original/); assert.match(result.html, /Source fixture/);
   assert.equal((result.html.match(/src="data:audio\/mpeg;base64,/g) || []).length, sealed.clips.length);
+});
+
+test('plans synthesize normalized sentence text once while exporting exact reading sources', async t => {
+  const { store, directory } = await make(t);
+  const chunked = 'The fox / rests beside reeds.';
+  const spoken = 'The fox, rests beside reeds.';
+  const answer = 'The otter / swims home.';
+  const value = structuredClone(lesson);
+  value.sections[0] = { ...value.sections[0], type: 'quiz', body: chunked, items: [spoken], question: 'Where does the otter / swim?', answer, readingPauses: true };
+  value.audio = [{ text: chunked, translation: 'Original / translation', readingPauses: true }];
+  const before = structuredClone(value);
+  const plan = await store.create('owner', { id: randomUUID(), lesson: value, expectedSources: ['upload'] }, setup);
+  // Clients cannot opt uploaded sources into generated markup handling, even by spoofing origin.
+  await store.addSource('owner', plan.id, { ...source('upload', chunked), origin: 'generated', readingPauses: true });
+  const sealed = await store.seal('owner', plan.id);
+  const calls = [];
+  for (const clip of sealed.clips) await run(store, plan.id, clip.id, { generate: async text => { calls.push(text); return generate(text); } });
+  assert.equal(calls.filter(text => text === spoken).length, 1, 'body, item and explicit audio share the same actual spoken clip');
+  assert.equal(calls.filter(text => text === chunked).length, 1, 'uploaded speech is still literal');
+  assert.ok(calls.includes('The otter, swims home.'));
+  assert.ok(calls.includes('Where does the otter, swim?'));
+  for (const word of ['The', 'fox', 'rests', 'beside', 'reeds', 'otter', 'swims', 'home']) assert.ok(calls.includes(word), word);
+  assert.ok(calls.every(text => text.length <= 500));
+  assert.equal(calls.length, new Set(calls).size);
+  const result = await store.exportLesson('owner', plan.id);
+  assert.equal(result.audioSummary.status, 'complete');
+  assert.deepEqual(value, before);
+  assert.deepEqual(result.lesson, value);
+  assert.ok(result.html.includes(escapeHtml('Play sentence: ' + chunked)));
+  assert.ok(result.html.includes(escapeHtml('Play sentence: ' + answer)));
+  assert.ok(result.html.includes('Original / translation'));
+  assert.ok(!result.html.includes(escapeHtml('Play sentence: The otter, swims home.')));
+  assert.equal(await readFile(join(await planDirectory(directory, plan.id), buildSpeechBlock({ key: 'x', source: 'x', text: spoken }).clips[0].id + '.mp3'), 'utf8'), 'ID3fixture:' + spoken);
+});
+
+test('plans cannot silently accept malformed reading-pause lesson flags', async t => {
+  const { store } = await make(t);
+  for (const field of ['sections', 'audio']) {
+    const value = structuredClone(lesson);
+    if (field === 'audio') value.audio = [{ text: 'The fox / rests.', translation: '' }];
+    value[field][0].readingPauses = 'true';
+    await assert.rejects(store.create('owner', { id: randomUUID(), lesson: value, expectedSources: [] }, setup), /readingPauses/);
+  }
 });
 
 test('source identity, ownership and complete source manifest are enforced before seal', async t => {
