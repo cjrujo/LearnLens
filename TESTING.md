@@ -78,9 +78,33 @@ Main-agent Windows rerun passed the full staged browser suite with real MP3/MP4/
 
 After activating the coherent public UI, the main agent reran the complete browser suite plus actual native Kokoro export playback: PASS. Native cache-only full lesson smoke again produced a 248,444-byte WAV. Live `/health` returned 200; disposable Chromium reported no runtime exceptions and an enabled composer. Local evidence: `artifacts/import-browser-live-release.log`, `artifacts/import-final-media.log`, `artifacts/native-import-release.log`. No cloud-provider teaching or actual user gateway was exercised.
 
+## Configurable primary deadlines and bounded preparation notes
+
+Working-tree verification on Windows / Node 22.23.1:
+
+- **291 passed, 0 failed, 2 opt-in skips** in the regular suite (293 total); syntax checks passed for **61 files**.
+- Primary roles accept only integer 30–600-second waits, default 300. Tests cover server/API round-trip, malformed/non-primary values, atomic rejection, stale consent revisions, probes/advisor/starter preservation, and no inference from merely saving settings. Both Responses and Chat use the selected budget without changing thinking or output-token fields. Recognition keeps its previous effective 10,000-token cap; notes keep 2,000.
+- Real loopback sockets and accelerated application clocks cover delayed headers, continuously arriving/unfinished JSON and SSE bodies, native HTTP abort errors, safe timeout phase/count metadata, exact one-call failures, and no automatic replay. Known upstream HTTP500 survives a stalled error body. DNS validation is deadline-bounded and cannot connect after a late lookup. Native transport above 300 seconds avoids Undici's internal five-minute ceiling; it retains HTTPS/public-IP/auth/redirect/body-size guards and explicitly rejects unexpected compression rather than replaying. Transcription/speech stay at 100 seconds, discovery at 20.
+- Exact 2,473-character notes and the 8,000/8,001 hard boundaries are tested server-side and in frontend preparation. Bounded over-target notes survive later failures, ordinary-cache eviction and continuation intact; raw audio sources remain lossless. Long/any-image inputs still use the model, while local passthrough remains capped at 2,200. Hierarchical merges are bounded and nonprogress stops explicitly; no clipping or paid repair is introduced.
+- Independent review found and then verified a fix for unexpected HTTP101 upgrades: the native adapter now destroys the upgraded socket and always settles on its abort signal. Regression tests and independent loopback repros confirm one-call rejection and subsequent session-job reuse; **106 focused tests passed**, with no remaining confirmed review finding.
+- The full disposable-Chromium suite passed after the transport fix, including **real 305-second delayed-header and delayed-body responses** at the 600-second setting, exactly one request each; actual 30-second deadlines produced safe 504s with the correct phase and no retry. The suite also verifies configured-wait consent/save/reload, timeout-only checkpoint continuation, exact 2,473-character notes through repeated failures, 8,001-character rejection and all prior media/offline-player checks. First Starter also preserves the visible wait field before any primary provider is selected, without inference. The final coherent run on 2026-10-31 completed both real waits in 305.014s / 305.011s, with unchanged production/test file hashes throughout; owned port9333 was closed afterward.
+- Evidence: `artifacts/timeout-notes-suite.log`, `timeout-notes-syntax.log`, `timeout-notes-api.log`, `timeout-notes-work.md`. New transport/API regressions: `tests/primary-timeout.test.mjs`, `tests/primary-timeout-api.test.mjs`. Browser evidence: `artifacts/timeout-notes-browser.log`, `timeout-notes-results.md` and `timeout-notes-browser/timeout-notes-long-wait.json`.
+
+Opt in to the real five-minute browser checks (with the disposable Chromium described above):
+
+```sh
+LEARNLENS_LONG_WAIT_TEST=1 LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1 \
+  LEARNLENS_NATIVE_FULL_AUDIO_LESSON=artifacts/native-full-audio-lesson.html \
+  LEARNLENS_NATIVE_LESSON=artifacts/native-offline-lesson.html npm run test:browser
+```
+
+Ordinary browser runs omit the long-wait cases. Current browser screenshots/logs are written under `artifacts/timeout-notes-browser/`; prior release evidence is not overwritten. Native HTML inputs exercise playback of existing exports, not new speech synthesis or pronunciation quality.
+
+These are synthetic fixtures, not real-provider compatibility, accuracy or billing/cancellation guarantees. The later user report supplied enough safe counts to identify its notes-length rejection; it does not establish why the earlier recognition request waited past 100 seconds. No live session was restarted by these checks.
+
 ## Preparation continuation and validation
 
-Current preparation-fix verification (Windows / Node 22.23.1):
+Previous preparation-fix verification at `3e8b9a1` (Windows / Node 22.23.1):
 
 - **260 passed, 0 failed, 2 opt-in skips** in the regular suite (262 total); syntax checks passed for **59 files**.
 - A synthetic 2,110-character transcript reproduced the old invalid-notes/502 failure before the fix. Afterward it is retained verbatim with **zero provider inference requests**. Tests cover exact text/Unicode, the 2,200-character boundary, and continued model processing for longer text or any images.
@@ -118,7 +142,7 @@ LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1 \
   LEARNLENS_NATIVE_LESSON=artifacts/native-offline-lesson.html npm run test:browser
 ```
 
-Evidence (ignored local artifacts): `full-audio-suite.log`, `full-audio-syntax.log`, `full-audio-recovery-fixes.log`, `full-audio-encoder-real.log`, `full-audio-native.log`, `native-full-audio-summary.json`, `full-audio-browser.log`, `full-audio-browser-run.log`, `app-full-audio.png`, `offline-full-audio.png`, `native-offline-full-audio.png`. The earlier `full-audio-stop-failure.json` records a found-and-fixed bug, not current status. The native CI workflow also prepares the managed encoder and runs full audio on Windows/Linux, with Linux external networking disabled. **Both platforms passed at `fe0dfc3`**: [native/full-audio run 41157060284](https://github.com/cjrujo/LearnLens/actions/runs/41157060284). The regular [checks run 41157058620](https://github.com/cjrujo/LearnLens/actions/runs/41157058620) also passed. These are current implementation results, distinct from the older native runs below.
+Evidence (ignored local artifacts): `full-audio-suite.log`, `full-audio-syntax.log`, `full-audio-recovery-fixes.log`, `full-audio-encoder-real.log`, `full-audio-native.log`, `native-full-audio-summary.json`, `full-audio-browser.log`, `full-audio-browser-run.log`, `app-full-audio.png`, `offline-full-audio.png`, `native-offline-full-audio.png`. The earlier `full-audio-stop-failure.json` records a found-and-fixed bug, not current status. The native CI workflow also prepares the managed encoder and runs full audio on Windows/Linux, with Linux external networking disabled. **Both platforms passed at `fe0dfc3`**: [native/full-audio run 41157060284](https://github.com/cjrujo/LearnLens/actions/runs/41157060284). The regular [checks run 41157058620](https://github.com/cjrujo/LearnLens/actions/runs/41157058620) also passed. These results describe the full-audio implementation release, distinct from later preparation changes and the older native runs below.
 
 Scope and quotas are in [FULL-AUDIO.md](FULL-AUDIO.md). Real cloud quality, all voices, faithful recognition of every original word, mathematical pronunciation, all mobile hardware and peak memory at the maximum export quota are **not** established by these tests. No real learner material, cloud credentials or paid provider inference were used.
 

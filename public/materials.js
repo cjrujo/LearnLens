@@ -1,5 +1,8 @@
 // Local originals never go to a provider. Only bounded extracted parts do, after consent.
 import { AudioSourceCollector, isContiguousAudioText, validateVisionExtraction, TRANSCRIPTION_WARNING } from './audio-sources.js';
+// Mirror lib/material-digest.mjs: decoded UTF-16 defensive cap, not the 2200
+// soft prompt target/local passthrough threshold. Retain accepted text exactly.
+const MODEL_DIGEST_NOTE_MAX_CHARS = 8000;
 const el = (tag, text, className) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; };
 const bytesOf = url => Math.ceil((url.split(',')[1]?.length || 0) * .75);
 const split = (text, size = 20000) => {
@@ -244,7 +247,7 @@ export class MaterialWorkspace {
       const result = await this.api(request.path, { method: 'POST', body, signal: controller.signal });
       if (job.invalidated || this.checkpoint !== job) this.checkPreparation(job);
       if (request.path === '/audio/extract') validateVisionExtraction(result);
-      else if (typeof result?.text !== 'string' || !result.text.trim() || (request.path.endsWith('/summarize') && result.text.length > 2200)) throw new Error('The provider returned an invalid preparation result. No further paid calls were made.');
+      else if (typeof result?.text !== 'string' || !result.text.trim() || (request.path.endsWith('/summarize') && result.text.length > MODEL_DIGEST_NOTE_MAX_CHARS)) throw new Error('The provider returned an invalid preparation result. No further paid calls were made.');
       this.pinPreparation(job, key, result);
       this.cachePut(cacheKey, result);
       this.checkpointProgress(job);

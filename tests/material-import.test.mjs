@@ -75,7 +75,7 @@ test('binary upload API enforces CSRF, automatic multipart text, session isolati
 test('digest preparation requires explicit consent and safely validates provider output', async t => {
   assert.throws(() => digestInput({ text: 'notes' }), /consent/);
   assert.deepEqual(parseDigest('{"notes":"Safe notes","warnings":[]}'), { text: 'Safe notes', warnings: [] });
-  assert.throws(() => parseDigest('{"notes":"' + 'x'.repeat(2201) + '","warnings":[]}'), /valid preparation/);
+  assert.throws(() => parseDigest('{"notes":"' + 'x'.repeat(8001) + '","warnings":[]}'), /valid preparation/);
   const { client, mock } = await configured(t, { mock: { outputText: '{"notes":"Prepared source notes","warnings":[]}' } });
   const response = await client.request('/api/materials/summarize', { method: 'POST', json: { text: 'source', images: [] } });
   assert.equal(response.status, 400); assert.equal(mock.calls.length, 0);

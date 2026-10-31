@@ -582,14 +582,16 @@ test('checkpoint: missing current transcription role blocks only its unfinished 
   assert.equal(value.checkpointInfo().completedCalls, 0);
 });
 
-test('checkpoint: contiguous full sources and exact tails survive suspended digest and generator rebuild', async () => {
+test('checkpoint: 2473-character notes and contiguous full sources survive suspended digest and generator rebuild', async () => {
+  const retainedNotes = 'MODEL NOTES\n  Exact internal spacing. 🧪 '.padEnd(2469, 'x') + ' END';
+  assert.equal(retainedNotes.length, 2473);
   for (const localFailure of [false, true]) {
     const original = ' FIRST mid' + 'dle words. '.repeat(6000) + '\nLAST 😀  ';
     const textParts = Array.from({ length: Math.ceil(original.length / 20000) }, (_, index) => original.slice(index * 20000, (index + 1) * 20000));
     let fail = true, calls = 0; const reads = [];
     const value = workspace([{ id: 'contiguous', name: 'private.txt', kind: 'text', status: 'ready', textParts, partCount: textParts.length, warnings: [] }], async (_path, { body }) => {
       calls++;
-      return { text: !localFailure && fail && body.source.includes('(' + textParts.length + '/') ? '' : 'Lossy digest', warnings: [] };
+      return { text: !localFailure && fail && body.source.includes('(' + textParts.length + '/') ? '' : retainedNotes, warnings: [] };
     });
     const part = value.part.bind(value);
     value.part = async (...args) => {
@@ -604,6 +606,7 @@ test('checkpoint: contiguous full sources and exact tails survive suspended dige
     assert.equal(calls, before + 1);
     assert.equal(reads.length, readCount + (localFailure ? textParts.length : 0));
     assert.equal(result.audioSources.map(source => source.text).join(''), original);
+    assert.equal(result.text.split(retainedNotes).length - 1, textParts.length, 'Every model result survives exactly; no clipping or repair');
     assertDescriptors(result.audioSources);
     assert.equal(value.checkpointInfo().completedParts, textParts.length);
   }
@@ -721,6 +724,98 @@ test('checkpoint: failed merge resumes at its yield with all local parts already
   assert.equal(updates[0].info.part, 20);
   assert.equal(result.audioSources.map(source => source.text).join(''), textParts.join(''));
   assertDescriptors(result.audioSources);
+});
+
+test('checkpoint: frontend accepts exactly 8000 notes but never pins 8001 notes or failed requests', async () => {
+  const notes = 'MODEL\n  Interior 🧪 '.padEnd(7996, 'x') + ' END';
+  const textParts = [' First original words.\n', ' Second original words.\n'];
+  let calls = 0, mode = 'overlimit';
+  const value = workspace([{ id: 'hard-cap', name: 'Source.txt', kind: 'text', status: 'ready', partCount: 2, textParts, warnings: [] }], async () => {
+    calls++;
+    if (calls === 1) return { text: notes, warnings: [] };
+    if (mode === 'failed') throw new Error('Synthetic HTTP502');
+    return { text: mode === 'overlimit' ? notes + 'x' : 'Recovered.', warnings: [] };
+  });
+  const options = { ...settings, completeAudio: true };
+  await assert.rejects(value.prepare(options), /invalid preparation/);
+  assert.equal(calls, 2, 'Bounded first success must not trigger repair');
+  assert.equal(value.cache.size, 1);
+  assert.equal(value.checkpointInfo().completedCalls, 1);
+  assert.equal(value.checkpointInfo().completedParts, 1);
+  assert.deepEqual([...value.checkpoint.pinned.values()].map(result => result.text), [notes]);
+  evictGeneralCache(value); mode = 'failed';
+  await assert.rejects(value.prepare({ ...options, resume: true }), /Synthetic HTTP502/);
+  assert.equal(calls, 3);
+  assert.deepEqual([...value.cache.keys()], ['pressure'], 'Failed requests add no cache entries');
+  assert.equal(value.checkpointInfo().completedCalls, 1);
+  mode = 'valid';
+  const result = await value.prepare({ ...options, resume: true });
+  assert.equal(calls, 4);
+  assert.equal(result.text, `[Source: Source.txt · Text part 1 (1/2)]\n${notes}\n\n[Source: Source.txt · Text part 2 (2/2)]\nRecovered.`);
+  assert.equal(result.audioSources.map(source => source.text).join(''), textParts.join(''));
+});
+
+test('8000-character notes with maximum source prefixes merge hierarchically within unchanged input and aggregate bounds', async () => {
+  const textParts = Array.from({ length: 40 }, (_, index) => ` Original ${index} mid` + 'dle words. '.repeat(200) + '\nEND 🧪  ');
+  const requests = [];
+  let merges = 0, fail = true, reads = 0;
+  const value = workspace([{ id: 'bounded-merges', name: 'n'.repeat(180) + '.txt', kind: 'text', status: 'ready', partCount: textParts.length, textParts, warnings: [] }], async (path, { body }) => {
+    assert.equal(path, '/materials/summarize');
+    requests.push(body);
+    assert.ok(body.text.length <= 40000, 'All dispatches respect the lesson input ceiling');
+    assert.ok(body.source.length <= 200);
+    if (body.source.startsWith('Merged source notes')) {
+      merges++;
+      assert.ok(body.text.length <= 30000, 'Source prefixes and separators count toward merge grouping');
+      if (fail && merges === 2) return { text: 'x'.repeat(8001), warnings: [] };
+    }
+    return { text: `Notes ${requests.length}\n  Internal spacing 🧪 `.padEnd(7996, 'x') + ' END', warnings: [] };
+  });
+  const part = value.part.bind(value);
+  value.part = async (...args) => { reads++; return part(...args); };
+  const options = { ...settings, completeAudio: true };
+  await assert.rejects(value.prepare(options), /invalid preparation/);
+  assert.equal(requests.length, 42);
+  assert.equal(value.checkpointInfo().completedParts, 40);
+  assert.equal(value.checkpointInfo().completedCalls, 41);
+  assert.equal(value.checkpointInfo().stage, 'merge');
+  assert.equal(requests[40].text.match(/\[Source:/g).length, 3, 'Four 8000-character notes plus labels exceed a group');
+  evictGeneralCache(value); fail = false;
+  const result = await value.prepare({ ...options, resume: true });
+  assert.equal(reads, 40, 'Resume keeps its pending merge position');
+  assert.equal(merges, 14 + 5 + 2 + 1, 'Three shrinking merge levels plus one explicitly retried failure');
+  assert.equal(requests.length, 62);
+  assert.equal(value.checkpointInfo().completedCalls, 61);
+  assert.ok(result.text.length <= 35000);
+  assert.ok(result.text.length > 16000, 'Both final notes and source prefixes remain intact');
+  assert.equal(result.audioSources.map(source => source.text).join(''), textParts.join(''));
+  assertDescriptors(result.audioSources);
+  assert.strictEqual(await value.prepare({ ...options, resume: true }), result);
+  assert.equal(requests.length, 62);
+});
+
+test('merge reducer explicitly stops nonprogress even if handed legacy oversized accepted results', async () => {
+  // Exercise the reducer's independent defense directly. The request validator
+  // now rejects such results before acceptance; stale/legacy state must not loop.
+  const textParts = Array(5).fill('Original text.');
+  const value = workspace([{ id: 'nonprogress', name: 'Source.txt', kind: 'text', status: 'ready', partCount: 5, textParts, warnings: [] }]);
+  const job = { items: value.items, goal: 'Learn', epoch: value.epoch, totalParts: 5, pinned: new Map(), completedParts: new Set() };
+  value.checkpoint = job;
+  const generator = value.preparationSteps(job);
+  let step = await generator.next(), merges = 0;
+  while (!step.done) {
+    const request = step.value;
+    const isMerge = request.stage === 'merge';
+    if (isMerge) merges++;
+    const accepted = { text: isMerge ? request.body.text : 'x'.repeat(8000), warnings: [] };
+    if (merges === 2) {
+      await assert.rejects(generator.next(accepted), /did not become shorter.*no further calls/);
+      assert.equal((await generator.next()).done, true);
+      return;
+    }
+    step = await generator.next(accepted);
+  }
+  assert.fail('Nonprogress must stop explicitly, never return oversized aggregate');
 });
 
 test('checkpoint: success counts advance before cachePut, and a Stop from progress retains the paused request', async () => {

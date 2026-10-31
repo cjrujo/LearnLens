@@ -60,7 +60,7 @@ export const ocrText = 'Original screenshot English, not a source digest. Screen
 // More than 500 characters, one sentence: exercises sequenced sentence pieces.
 export const longSentence = 'A ' + 'careful reader follows the original source and learns each word '.repeat(12) + 'until the long sentence final sentinel.';
 export function createQAProvider() {
-  const config = { status: 200, failKind: null, failAfter: null, speechDelay: 0, digestFaultAt: null, digestFaultRepeat: false, digestFault: 'oversized-notes' }, calls = [];
+  const config = { status: 200, failKind: null, failAfter: null, speechDelay: 0, lessonDelay: 0, flushLessonHeaders: false, digestNotes: null, digestFaultAt: null, digestFaultRepeat: false, digestFault: 'oversized-notes' }, calls = [];
   const lesson = structuredClone(demoLesson);
   lesson.title = 'Browser integration test';
   lesson.summary = 'Mock-provider output for testing, not AI tutoring. <script>window.__learnlensExportInjection=true</script>';
@@ -80,6 +80,18 @@ export function createQAProvider() {
     }
     calls.push(call);
     res.setHeader('Content-Type', 'application/json');
+    if (call.kind === 'lesson' && config.lessonDelay) {
+      call.startedAt = Date.now();
+      if (config.flushLessonHeaders) { res.flushHeaders(); call.headersFlushedAt = Date.now(); }
+      await new Promise(resolve => {
+        const timer = setTimeout(done, config.lessonDelay);
+        function done() { clearTimeout(timer); res.off('close', done); resolve(); }
+        res.once('close', done);
+      });
+      call.elapsedMs = Date.now() - call.startedAt;
+      call.disconnected = res.destroyed;
+      if (res.destroyed) return;
+    }
     if (call.kind === 'speech' && config.speechDelay) await new Promise(resolve => setTimeout(resolve, config.speechDelay));
     if (config.status !== 200 || config.failKind === call.kind || (call.kind === 'speech' && config.failAfter !== null && calls.filter(c => c.kind === 'speech').length > config.failAfter)) { call.failed = true; res.statusCode = config.status !== 200 ? config.status : 500; res.end('{}'); return; }
     if (req.url === '/v1/models') res.end(JSON.stringify({ data: ['test/vision', 'test/speech', 'test/transcribe', 'gpt-5.4-mini'].map(id => ({ id })) }));
@@ -91,8 +103,8 @@ export function createQAProvider() {
       } else if (input.instructions.includes('LEARNLENS_SOURCE_DIGEST')) {
         const ordinal = calls.filter(c => c.kind === 'digest').length;
         const malformed = config.digestFaultAt !== null && (ordinal === config.digestFaultAt || (config.digestFaultRepeat && ordinal > config.digestFaultAt));
-        if (malformed) { call.malformed = true; text = config.digestFault === 'invalid-json' ? '{not valid JSON' : JSON.stringify({ notes: 'x'.repeat(2201), warnings: [] }); }
-        else text = JSON.stringify({ notes: 'Fixture digest of the supplied source part. This is synthetic QA, not real AI.', warnings: [] });
+        if (malformed) { call.malformed = true; text = config.digestFault === 'invalid-json' ? '{not valid JSON' : JSON.stringify({ notes: 'x'.repeat(8001), warnings: [] }); }
+        else text = JSON.stringify({ notes: config.digestNotes ?? 'Fixture digest of the supplied source part. This is synthetic QA, not real AI.', warnings: [] });
       } else if (input.instructions.includes('model setup advisor')) {
         const catalog = JSON.parse(input.input[0].content[0].text).candidates;
         const roles = Object.fromEntries(Object.entries({ primary: 'test/vision', speech: 'test/speech', transcription: 'test/transcribe' }).map(([role, model]) => [role, { candidateId: catalog.find(c => c.model === model)?.candidateId ?? null, reason: 'QA fixture recommendation.', caveat: 'This is not real model advice.' }]));

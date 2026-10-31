@@ -33,7 +33,7 @@ The tests use local mock providers. They do not call paid models or prove the ed
 - Free-form subjects and AI classification, across primary, junior secondary, high school and college/university. Users can specify subject, level, language and teaching goal.
 - Flexible model-chosen lesson composition: explanations, ordered steps, examples, vocabulary, translations, practice with revealable answers, summaries and objectives.
 - Built-in OpenAI standard preset (`https://api.openai.com/v1`), editable connections, multiple compatible providers and manual model IDs.
-- Primary-model thinking level: Default, None, Minimal, Low, Medium, High, Extra high or Maximum, subject to model support.
+- Primary-model thinking level: Default, None, Minimal, Low, Medium, High, Extra high or Maximum, subject to model support. Configurable request wait: 30–600 seconds, default 300.
 - Optional primary-model setup advisor: reviewed suggestions with reasons, never silently saved or treated as capability verification.
 - Explicit model listing and opt-in **billable** text, vision and speech capability tests.
 - Separate primary, transcription and speech model roles. Same provider/model may serve several roles when supported.
@@ -63,7 +63,11 @@ That means **one required role and two optional roles**, not necessarily three d
 
 **Gemini audio:** In Speech-to-text, choose **Transcription API → Gemini-native audio**, then save. Your provider/key stay on the same host; a `/v1` base maps to `/v1beta` for audio only. Configure the primary teaching API separately (Aiberm documents Chat Completions for its Gemini model). A user reported a successful `gemini-3.8-flash` native transcription. Automated tests remain local fixtures; broader gateway/token-group compatibility is not established. No paid probe or protocol fallback is automatic. See [setup, limits and evidence](GEMINI-AUDIO.md).
 
-**Thinking level:** Default omits the parameter entirely; it is not the same as None. Responses uses `reasoning: { effort }`; Chat uses `reasoning_effort`. Both use output-token limits that include reasoning tokens. More effort can increase latency/cost or exhaust the output budget. Not every model/gateway supports every setting; unsupported requests fail visibly, without silently downgrading effort or retrying against a different endpoint on HTTP 400. Use Default if unsure. Capability badges are scoped to API mode/thinking level (and voice for speech).
+**Thinking level:** Default omits the parameter entirely; it is not the same as None. Responses uses `reasoning: { effort }`; Chat uses `reasoning_effort`. Both use output-token limits that include reasoning tokens. More effort can increase latency/cost or exhaust the output budget. Not every model/gateway supports every setting; unsupported requests fail visibly, without silently downgrading effort or retrying against a different endpoint on HTTP 400. Use Default if unsure. Capability badges are scoped to API mode/thinking level/wait limit (and voice for speech).
+
+**Request wait limit:** under **AI providers → Primary lesson model**, choose 30–600 seconds (default 300 / five minutes), then **Save model roles**. Recognition, necessary preparation notes, teaching, primary capability tests and model advice use this limit per provider HTTP request, including reading the full response body. It does not change thinking or output-token budgets. Transcription/speech retain 100-second limits and discovery 20 seconds. Auto's narrowly allowed missing-endpoint fallback is a separate request with the same limit. A provider/proxy may stop sooner; waiting longer does not guarantee success or prevent charges. Timeout reports show the actual limit and whether response headers had arrived. No automatic timeout retry occurs. Keep the page open and use **Continue generation** with renewed consent; only unfinished work uses the new settings, not retained successful preparation. These settings and checkpoints remain session-only.
+
+**Preparation notes:** 2,200 characters is a compactness target, not a reason to discard otherwise valid modestly longer output. Model notes up to 8,000 decoded UTF-16 code units are retained without clipping (existing outer whitespace trimming still applies). Larger/malformed/incomplete results fail explicitly; they are never silently repaired or replayed. Text-only inputs up to 2,200 characters still bypass model rewriting entirely. See [API boundaries](API-CONTRACT.md#post-apimaterialssummarize).
 
 **Editing a connection:** use its Edit button. A blank key retains the saved key only when the base URL is unchanged. Changing the URL requires re-entering a key for a remote provider, so credentials are not silently transferred to another endpoint. Changing the endpoint/key clears discovery results and checks, while keeping model IDs as editable, unverified selections.
 
@@ -96,7 +100,7 @@ PUBLIC_ORIGIN=https://learnlens.your-domain.example
 LEARNLENS_ACCESS_PASSWORD=<unique-random-secret-at-least-16-characters>
 ```
 
-A public bind requires both an HTTPS origin and access password. Never expose the Node HTTP port directly to the internet. Put an HTTPS reverse proxy in front and preserve the original `Host` header. Terminate TLS at the proxy; set upload limits to at least 13 MB and upstream read timeouts appropriately for model/audio generation (several minutes). Use edge rate limiting as well.
+A public bind requires both an HTTPS origin and access password. Never expose the Node HTTP port directly to the internet. Put an HTTPS reverse proxy in front and preserve the original `Host` header. Terminate TLS at the proxy; set upload limits to at least 13 MB and upstream read timeouts appropriately for model/audio generation (primary requests can wait up to ten minutes per HTTP attempt; narrow Auto fallback can add a separate attempt). Use edge rate limiting as well.
 
 Example Docker commands (create `.env` yourself with real values, do not commit it):
 

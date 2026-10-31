@@ -64,7 +64,7 @@ async function attachments(session, count) {
   await wait(session, `document.querySelectorAll('#material-list > li').length === ${count} && document.getElementById('material-list').getAttribute('aria-busy') === 'false'`);
   assert.equal(await evaluate(session, 'document.querySelectorAll("#material-list .inline-message.error").length'), 0, await evaluate(session, 'document.getElementById("material-list").innerText'));
 }
-async function shot(session, name) { await call('Page.bringToFront', {}, session); const { data } = await call('Page.captureScreenshot', { format: 'png' }, session); await writeFile(resolve('artifacts', name), Buffer.from(data, 'base64')); }
+async function shot(session, name) { await call('Page.bringToFront', {}, session); const { data } = await call('Page.captureScreenshot', { format: 'png' }, session); await writeFile(resolve('artifacts/timeout-notes-browser', name), Buffer.from(data, 'base64')); }
 async function upload(session, selector, files) { const { root } = await call('DOM.getDocument', {}, session); const { nodeId } = await call('DOM.querySelector', { nodeId: root.nodeId, selector }, session); await call('DOM.setFileInputFiles', { nodeId, files: files.map(file => resolve(file)) }, session); }
 async function gesture(session, expression) {
   const result = await call('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true }, session);
@@ -111,7 +111,69 @@ async function verifyFullPlayer(session, { synthetic = false } = {}) {
   passed('full offline player: actual MP3 decode/playback, single player, speeds, natural ended repeat progression, Stop/rapid replacement, hidden answers/collapse, long sentence pieces and 320px');
 }
 const provider = createQAProvider(), kokoro = createQAProvider(), gated = createApp({ publicDirectory, accessPassword: 'test-private-beta-password' }).server;
-let app;
+let app, longWaitRun;
+const longWaitProviders = [];
+// Opt-in real wall-clock regression; production application transport is not mocked.
+async function startLongWaitChecks(origin) {
+  const sessions = [];
+  for (const { phase, seconds } of [600, 30].flatMap(seconds => ['response_headers', 'response_body'].map(phase => ({ phase, seconds })))) {
+    const slow = createQAProvider(); longWaitProviders.push(slow);
+    slow.config.lessonDelay = seconds === 600 ? 305000 : 35000;
+    slow.config.flushLessonHeaders = phase === 'response_body';
+    const providerOrigin = await listen(slow.server);
+    const originalContext = browserContextId;
+    ({ browserContextId } = await call('Target.createBrowserContext')); extraContexts.push(browserContextId);
+    const session = await tab(origin); browserContextId = originalContext;
+    await wait(session, 'document.getElementById("setup-label")?.textContent === "Connect your AI"');
+    await evaluate(session, `document.querySelector('[data-page="providers"]').click();document.getElementById('provider-name').value='Long wait ${phase}';document.getElementById('provider-url').value=${JSON.stringify(providerOrigin + '/v1')};document.getElementById('provider-form').requestSubmit()`);
+    await wait(session, '!!document.querySelector(".provider-name")');
+    await evaluate(session, `const p=document.getElementById('role-primary-provider');p.selectedIndex=1;p.dispatchEvent(new Event('change'));const m=document.getElementById('role-primary-model');m.value='__manual__';m.dispatchEvent(new Event('change'));document.getElementById('role-primary-manual').value='test/vision';document.getElementById('role-primary-manual').dispatchEvent(new Event('input'));document.getElementById('role-primary-timeout').value='${seconds}';document.getElementById('role-primary-timeout').dispatchEvent(new Event('input'));document.getElementById('roles-form').requestSubmit()`);
+    await wait(session, '!document.getElementById("roles-fields").disabled && document.getElementById("roles-message").textContent.startsWith("Model roles saved")');
+    await evaluate(session, `document.querySelector('[data-page="lesson"]').click();document.getElementById('learning-goal').value='Synthetic long wait lesson ${phase}';document.getElementById('learning-goal').dispatchEvent(new Event('input'));document.getElementById('include-audio').checked=false;document.getElementById('include-audio').dispatchEvent(new Event('input'));document.getElementById('lesson-form').requestSubmit()`);
+    await wait(session, 'document.getElementById("confirm-dialog").open');
+    assert.match(await evaluate(session, 'document.getElementById("confirm-dialog").textContent'), new RegExp(`Primary request wait: ${seconds} seconds`));
+    await consent(session);
+    await wait(session, 'JSON.parse(document.getElementById("diagnostic-report").textContent).lastOperation?.status === "Waiting"');
+    assert.equal(await evaluate(session, 'JSON.parse(document.getElementById("diagnostic-report").textContent).lastOperation.timeoutMs'), seconds * 1000);
+    sessions.push({ session, phase, seconds, slow, startedAt: Date.now() });
+  }
+  // Return a wrapped promise so setup is awaited, not the five-minute checks.
+  return { completion: Promise.all(sessions.map(async ({ session, phase, seconds, slow, startedAt }) => {
+    await wait(session, '!document.getElementById("generate-button").disabled', 345000);
+    if (seconds === 30) {
+      assert.equal(await evaluate(session, 'document.getElementById("preview-error").hidden'), false);
+      const report = JSON.parse(await evaluate(session, 'document.getElementById("diagnostic-report").textContent'));
+      assert.equal(report.lastOperation.appStatus, 504);
+      assert.equal(report.lastOperation.timeoutMs, 30000);
+      assert.equal(report.lastOperation.timeoutPhase, phase);
+      assert.equal(report.lastOperation.category, 'timeout');
+      assert.equal(report.lastOperation.automaticRetry, false);
+      assert.equal(report.lastOperation.responseBodyOmitted, true);
+      assert.doesNotMatch(JSON.stringify(report), /Synthetic long wait lesson|Bearer|"(?:requestBody|responseBody|sourceText|goal)"/);
+      const hint = await evaluate(session, 'document.getElementById("diagnostic-hint").textContent');
+      assert.match(hint, /30-second waiting limit/);
+      assert.match(hint, phase === 'response_body' ? /while reading the response body/ : /before receiving response headers/);
+      assert.equal(slow.calls.length, 1, 'Timeout never automatically retries');
+      await evaluate(session, 'document.getElementById("lesson-diagnostics").scrollIntoView({block:"start"})');
+      await shot(session, 'timeout-error-' + phase + '.png');
+      passed('real 30-second timeout: ' + phase + '; safe error trace, phase hint, exactly one provider request');
+      return { phase, configuredMs: 30000, browserElapsedMs: Date.now() - startedAt, requests: slow.calls.length, expectedTimeout: true };
+    }
+    await created(session);
+    assert.equal(slow.calls.length, 1, 'Exactly one provider request, no discovery/retry/fallback');
+    const request = slow.calls[0];
+    assert.equal(request.kind, 'lesson'); assert.equal(request.disconnected, false);
+    assert.ok(request.elapsedMs >= 305000, 'Real wait exceeds the 300-second Undici cap');
+    assert.equal(Boolean(request.headersFlushedAt), phase === 'response_body');
+    assert.match(await evaluate(session, 'document.getElementById("lesson-frame").srcdoc'), /Browser integration test/);
+    const report = JSON.parse(await evaluate(session, 'document.getElementById("diagnostic-report").textContent'));
+    assert.equal(report.lastOperation.timeoutMs, 600000); assert.equal(report.lastOperation.status, 'Completed');
+    assert.equal(report.lastOperation.timeoutPhase, undefined);
+    await shot(session, 'long-wait-' + phase + '.png');
+    const timing = { phase, configuredMs: 600000, providerElapsedMs: request.elapsedMs, browserElapsedMs: Date.now() - startedAt, requests: slow.calls.length };
+    passed('real long wait ' + JSON.stringify(timing)); return timing;
+  })).then(result => ({ result }), error => ({ error })) };
+}
 try {
   const providerOrigin = await listen(provider.server), kokoroOrigin = await listen(kokoro.server);
   // Synthetic codec fixture: encode the existing one-second tone once using cached OFFLINE tools.
@@ -120,19 +182,22 @@ try {
   app = createApp({ publicDirectory, audioEncoderFactory: async () => async () => fixtureMP3, kokoroBaseUrl: kokoroOrigin + '/v1', kokoroBuiltin: true, kokoroFormat: 'wav', kokoroLanguages: ['en'] }).server;
   const origin = await listen(app), gatedOrigin = await listen(gated);
   ({ browserContextId } = await call('Target.createBrowserContext'));
-  await mkdir('artifacts', { recursive: true });
-  await writeFile('artifacts/test-screenshot.png', Buffer.from(probeImage().dataUrl.split(',')[1], 'base64'));
-  await writeFile('artifacts/test-audio.wav', wav);
-  await writeFile('artifacts/test-notes.md', sourceText + '\n' + longSentence);
-  const downloads = resolve('artifacts', 'downloads-' + Date.now());
+  await mkdir('artifacts/timeout-notes-browser', { recursive: true });
+  await writeFile('artifacts/timeout-notes-browser/test-screenshot.png', Buffer.from(probeImage().dataUrl.split(',')[1], 'base64'));
+  await writeFile('artifacts/timeout-notes-browser/test-audio.wav', wav);
+  await writeFile('artifacts/timeout-notes-browser/test-notes.md', sourceText + '\n' + longSentence);
+  const downloads = resolve('artifacts/timeout-notes-browser', 'downloads-' + Date.now());
   await mkdir(downloads);
   await call('Browser.setDownloadBehavior', { behavior: 'allow', browserContextId, downloadPath: downloads, eventsEnabled: true });
+  if (process.env.LEARNLENS_LONG_WAIT_TEST === '1') longWaitRun = (await startLongWaitChecks(origin)).completion;
   const s = await tab(origin);
   await wait(s, 'document.getElementById("setup-label")?.textContent === "Connect your AI"');
   await call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false }, s);
   assert.equal(await evaluate(s, 'document.getElementById("provider-url").value'), 'https://api.openai.com/v1');
   assert.equal(await evaluate(s, 'document.getElementById("role-speech-engine").value'), 'kokoro', 'Built-in speech needs no learner setup');
   assert.equal(await evaluate(s, 'document.getElementById("role-speech-voice").value'), 'af_heart');
+  assert.deepEqual(await evaluate(s, `(()=>{const n=document.getElementById('role-primary-timeout');return [n.type,n.min,n.max,n.value]})()`), ['number','30','600','300']);
+  assert.equal(await evaluate(s, `['speech','transcription'].every(role=>document.getElementById('role-'+role+'-timeout').closest('.timeout-field').hidden)`), true);
   await shot(s, 'app-desktop.png');
   await evaluate(s, `window.__previewLoaded=false;document.getElementById('lesson-frame').addEventListener('load',()=>{window.__previewLoaded=true},{once:true});document.querySelector('[data-action="demo"]').click()`);
   await wait(s, '!document.getElementById("preview-result").hidden');
@@ -163,10 +228,29 @@ try {
   await wait(s, '!!document.querySelector(".provider-name")');
   await evaluate(s, 'document.querySelector(".discover-button").click()');
   await wait(s, 'document.querySelector(".provider-model-count")?.textContent === "4 listed models"');
+  assert.equal(await evaluate(s, 'document.getElementById("role-primary-provider").value'), '', 'No primary provider selected before first Starter');
+  assert.equal(await evaluate(s, 'document.getElementById("role-primary-model").value'), '', 'No primary model draft before first Starter');
+  const beforeFirstStarter = provider.calls.length;
+  await evaluate(s, `document.getElementById('role-primary-timeout').value='450';document.getElementById('role-primary-timeout').dispatchEvent(new Event('input'))`);
+  assert.equal(await evaluate(s, 'document.getElementById("role-primary-provider").value'), '', 'Entering wait alone does not select a provider');
   await evaluate(s, 'document.getElementById("use-starter").click()');
+  await wait(s, 'document.getElementById("role-primary-model").value === "gpt-5.4-mini"');
+  assert.equal(await evaluate(s, 'document.getElementById("role-primary-timeout").value'), '450', 'First Starter preserves visible wait even when readDraft was null');
+  assert.notEqual(await evaluate(s, 'document.getElementById("role-primary-provider").value'), '', 'Starter now fills the primary provider');
+  assert.equal(provider.calls.length, beforeFirstStarter, 'Entering wait and applying first Starter sends no provider request');
+  assert.equal(provider.calls.filter(c=>c.kind!=='discovery').length, 0, 'No inference before primary setup consent');
+  await evaluate(s, 'document.getElementById("role-primary-timeout").scrollIntoView({block:"center"})');
+  await shot(s, 'starter-visible-wait.png');
+  passed('first Starter retains visible450sec before any primary provider/model selection; no provider request or inference');
+  await evaluate(s, `document.getElementById('role-primary-timeout').value='450';document.getElementById('role-primary-timeout').dispatchEvent(new Event('input'));document.getElementById('use-starter').click()`);
+  await wait(s, 'document.getElementById("confirm-dialog").open');
+  await evaluate(s, 'document.getElementById("confirm-accept").click()');
+  await wait(s, '!document.getElementById("confirm-dialog").open');
+  assert.equal(await evaluate(s, 'document.getElementById("role-primary-timeout").value'), '450', 'Starter preserves draft wait');
   assert.equal(await evaluate(s, 'document.getElementById("role-primary-model").value'), 'gpt-5.4-mini');
   await evaluate(s, 'document.getElementById("role-primary-effort").value="high";document.getElementById("role-primary-effort").dispatchEvent(new Event("change"));document.getElementById("recommend-models").click()');
   await wait(s, 'document.getElementById("confirm-dialog").open');
+  assert.match(await evaluate(s, 'document.getElementById("confirm-dialog").textContent'), /Primary request wait: 450 seconds/);
   assert.equal(provider.calls.filter(c => c.path === '/v1/responses').length, 0, 'No inference before explicit advisor consent');
   await evaluate(s, 'document.getElementById("confirm-consent").click();document.getElementById("confirm-accept").click()');
   await wait(s, '!document.getElementById("recommend-results").hidden');
@@ -174,6 +258,7 @@ try {
   assert.equal(await evaluate(s, 'document.getElementById("setup-count").textContent'), '1/3', 'Advice cannot save roles');
   await evaluate(s, 'document.querySelector("#recommend-cards input[data-role=primary]").click();document.querySelector("#recommend-cards input[data-role=speech]").click();document.getElementById("apply-recommendations").click()');
   assert.equal(await evaluate(s, 'document.getElementById("role-primary-model").value'), 'test/vision');
+  assert.equal(await evaluate(s, 'document.getElementById("role-primary-timeout").value'), '450', 'Advisor preserves draft wait');
   assert.equal(await evaluate(s, 'document.getElementById("setup-count").textContent'), '1/3', 'Applying advice only changes the form');
   await evaluate(s, 'document.querySelector(".setup-advisor").scrollIntoView({block:"start"})');
   await shot(s, 'app-model-advisor.png');
@@ -186,12 +271,22 @@ try {
   await evaluate(s, `document.querySelector('[data-role="primary"] .probe-buttons button:last-child').click()`);
   await wait(s, 'document.getElementById("confirm-dialog").open');
   assert.equal(await evaluate(s, 'document.getElementById("confirm-accept").disabled'), true);
+  assert.match(await evaluate(s, 'document.getElementById("confirm-dialog").textContent'), /Primary request wait: 450 seconds/);
   await evaluate(s, `document.getElementById('confirm-consent').click();document.getElementById('confirm-accept').click()`);
   await wait(s, `document.querySelector('[data-role="primary"] .check-badges').textContent.includes('vision: Verified')`);
   await shot(s, 'app-providers.png');
+  const beforeTimeoutSave = provider.calls.length;
+  await evaluate(s, `document.getElementById('role-primary-timeout').value='600';document.getElementById('role-primary-timeout').dispatchEvent(new Event('input'));document.getElementById('roles-form').requestSubmit()`);
+  await wait(s, '!document.getElementById("roles-fields").disabled');
+  assert.match(await evaluate(s, 'document.querySelector("[data-role=primary] .check-badges").textContent'), /vision: Untested/);
+  assert.equal(provider.calls.length, beforeTimeoutSave, 'Wait-only save never probes automatically');
+  await call('Page.reload', {}, s);
+  await wait(s, 'document.getElementById("role-primary-timeout")?.value === "600"');
+  assert.equal(await evaluate(s, 'document.getElementById("role-primary-effort").value'), 'low', 'Wait changes preserve thinking');
+  passed('primary wait number/default/bounds; hidden speech/STT; starter/advisor preserve wait; save/reload roundtrip; verification scoped to wait');
   await evaluate(s, `document.querySelector('[data-page="lesson"]').click();document.getElementById('tab-compose').click();document.getElementById('learning-goal').value='Explain this screenshot with examples.';document.getElementById('learning-goal').dispatchEvent(new Event('input'));document.getElementById('include-audio').checked=true;document.getElementById('include-audio').dispatchEvent(new Event('input'))`);
   const beforeUpload = provider.calls.length;
-  await upload(s, '#material-input', ['artifacts/test-screenshot.png', 'artifacts/test-notes.md', 'artifacts/test-audio.wav']);
+  await upload(s, '#material-input', ['artifacts/timeout-notes-browser/test-screenshot.png', 'artifacts/timeout-notes-browser/test-notes.md', 'artifacts/timeout-notes-browser/test-audio.wav']);
   await attachments(s, 3);
   assert.equal(provider.calls.length, beforeUpload, 'Uploads and local preparation never call a provider');
   assert.match(await evaluate(s, 'document.querySelector("#material-list .material-text-preview").textContent'), /Markdown source/);
@@ -254,7 +349,7 @@ try {
   finally { clearTimeout(downloadTimer); }
   const downloaded = await readFile(downloadedPath, 'utf8');
   assert.equal(downloaded, html, 'Actual browser download matches the preview document');
-  await writeFile('artifacts/browser-export.html', downloaded);
+  await writeFile('artifacts/timeout-notes-browser/browser-export.html', downloaded);
   await shot(s, 'app-generated.png');
   await shot(s, 'app-full-audio.png');
   assert.ok(provider.calls.some(c => c.path === '/v1/audio/speech'), 'Online speech method used');
@@ -308,7 +403,7 @@ try {
   passed('provider failure preserves previous lesson and explicit retry succeeds');
   // Genuine PDF/Office originals and a native browser recording: all enter the
   // same file input, never an API-only import or a forged extension.
-  const fixtures = await importFixtures(resolve('artifacts/browser-import-fixtures'), { media: process.env.LEARNLENS_MEDIA_INTEGRATION === '1' });
+  const fixtures = await importFixtures(resolve('artifacts/timeout-notes-browser/browser-import-fixtures'), { media: process.env.LEARNLENS_MEDIA_INTEGRATION === '1' });
   const nativeRecording = await call('Runtime.evaluate', { userGesture: true, awaitPromise: true, returnByValue: true, expression: `(async()=>{
     if (!MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) throw new Error('Native WebM recording unsupported in this disposable Chromium');
     const context = new AudioContext(); await context.resume();
@@ -323,7 +418,7 @@ try {
     } finally {destination.stream.getTracks().forEach(t=>t.stop());await context.close()}
   })()` }, s);
   assert.equal(nativeRecording.exceptionDetails, undefined, 'Microphone-free MediaRecorder fixture created');
-  const recordingPath = resolve('artifacts/browser-import-fixtures/browser-recording.webm');
+  const recordingPath = resolve('artifacts/timeout-notes-browser/browser-import-fixtures/browser-recording.webm');
   await writeFile(recordingPath, Buffer.from(nativeRecording.result.value.split(',')[1], 'base64'));
   const beforeDocuments = provider.calls.length;
   await evaluate(s, 'document.getElementById("tab-compose").click()');
@@ -389,9 +484,9 @@ try {
   await evaluate(checkpointTab, 'document.querySelector("[data-page=lesson]").click();document.querySelector("[data-action=demo]").click()'); await created(checkpointTab);
   const checkpointPrevious = await evaluate(checkpointTab, 'document.getElementById("lesson-frame").srcdoc');
   const checkpointGoal = 'CHECKPOINT_PRIVATE_INSTRUCTIONS retain original science examples';
-  await writeFile('artifacts/checkpoint-second.wav', wav);
+  await writeFile('artifacts/timeout-notes-browser/checkpoint-second.wav', wav);
   await evaluate(checkpointTab, `document.getElementById('tab-compose').click();document.getElementById('learning-goal').value=${JSON.stringify(checkpointGoal)};document.getElementById('learning-goal').dispatchEvent(new Event('input'));document.getElementById('include-audio').checked=true;document.getElementById('include-audio').dispatchEvent(new Event('input'));document.getElementById('level').value='Primary'`);
-  await upload(checkpointTab, '#material-input', ['artifacts/test-audio.wav', 'artifacts/test-screenshot.png', fixtures.documents[0], 'artifacts/test-notes.md', 'artifacts/checkpoint-second.wav']);
+  await upload(checkpointTab, '#material-input', ['artifacts/timeout-notes-browser/test-audio.wav', 'artifacts/timeout-notes-browser/test-screenshot.png', fixtures.documents[0], 'artifacts/timeout-notes-browser/test-notes.md', 'artifacts/timeout-notes-browser/checkpoint-second.wav']);
   await attachments(checkpointTab, 5);
   const checkpointAttachments = await evaluate(checkpointTab, '[...document.querySelectorAll("#material-list details")].map(n=>n.dataset.id)');
   const checkpointStart = provider.calls.length, checkpointRequests = browserRequests.length;
@@ -414,6 +509,9 @@ try {
     assert.deepEqual(Object.keys(report.checkpoint).sort(), ['completedCalls','completedParts','phase','preparationComplete','totalParts']);
     return report;
   };
+  const acceptedNote = 'NOTE_2473_BEGIN_' + 'n'.repeat(2443) + '_NOTE2473_END!';
+  assert.equal(acceptedNote.length, 2473);
+  provider.config.digestNotes = acceptedNote;
   provider.config.digestFaultAt = provider.calls.filter(c=>c.kind==='digest').length + 3;
   provider.config.digestFaultRepeat = true;
   await evaluate(checkpointTab, 'document.getElementById("lesson-form").requestSubmit()'); await consent(checkpointTab); await checkpointFailed();
@@ -434,17 +532,18 @@ try {
   assert.equal(malformedReport.lastOperation.appStatus, 502);
   assert.equal(malformedReport.lastOperation.category, 'preparation_validation');
   assert.equal(malformedReport.lastOperation.validationReason, 'digest_notes_limit');
-  assert.equal(malformedReport.lastOperation.notesCharacters, 2201);
+  assert.equal(malformedReport.lastOperation.notesCharacters, 8001);
+  assert.equal(malformedReport.lastOperation.timeoutMs, 300000);
   assert.equal(malformedReport.lastOperation.upstreamStatus, 200);
   assert.equal(malformedReport.lastOperation.maxOutputTokens, 2000);
   assert.equal(malformedReport.lastOperation.completionStatus, 'unknown', 'Legacy mock omits completion status, never invent success');
-  assert.ok(malformedReport.lastOperation.responseBytes > 2201);
+  assert.ok(malformedReport.lastOperation.responseBytes > 8001);
   assert.equal(malformedReport.lastOperation.responseBodyOmitted, true);
   assert.equal(malformedReport.lastOperation.automaticRetry, false);
   const assertLocalPreparation = operation => {
     assert.equal(operation.execution, 'local'); assert.equal(operation.role, 'local'); assert.equal(operation.apiMode, 'local');
     assert.equal(operation.status, 'Completed');
-    for (const key of ['provider', 'model', 'thinking']) assert.equal(Object.hasOwn(operation, key), false, 'Local preparation has no ' + key);
+    for (const key of ['provider', 'model', 'thinking', 'timeoutMs', 'timeoutPhase']) assert.equal(Object.hasOwn(operation, key), false, 'Local preparation has no ' + key);
   };
   const firstLocal = malformedReport.operations.filter(op=>op.execution==='local');
   assert.equal(firstLocal.length, 1); assert.equal(firstLocal[0].part.current, 1); assertLocalPreparation(firstLocal[0]);
@@ -457,17 +556,26 @@ try {
   const failedPartFetches = checkpointPartRequests().length;
   await evaluate(checkpointTab, 'document.getElementById("continue-generation").click()'); await checkpointDialog(false);
   assertCheckpointCounts(3); assert.equal(checkpointPartRequests().length, failedPartFetches);
+  // A timeout-only revision must retain every successful source operation and note.
+  const beforeWaitRevision = provider.calls.length;
+  await evaluate(checkpointTab, `document.querySelector('[data-page="providers"]').click();document.getElementById('role-primary-timeout').value='600';document.getElementById('role-primary-timeout').dispatchEvent(new Event('input'));document.getElementById('roles-form').requestSubmit()`);
+  await wait(checkpointTab, '!document.getElementById("roles-fields").disabled');
+  assert.equal(provider.calls.length, beforeWaitRevision);
+  await evaluate(checkpointTab, 'document.querySelector("[data-page=lesson]").click()');
   // Ordinary Create on an unchanged failed draft must continue, not silently start over.
   await evaluate(checkpointTab, 'document.getElementById("tab-compose").click();document.getElementById("lesson-form").requestSubmit()'); await checkpointDialog(); await checkpointFailed();
   assertCheckpointCounts(4);
   assert.deepEqual(checkpointCalls().filter(c=>c.kind==='digest').at(-1).body.input, firstDigests[2].body.input, 'Repeated failure retries exactly the failed PDF part');
   assert.equal(checkpointPartRequests().length, failedPartFetches, 'Failed digest retry does not reread local source parts');
   assert.match(await evaluate(checkpointTab, 'document.getElementById("generation-checkpoint-summary").textContent'), /^10 successful preparation call\(s\) retained · 3\/6 parts prepared\./);
-  await assertCheckpointPrivacy();
+  const timeoutRevisionReport = await assertCheckpointPrivacy();
+  assert.equal(timeoutRevisionReport.lastOperation.timeoutMs, 600000);
+  assert.equal(timeoutRevisionReport.checkpoint.completedCalls, 10);
+  assert.equal(timeoutRevisionReport.checkpoint.completedParts, 3);
   // Changed attachment identity/count blocks Continue before any provider access.
-  await writeFile('artifacts/checkpoint-added.md', 'Synthetic attachment identity change.');
+  await writeFile('artifacts/timeout-notes-browser/checkpoint-added.md', 'Synthetic attachment identity change.');
   await evaluate(checkpointTab, 'document.getElementById("error-back-draft").click()');
-  await upload(checkpointTab, '#material-input', ['artifacts/checkpoint-added.md']); await attachments(checkpointTab, 6);
+  await upload(checkpointTab, '#material-input', ['artifacts/timeout-notes-browser/checkpoint-added.md']); await attachments(checkpointTab, 6);
   assert.equal(await evaluate(checkpointTab, 'document.getElementById("continue-generation").disabled'), true);
   await evaluate(checkpointTab, 'document.getElementById("continue-generation").click();document.getElementById("lesson-form").requestSubmit()');
   await wait(checkpointTab, 'document.getElementById("confirm-dialog").open');
@@ -509,6 +617,9 @@ try {
   const resumedLocals = preparedReport.operations.filter(op=>op.execution==='local');
   assert.deepEqual(resumedLocals.map(op=>op.part.current), [5, 6]); resumedLocals.forEach(assertLocalPreparation);
   const rawCheckpointInput = checkpointCalls().find(c=>c.kind==='lesson').body.input[0].content[0].text;
+  assert.equal(rawCheckpointInput.split(acceptedNote).length - 1, 3, 'Three exact 2473-character notes survive repeated failure/resume without clipping');
+  assert.equal(preparedReport.lastOperation.timeoutMs, 600000);
+  provider.config.digestNotes = null;
   assert.ok(rawCheckpointInput.includes(sourceText + '\n' + longSentence), 'Entire original Markdown survives final teaching input');
   assert.equal(rawCheckpointInput.split('Gemini-native synthetic transcript about Newton’s laws.').length - 1, 2, 'Both raw Gemini transcripts survive without AI rewriting');
   const preparedPartFetches = checkpointPartRequests().length, preparedSources = checkpointCalls().filter(c=>c.kind!=='lesson').length;
@@ -522,7 +633,7 @@ try {
   assert.equal(await evaluate(checkpointTab, 'document.getElementById("generation-checkpoint").hidden && !document.getElementById("continue-audio").hidden'), true, 'Text retention releases source checkpoint and keeps the separate audio continuation');
   await assertCheckpointPrivacy();
   await shot(checkpointTab, 'app-generation-checkpoint-recovered.png');
-  passed('checkpoint: malformed HTTP200 later digest; exact stage/part counts; cancellation; repeated failure; unchanged Create continues; model/revision change reuses prior Gemini STT/OCR; saved instructions/options; final teaching-only retry without local rereads; metadata-only diagnostics');
+  passed('checkpoint: exact 2473-character notes retained without clipping; 8001 rejected; timeout-only revision preserves successes; digests 3→4→5, teaching 1→2, STT 2, 14 retained operations/6 parts; cancellation/repeated failure; model change; saved source payload; no local rereads or diagnostic leakage');
   // Clearing a session invalidates an unfinished checkpoint, never silently recreates it.
   const checkpointPrivateContext = extraContexts.at(-1);
   browserContextId = checkpointPrivateContext;
@@ -550,8 +661,8 @@ try {
   await wait(diagnosticTab, 'document.getElementById("setup-count")?.textContent === "3/3"');
   const diagnosticSource = 'DIAGNOSTIC_PRIVATE_LONG_SOURCE ' + 'Synthetic bounded digest evidence. '.repeat(90) + ' DIAGNOSTIC_PRIVATE_TAIL';
   assert.ok(diagnosticSource.length > 2200);
-  await writeFile('artifacts/diagnostic-long-source.md', diagnosticSource);
-  await upload(diagnosticTab, '#material-input', ['artifacts/diagnostic-long-source.md', 'artifacts/test-audio.wav']);
+  await writeFile('artifacts/timeout-notes-browser/diagnostic-long-source.md', diagnosticSource);
+  await upload(diagnosticTab, '#material-input', ['artifacts/timeout-notes-browser/diagnostic-long-source.md', 'artifacts/timeout-notes-browser/test-audio.wav']);
   await attachments(diagnosticTab, 2);
   for (const [kind, stage, part] of [['digest', 'source_preparation', 1], ['transcription', 'transcription', 2]]) {
     provider.config.failKind = kind;
@@ -589,7 +700,7 @@ try {
   assert.equal(tinyTranscript.length, 2110);
   provider.config.transcriptText = tinyTranscript;
   const beforeLocal = provider.calls.length;
-  await upload(localTab, '#material-input', ['artifacts/test-audio.wav', 'artifacts/test-notes.md']); await attachments(localTab, 2);
+  await upload(localTab, '#material-input', ['artifacts/timeout-notes-browser/test-audio.wav', 'artifacts/timeout-notes-browser/test-notes.md']); await attachments(localTab, 2);
   assert.equal(provider.calls.length, beforeLocal, 'Local imports never infer');
   await evaluate(localTab, 'document.getElementById("include-audio").checked=false;document.getElementById("include-audio").dispatchEvent(new Event("input"));document.getElementById("lesson-form").requestSubmit()');
   await wait(localTab, 'document.getElementById("confirm-dialog").open');
@@ -670,7 +781,7 @@ try {
     await consent(nativeTab);
   };
   await setNativeMode('auto', 'gemini-audio-fixture');
-  await upload(nativeTab, '#material-input', ['artifacts/test-audio.wav']); await attachments(nativeTab, 1);
+  await upload(nativeTab, '#material-input', ['artifacts/timeout-notes-browser/test-audio.wav']); await attachments(nativeTab, 1);
   await submitNative(); await created(nativeTab);
   await setNativeMode('gemini');
   await evaluate(nativeTab, 'document.getElementById("lesson-form").requestSubmit()');
@@ -732,7 +843,7 @@ try {
   await evaluate(full, 'document.querySelector("[data-action=demo]").click()'); await created(full);
   const priorFull = await evaluate(full, 'document.getElementById("lesson-frame").srcdoc');
   await evaluate(full, 'document.getElementById("tab-compose").click();document.getElementById("include-audio").checked=true;document.getElementById("include-audio").dispatchEvent(new Event("input"))');
-  await upload(full, '#material-input', ['artifacts/test-notes.md', 'artifacts/test-screenshot.png', 'artifacts/test-audio.wav']); await attachments(full, 3);
+  await upload(full, '#material-input', ['artifacts/timeout-notes-browser/test-notes.md', 'artifacts/timeout-notes-browser/test-screenshot.png', 'artifacts/timeout-notes-browser/test-audio.wav']); await attachments(full, 3);
   const beforeFull = provider.calls.length, beforeFullSpeech = kokoro.calls.filter(c=>c.kind==='speech').length;
   await evaluate(full, 'document.getElementById("lesson-form").requestSubmit()'); await consent(full); await exactConsent(full, false); await created(full);
   assert.equal(kokoro.calls.filter(c=>c.kind==='speech').length, beforeFullSpeech, 'Exact-count cancellation dispatches no TTS');
@@ -758,7 +869,7 @@ try {
   assert.match(await evaluate(full, 'document.getElementById("audio-count").textContent'), /^2\/\d+.*partial/);
   const partial = await evaluate(full, 'document.getElementById("lesson-frame").srcdoc');
   assert.match(partial, /data:audio\/mpeg;base64/); assert.match(partial, /Incomplete/);
-  await writeFile('artifacts/browser-partial-audio.html', partial);
+  await writeFile('artifacts/timeout-notes-browser/browser-partial-audio.html', partial);
   const diagnostics = await evaluate(full, 'document.getElementById("diagnostic-report").textContent');
   assert.doesNotMatch(diagnostics, /Original text|Screenshot final|Newton|test-notes|test-screenshot|test-audio|data:audio|Bearer|"(?:requestBody|responseBody|filename|sourceText)"/);
   assert.deepEqual(JSON.parse(diagnostics).lastOperation.input, { clips: 1 }, 'Diagnostic input is counts only, never provider request body');
@@ -792,7 +903,7 @@ try {
     const notice = await evaluate(full, 'document.getElementById("audio-message").textContent');
     const failure = 'Immediate Stop/Continue cannot reach exact-count consent or GET clip polling: ' + notice;
     lifecycleFailures.push(failure); testLog.push('FAIL: ' + failure);
-    await writeFile('artifacts/full-audio-stop-failure.json', JSON.stringify({ notice, requests: browserRequests.slice(stoppedRequests) }, null, 2));
+    await writeFile('artifacts/timeout-notes-browser/full-audio-stop-failure.json', JSON.stringify({ notice, requests: browserRequests.slice(stoppedRequests) }, null, 2));
     await shot(full, 'app-full-audio-stop-failure.png');
   } else {
     await exactConsent(full);
@@ -827,7 +938,7 @@ try {
     await wait(offline, '!!document.getElementById("course-player")');
     await verifyFullPlayer(offline);
     await shot(offline, 'native-offline-full-audio.png');
-    passed('real native full MP3 export decoded and played offline with controls');
+    passed('supplied full MP3 export decoded and played offline with controls (fixture playback, not a new synthesis/voice-quality claim)');
   } else passed('optional real-native full export not supplied; synthetic MP3 fixture is not native voice verification');
   if (process.env.LEARNLENS_NATIVE_LESSON) {
     const nativePath = resolve(process.env.LEARNLENS_NATIVE_LESSON);
@@ -849,22 +960,27 @@ try {
     await wait(offline, 'document.querySelector("audio").currentTime > 0.1');
     assert.deepEqual(await evaluate(offline, 'performance.getEntriesByType("resource").filter(r=>/^https?:/.test(r.name)).map(r=>r.name)'), []);
     await shot(offline, 'native-offline-lesson.png');
-    console.log('PASS: real native Kokoro WAV decoded and played offline; 1×/0.75×/0.5× rates survive reload; answers work; no HTTP(S) resources.');
+    passed('supplied WAV export decoded and played offline; 1×/0.75×/0.5× rates survive reload; answers work; no HTTP(S) resources (no new synthesis)');
   }
   passed('gated login/logout; direct offline HTML script escaping, actual audio playback, 1×/0.75×/0.5× rates and revealable answers with no HTTP(S) resources');
-  assert.deepEqual(errors.filter(error => !/Failed to load resource:.*502/.test(error)), [], 'Unexpected browser console/CSP errors');
+  if (longWaitRun) {
+    const outcome = await longWaitRun;
+    if (outcome.error) throw outcome.error;
+    await writeFile('artifacts/timeout-notes-browser/timeout-notes-long-wait.json', JSON.stringify(outcome.result, null, 2));
+  }
+  assert.deepEqual(errors.filter(error => !/Failed to load resource:.*502/.test(error) && !(longWaitRun && /Failed to load resource:.*504.*\/api\/lessons/.test(error))), [], 'Unexpected browser console/CSP errors');
   assert.deepEqual(lifecycleFailures, [], 'Full audio lifecycle failures (recorded while allowing offline/native checks to finish)');
   passed('1440/390/320px layouts; sandbox; discovery/roles/consented probe; unified imports; generation/failure recovery; actual download; OpenAI preset; consented model advisor + thinking controls; online/Kokoro speech routing; password gate; offline audio playback/speed/answers.');
 } catch (error) {
   testLog.push('FAIL: ' + error.message);
   throw error;
 } finally {
-  await writeFile(resolve('artifacts/browser-smoke.log'), testLog.join('\n') + '\n');
-  await writeFile(resolve('artifacts/full-audio-browser.log'), testLog.join('\n') + '\n');
-  await writeFile(resolve('artifacts/checkpoint-browser.log'), testLog.join('\n') + '\n');
-  await writeFile(resolve('artifacts/preparation-browser.log'), testLog.join('\n') + '\n');
+  await writeFile(resolve('artifacts/timeout-notes-browser/browser-smoke.log'), testLog.join('\n') + '\n');
+  await writeFile(resolve('artifacts/timeout-notes-browser/full-audio-browser.log'), testLog.join('\n') + '\n');
+  await writeFile(resolve('artifacts/timeout-notes-browser/checkpoint-browser.log'), testLog.join('\n') + '\n');
+  await writeFile(resolve('artifacts/timeout-notes-browser/preparation-browser.log'), testLog.join('\n') + '\n');
   for (const targetId of targets) await call('Target.closeTarget', { targetId }).catch(() => {});
   for (const context of [browserContextId, ...extraContexts].filter(Boolean)) await call('Target.disposeBrowserContext', { browserContextId: context });
   ws.close();
-  await Promise.all([app, provider.server, kokoro.server, gated].filter(Boolean).map(close));
+  await Promise.all([app, provider.server, kokoro.server, gated, ...longWaitProviders.map(p=>p.server)].filter(Boolean).map(close));
 }

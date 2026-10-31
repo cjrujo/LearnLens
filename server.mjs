@@ -3,7 +3,7 @@ import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
-import { AppError, boundedString, normalizeBaseUrl, publicProvider, discoverModels, generateText, generateSpeech, generateSpeechBytes, transcribeAudio, geminiAudioTarget, decodeDataUrl, probeImage } from './lib/provider.mjs';
+import { AppError, boundedString, normalizeBaseUrl, publicProvider, discoverModels, generateText, generateSpeech, generateSpeechBytes, transcribeAudio, geminiAudioTarget, decodeDataUrl, probeImage, primaryTimeoutSeconds } from './lib/provider.mjs';
 import { validateLessonInput, lessonPrompt, parseLesson, demoLesson } from './lib/lesson.mjs';
 import { renderLesson, renderScriptHash, fullAudioRenderScriptHash } from './lib/render.mjs';
 import { createAudioPlanStore } from './lib/audio-plans.mjs';
@@ -20,7 +20,7 @@ const SESSION_IDLE_MS = 60 * 60 * 1000;
 const SESSION_MAX_MS = 12 * 60 * 60 * 1000;
 const emptyRoles = () => ({ primary: null, transcription: null, speech: null });
 const equal = (a, b) => typeof a === 'string' && typeof b === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
-const check = (status, detail, role) => ({ status, detail, checkedAt: new Date().toISOString(), ...(role ? { api: role.api, ...(role.reasoningEffort ? { reasoningEffort: role.reasoningEffort } : {}), ...(role.voice ? { voice: role.voice } : {}) } : {}) });
+const check = (status, detail, role) => ({ status, detail, checkedAt: new Date().toISOString(), ...(role ? { api: role.api, ...(role.reasoningEffort ? { reasoningEffort: role.reasoningEffort } : {}), ...(role.timeoutSeconds !== undefined ? { timeoutSeconds: role.timeoutSeconds } : {}), ...(role.voice ? { voice: role.voice } : {}) } : {}) });
 
 function json(response, status, data) {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -55,6 +55,7 @@ async function bodyJson(request) {
 function roleFor(session, value, name) {
   if (value === null) return null;
   if (!value || typeof value !== 'object') throw new AppError(`Invalid ${name} role.`);
+  if (value.timeoutSeconds !== undefined && name !== 'primary') throw new AppError('Request timeout applies only to the primary lesson model.');
   if (value.engine === 'kokoro') {
     if (name !== 'speech' || !session.kokoro) throw new AppError('Kokoro is only available for speech when configured by the server operator.');
     const voice = boundedString(value.voice || session.kokoro.voice, 'Voice ID', 200);
@@ -76,6 +77,7 @@ function roleFor(session, value, name) {
     const effort = reasoningEffort(value.reasoningEffort);
     if (effort !== 'default') role.reasoningEffort = effort;
   }
+  if (value.timeoutSeconds !== undefined) role.timeoutSeconds = primaryTimeoutSeconds(value.timeoutSeconds);
   if (name === 'speech') role.voice = boundedString(value.voice || 'alloy', 'Voice ID', 200);
   return role;
 }
@@ -276,7 +278,7 @@ export function createApp(options = {}) {
               }
             } catch (error) { result = check('failed', error instanceof AppError ? error.message : 'Capability test failed.'); }
             ensureCurrent();
-            result = { ...result, api: role.api, ...(role.reasoningEffort ? { reasoningEffort: role.reasoningEffort } : {}), ...(role.voice ? { voice: role.voice } : {}) };
+            result = { ...result, api: role.api, ...(role.reasoningEffort ? { reasoningEffort: role.reasoningEffort } : {}), ...(role.timeoutSeconds !== undefined ? { timeoutSeconds: role.timeoutSeconds } : {}), ...(role.voice ? { voice: role.voice } : {}) };
             provider.checks[role.model] ||= Object.create(null); provider.checks[role.model][body.kind] = result;
             json(response, 200, { check: result });
           }); return;
@@ -342,7 +344,8 @@ export function createApp(options = {}) {
         context('source_recognition', provider, primary);
         await runJob(session, async () => {
           ensureCurrent(); if (session.setupRevision !== snapshot) throw new AppError('AI setup changed before source recognition.', 409);
-          const output = await generateText(provider, { ...primary, maxTokens: 12000 }, prompt);
+          // Make the existing effective output budget explicit; a longer wait does not raise it.
+          const output = await generateText(provider, primary, { ...prompt, maxTokens: 10000 });
           ensureCurrent(); json(response, 200, parseAudioExtraction(output.text));
         }); return;
       }
@@ -472,7 +475,7 @@ export function createApp(options = {}) {
           ensureCurrent();
           const lesson = parseLesson(output.text);
           const warnings = [...input.sourceWarnings, ...lesson.warnings];
-          if (input.images.length && (provider.checks[primary.model]?.vision?.status !== 'verified' || provider.checks[primary.model]?.vision?.api !== primary.api || (provider.checks[primary.model]?.vision?.reasoningEffort || 'default') !== (primary.reasoningEffort || 'default'))) warnings.push('Image understanding was not capability-tested. Check that the lesson accurately reflects your screenshots.');
+          if (input.images.length && (provider.checks[primary.model]?.vision?.status !== 'verified' || provider.checks[primary.model]?.vision?.api !== primary.api || (provider.checks[primary.model]?.vision?.reasoningEffort || 'default') !== (primary.reasoningEffort || 'default') || (provider.checks[primary.model]?.vision?.timeoutSeconds ?? 300) !== (primary.timeoutSeconds ?? 300))) warnings.push('Image understanding was not capability-tested. Check that the lesson accurately reflects your screenshots.');
           provider.checks[primary.model] ||= Object.create(null); provider.checks[primary.model].text = check('verified', `Generated a structurally valid lesson using ${output.api}. Factual accuracy still needs review.`, primary);
           const audio = []; let audioBytes = 0;
           if (input.includeAudio) {

@@ -96,6 +96,8 @@ function assertTransport(diagnostics, api, payload, type = 'application/json') {
   assert.ok(Number.isSafeInteger(diagnostics.elapsedMs) && diagnostics.elapsedMs >= 0);
   assert.equal(diagnostics.automaticRetry, false);
   assert.equal(diagnostics.responseBodyOmitted, true);
+  assert.equal(diagnostics.timeoutMs, 300000);
+  assert.equal(diagnostics.timeoutPhase, undefined);
   assert.ok(!JSON.stringify(diagnostics).includes(SECRET));
 }
 function textEnvelope(api, output, usage) {
@@ -112,7 +114,7 @@ function tokenUsage(api, output, reasoning) {
 test('both text endpoints preserve exact text, safe successful metadata and unchanged request budgets/thinking', async t => {
   for (const api of ['responses', 'chat']) {
     const text = `  ${SECRET}\n中文\r\n🙂  `;
-    const payload = JSON.stringify({ ...textEnvelope(api, text, tokenUsage(api, 123, 45)), model: SECRET, max_output_tokens: SECRET, [SECRET]: SECRET });
+    const payload = JSON.stringify({ ...textEnvelope(api, text, tokenUsage(api, 123, 45)), model: SECRET, max_output_tokens: SECRET, timeoutMs: SECRET, timeoutPhase: SECRET, [SECRET]: SECRET });
     const { provider, calls } = await upstream(t, payload);
     const result = await generateText(provider, { model: 'test', api, reasoningEffort: 'high' }, { ...prompt, maxTokens: 6000 });
     assert.equal(result.text, text); assert.equal(result.api, api);
@@ -122,7 +124,7 @@ test('both text endpoints preserve exact text, safe successful metadata and unch
     assert.equal(result.diagnostics.outputCharacters, text.length);
     assert.equal(result.diagnostics.outputTokens, 123);
     assert.equal(result.diagnostics.reasoningTokens, 45);
-    assert.deepEqual(Object.keys(result.diagnostics).sort(), ['version', 'endpoint', 'automaticRetry', 'responseBodyOmitted', 'upstreamStatus', 'contentType', 'providerRequestId', 'responseBytes', 'elapsedMs', 'maxOutputTokens', 'completionStatus', 'outputCharacters', 'outputTokens', 'reasoningTokens'].sort());
+    assert.deepEqual(Object.keys(result.diagnostics).sort(), ['version', 'endpoint', 'automaticRetry', 'responseBodyOmitted', 'timeoutMs', 'upstreamStatus', 'contentType', 'providerRequestId', 'responseBytes', 'elapsedMs', 'maxOutputTokens', 'completionStatus', 'outputCharacters', 'outputTokens', 'reasoningTokens'].sort());
     assert.equal(calls.length, 1); assert.equal(calls[0].body.stream, false);
     assert.equal(calls[0].body[api === 'responses' ? 'max_output_tokens' : 'max_completion_tokens'], 6000);
     assert.equal(api === 'responses' ? calls[0].body.reasoning.effort : calls[0].body.reasoning_effort, 'high');
