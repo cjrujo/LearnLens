@@ -78,6 +78,20 @@ Main-agent Windows rerun passed the full staged browser suite with real MP3/MP4/
 
 After activating the coherent public UI, the main agent reran the complete browser suite plus actual native Kokoro export playback: PASS. Native cache-only full lesson smoke again produced a 248,444-byte WAV. Live `/health` returned 200; disposable Chromium reported no runtime exceptions and an enabled composer. Local evidence: `artifacts/import-browser-live-release.log`, `artifacts/import-final-media.log`, `artifacts/native-import-release.log`. No cloud-provider teaching or actual user gateway was exercised.
 
+## Preparation continuation and validation
+
+Current preparation-fix verification (Windows / Node 22.23.1):
+
+- **260 passed, 0 failed, 2 opt-in skips** in the regular suite (262 total); syntax checks passed for **59 files**.
+- A synthetic 2,110-character transcript reproduced the old invalid-notes/502 failure before the fix. Afterward it is retained verbatim with **zero provider inference requests**. Tests cover exact text/Unicode, the 2,200-character boundary, and continued model processing for longer text or any images.
+- Consent, CSRF and stale-revision rejection remain enforced. A local success survives a later failed model step, ordinary-cache eviction and explicit checkpoint continuation; original full-audio source text remains complete. The existing checkpoint regression suite still passes.
+- Notes errors have deterministic metadata-only reasons for JSON/type/empty/length/count/control failures. Upstream HTTP success metadata survives subsequent local validation failure. Tests exclude source, filenames, response prose and credentials from reports and assert one request only on malformed HTTP200.
+- Responses/Chat JSON and completed-SSE tests preserve exact output text, known bounded usage counts and legacy missing/null completion metadata. Explicit noncompleted/refusal/tool outputs fail without replay; Auto fallback remains restricted to HTTP404/405/501. Token budgets and configured thinking remain unchanged.
+- Full disposable-Chromium9333 retest passed: a 2,110-character transcript and short Markdown produce zero provider digests and reach final teaching verbatim; local diagnostics omit provider/model/thinking; malformed notes report `digest_notes_limit`, 2,201 characters, upstream200 and the unchanged2,000-token budget. Later-step failures/resume preserve exact call counts (digests3→4→5, final teaching1→2), all14 successful preparation operations and6 source parts. All earlier import, consent, privacy, offline native MP3/WAV, player, answer and responsive checks still pass.
+- Evidence: `artifacts/preparation-short-text-before.log`, `preparation-suite.log`, `preparation-syntax.log`, `preparation-browser.log`, `preparation-browser-run.log`, `app-preparation-validation.png`, `preparation-response-work.md`.
+
+These synthetic checks do not recover the user's historical model response or establish its exact rejected field. They do not certify real provider compliance, recognition accuracy or teaching quality. Publication is separate from activation; no live session is restarted by these tests. Full-audio/native results below describe their earlier verified releases, not a new native synthesis run for this fix.
+
 ## Complete source + lesson audio
 
 Full-audio working-tree verification on Windows / Node 22.23.1:

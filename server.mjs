@@ -11,7 +11,7 @@ import { prepareAudioEncoder } from './lib/audio-encode.mjs';
 import { audioExtractionPrompt, parseAudioExtraction } from './lib/audio-extract.mjs';
 import { documentName, documentBody, importDocument } from './lib/document-import.mjs';
 import { createMaterialStore, UPLOAD_CHUNK_BYTES } from './lib/material-store.mjs';
-import { digestInput, digestPrompt, parseDigest } from './lib/material-digest.mjs';
+import { digestInput, digestPrompt, parseDigest, localDigest } from './lib/material-digest.mjs';
 import { reasoningEffort, starterPrimary, recommendationCatalog, recommendationPrompt, parseRecommendations } from './lib/setup.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
@@ -392,8 +392,17 @@ export function createApp(options = {}) {
         if (!primary) throw new AppError('Assign a primary model before preparing material notes.');
         context('source_preparation', session.providers.get(primary.providerId), primary);
         await runJob(session, async () => {
+          const retained = localDigest(input);
+          if (retained) { ensureCurrent(); json(response, 200, retained); return; }
           const result = await generateText(session.providers.get(primary.providerId), primary, { ...digestPrompt(input), maxTokens: 2000 });
-          ensureCurrent(); json(response, 200, parseDigest(result.text));
+          ensureCurrent();
+          let prepared;
+          try { prepared = parseDigest(result.text); }
+          catch (error) {
+            if (error instanceof AppError) error.diagnostics = { ...result.diagnostics, ...error.diagnostics };
+            throw error;
+          }
+          json(response, 200, { ...prepared, preparationMode: 'model' });
         }); return;
       }
       const materialPath = /^\/api\/materials\/([a-f0-9-]{36})(?:\/(content|finish|parts))?$/.exec(path);

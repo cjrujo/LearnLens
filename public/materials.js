@@ -317,8 +317,8 @@ export class MaterialWorkspace {
     const completePart = () => { job.completedParts.add(processed); this.checkpointProgress(job); };
     const warn = value => { const text = String(value).slice(0, 500); if (!warnings.includes(text) && warnings.length < 29) warnings.push(text); };
     const digest = async function* (text, images, source, stable) {
-      digested = true;
       const result = yield { path: '/materials/summarize', body: { text, images, goal, source: source.slice(0, 200) }, stable, role: 'primary', stage: stable === 'merge' ? 'merge' : 'digest' };
+      if (result.preparationMode !== 'verbatim') digested = true;
       for (const warning of result.warnings || []) warn(source + ': ' + warning);
       return `[Source: ${source.slice(0, 200)}]\n${result.text}`;
     };

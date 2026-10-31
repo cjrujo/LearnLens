@@ -66,7 +66,7 @@ test('API distinguishes transcription, source preparation and final lesson failu
   await setRoles(client, { ...EMPTY_ROLES, primary: role, transcription: role });
   for (const [route, body, stage, endpoint] of [
     ['/api/transcribe', { consent: true, dataUrl: `data:audio/wav;base64,${WAV.toString('base64')}` }, 'transcription', '/audio/transcriptions'],
-    ['/api/materials/summarize', { consent: true, text: SOURCE, images: [] }, 'source_preparation', '/chat/completions'],
+    ['/api/materials/summarize', { consent: true, text: SOURCE.repeat(100), images: [] }, 'source_preparation', '/chat/completions'],
     ['/api/lessons', lessonInput({ text: SOURCE }), 'lesson_generation', '/chat/completions'],
   ]) {
     const result = await client.request(route, { method: 'POST', json: body });

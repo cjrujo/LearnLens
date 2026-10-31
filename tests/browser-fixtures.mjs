@@ -100,7 +100,7 @@ export function createQAProvider() {
       } else text = input.instructions.includes('LearnLens') ? JSON.stringify(lesson) : prompt.includes('dominant color') ? 'green' : 'READY';
       res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text }] }] }));
     } else if (req.url === '/v1/audio/speech') { res.setHeader('Content-Type', 'audio/wav'); res.end(wav); }
-    else if (req.url === '/v1/audio/transcriptions') res.end(JSON.stringify({ text: transcriptText }));
+    else if (req.url === '/v1/audio/transcriptions') res.end(JSON.stringify({ text: config.transcriptText ?? transcriptText }));
     else if (/^\/v1beta\/models\/[^/]+:generateContent$/.test(req.url)) res.end(JSON.stringify({ candidates: [{ finishReason: 'STOP', content: { role: 'model', parts: [{ text: 'Excluded fixture thinking', thought: true }, { text: 'Gemini-native synthetic transcript about Newton’s laws.' }] } }] }));
     else { res.statusCode = 404; res.end('{}'); }
   });

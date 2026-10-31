@@ -208,7 +208,12 @@ try {
   assert.ok(browserRequests.some(r=>r.path==='/api/audio/preflight' && r.method==='POST'));
   assert.ok(browserRequests.filter(r=>r.path==='/api/lessons' && r.method==='POST').every(r=>r.includeAudio === false), 'Teaching endpoint receives includeAudio:false');
   assert.ok(provider.calls.slice(beforeUpload).some(c=>c.kind==='transcription'), 'Attached WAV transcribed only after creation consent');
-  assert.ok(provider.calls.slice(beforeUpload).filter(c=>c.kind==='digest').length >= 3, 'Every material enters paid digest preparation');
+  assert.equal(provider.calls.slice(beforeUpload).filter(c=>c.kind==='digest').length, 1, 'Only the image needs paid digest preparation');
+  const initialReport = await evaluate(s, 'JSON.parse(document.getElementById("diagnostic-report").textContent)');
+  assert.equal(initialReport.operations.filter(op=>op.appEndpoint==='/materials/summarize' && op.status==='Completed').length, 3, 'All three materials complete preparation');
+  assert.deepEqual(initialReport.operations.filter(op=>op.execution==='local').map(op=>op.part.current), [2, 3], 'Markdown and WAV transcript are prepared locally');
+  const initialTeachingText = provider.calls.findLast(c=>c.kind==='lesson').body.input[0].content[0].text;
+  assert.ok(initialTeachingText.includes(sourceText + '\n' + longSentence)); assert.ok(initialTeachingText.includes(transcriptText));
   assert.ok(provider.calls.slice(beforeUpload).filter(c=>['lesson','digest'].includes(c.kind)).every(c=>c.body.model==='test/vision'), 'Primary role handles sources and final lesson');
   assert.equal(await evaluate(s, 'document.getElementById("learning-goal").value'), 'Explain this screenshot with examples.', 'Transcription never overwrites instructions');
   passed('unified image/Markdown/WAV input; no upload/local-preparation calls; cancelled consent sends nothing; role-routed paid creation');
@@ -351,9 +356,12 @@ try {
   const documentCalls = provider.calls.slice(beforeDocuments), digestText = JSON.stringify(documentCalls.filter(c=>c.kind==='digest').map(c=>c.body.input));
   for (let page=1;page<=5;page++) assert.ok(digestText.includes('PDF page ' + page + ' evidence'), 'Automatic digest includes PDF page ' + page);
   assert.ok(digestText.includes('DOCX_BEGIN') && digestText.includes('DOCX_END'), 'Both ends of long Office source reached digests');
-  for (let slide=1;slide<=6;slide++) assert.ok(digestText.includes('Ordered slide ' + slide), 'Digest includes slide ' + slide);
+  const documentTeachingText = documentCalls.findLast(c=>c.kind==='lesson').body.input[0].content[0].text;
+  for (let slide=1;slide<=6;slide++) assert.ok(documentTeachingText.includes('Ordered slide ' + slide), 'Verbatim final input includes slide ' + slide);
+  assert.ok(!documentCalls.some(c=>c.kind==='digest' && JSON.stringify(c.body.input).includes('six-slides.pptx')), 'Short PPTX stays local, without a lossy digest');
   for (const card of cards.slice(3)) for (let part=1;part<=card.parts;part++) {
-    assert.ok(documentCalls.some(c=>c.kind==='digest' && JSON.stringify(c.body.input).includes(card.name) && JSON.stringify(c.body.input).includes('(' + part + '/' + card.parts + ')')), 'Every automatic part reaches primary: ' + card.name + ' part ' + part);
+    const expectedKind = ['six-slides.pptx', 'browser-recording.webm'].includes(card.name) ? 'lesson' : 'digest';
+    assert.ok(documentCalls.some(c=>c.kind===expectedKind && JSON.stringify(c.body.input).includes(card.name) && JSON.stringify(c.body.input).includes('(' + part + '/' + card.parts + ')')), 'Every automatic part reaches primary via raw final input or digest: ' + card.name + ' part ' + part);
   }
   assert.equal(documentCalls.filter(c=>c.kind==='transcription').length, cards.find(c=>c.name==='browser-recording.webm').parts, 'Browser recording transcribed after consent');
   const completedPaid = provider.calls.filter(c=>['digest','transcription'].includes(c.kind)).length;
@@ -363,7 +371,9 @@ try {
   assert.equal(provider.calls.filter(c=>['digest','transcription'].includes(c.kind)).length, completedPaid, 'Explicit retry reuses every finished digest/transcription');
   const finalInput = JSON.stringify(provider.calls.findLast(c=>c.kind==='lesson').body.input);
   for (const card of cards) for (let part=1;part<=card.parts;part++) assert.ok(finalInput.includes(card.name) && finalInput.includes('(' + part + '/' + card.parts + ')'), 'Final lesson includes prepared source ' + card.name + ' part ' + part);
-  passed('all document pages/Office chunks reach primary digests and final lesson; final failure retains attachments/previous lesson; retry does not repeat finished paid preparation');
+  assert.ok(provider.calls.findLast(c=>c.kind==='lesson').body.input[0].content[0].text.includes(transcriptText), 'Full recording transcript including its tail survives local preparation');
+  assert.ok(digestText.includes('Footnote evidence'), 'DOCX footnote tail is not omitted');
+  passed('all document pages/Office chunks reach primary digests or raw final input with tails intact; final failure retains attachments/previous lesson; retry does not repeat finished paid preparation');
   // A private context isolates checkpoint accounting from successful-lesson caches/history.
   const checkpointOriginalContext = browserContextId;
   ({ browserContextId } = await call('Target.createBrowserContext')); extraContexts.push(browserContextId);
@@ -404,24 +414,41 @@ try {
     assert.deepEqual(Object.keys(report.checkpoint).sort(), ['completedCalls','completedParts','phase','preparationComplete','totalParts']);
     return report;
   };
-  provider.config.digestFaultAt = provider.calls.filter(c=>c.kind==='digest').length + 4;
+  provider.config.digestFaultAt = provider.calls.filter(c=>c.kind==='digest').length + 3;
   provider.config.digestFaultRepeat = true;
   await evaluate(checkpointTab, 'document.getElementById("lesson-form").requestSubmit()'); await consent(checkpointTab); await checkpointFailed();
-  assertCheckpointCounts(4);
-  assert.deepEqual(checkpointCalls().map(c=>c.kind), ['transcription','digest','audio-extract','digest','audio-extract','audio-extract','audio-extract','digest','audio-extract','audio-extract','digest']);
+  assertCheckpointCounts(3);
+  assert.deepEqual(checkpointCalls().map(c=>c.kind), ['transcription','audio-extract','digest','audio-extract','audio-extract','audio-extract','digest','audio-extract','audio-extract','digest']);
   assert.equal(checkpointCalls()[0].path, '/v1beta/models/gemini-checkpoint-fixture:generateContent');
   const firstDigests = checkpointCalls().filter(c=>c.kind==='digest');
-  for (const [index, name, part] of [[0,'test-audio.wav','(1/1)'],[1,'test-screenshot.png','(1/1)'],[2,'five-pages.pdf','(1/2)'],[3,'five-pages.pdf','(2/2)']]) {
+  for (const [index, name, part] of [[0,'test-screenshot.png','(1/1)'],[1,'five-pages.pdf','(1/2)'],[2,'five-pages.pdf','(2/2)']]) {
     assert.ok(JSON.stringify(firstDigests[index].body.input).includes(name));
     assert.ok(JSON.stringify(firstDigests[index].body.input).includes(part));
   }
-  assert.equal(firstDigests[3].malformed, true, 'HTTP 200 invalid notes are not a successful checkpoint');
+  assert.equal(firstDigests[2].malformed, true, 'HTTP 200 invalid notes are not a successful checkpoint');
   assert.match(await evaluate(checkpointTab, 'document.getElementById("generation-checkpoint-summary").textContent'), /^10 successful preparation call\(s\) retained · 3\/6 parts prepared\./);
   assert.equal(await evaluate(checkpointTab, 'document.getElementById("retry-preview").textContent'), 'Continue generation');
   assert.equal(await evaluate(checkpointTab, 'document.getElementById("learning-goal").value'), checkpointGoal);
   assert.deepEqual(await evaluate(checkpointTab, '[...document.querySelectorAll("#material-list details")].map(n=>n.dataset.id)'), checkpointAttachments);
   const malformedReport = await assertCheckpointPrivacy();
   assert.equal(malformedReport.lastOperation.appStatus, 502);
+  assert.equal(malformedReport.lastOperation.category, 'preparation_validation');
+  assert.equal(malformedReport.lastOperation.validationReason, 'digest_notes_limit');
+  assert.equal(malformedReport.lastOperation.notesCharacters, 2201);
+  assert.equal(malformedReport.lastOperation.upstreamStatus, 200);
+  assert.equal(malformedReport.lastOperation.maxOutputTokens, 2000);
+  assert.equal(malformedReport.lastOperation.completionStatus, 'unknown', 'Legacy mock omits completion status, never invent success');
+  assert.ok(malformedReport.lastOperation.responseBytes > 2201);
+  assert.equal(malformedReport.lastOperation.responseBodyOmitted, true);
+  assert.equal(malformedReport.lastOperation.automaticRetry, false);
+  const assertLocalPreparation = operation => {
+    assert.equal(operation.execution, 'local'); assert.equal(operation.role, 'local'); assert.equal(operation.apiMode, 'local');
+    assert.equal(operation.status, 'Completed');
+    for (const key of ['provider', 'model', 'thinking']) assert.equal(Object.hasOwn(operation, key), false, 'Local preparation has no ' + key);
+  };
+  const firstLocal = malformedReport.operations.filter(op=>op.execution==='local');
+  assert.equal(firstLocal.length, 1); assert.equal(firstLocal[0].part.current, 1); assertLocalPreparation(firstLocal[0]);
+  await shot(checkpointTab, 'app-preparation-validation.png');
   assert.equal(malformedReport.checkpoint.completedCalls, 10);
   assert.equal(malformedReport.checkpoint.completedParts, 3);
   await evaluate(checkpointTab, 'document.getElementById("show-previous").click()');
@@ -429,11 +456,11 @@ try {
   assert.equal(await evaluate(checkpointTab, 'document.getElementById("preview-error").hidden && !document.getElementById("generation-checkpoint").hidden && document.getElementById("continue-generation").getClientRects().length > 0'), true, 'Continuation is visible while the error panel is hidden');
   const failedPartFetches = checkpointPartRequests().length;
   await evaluate(checkpointTab, 'document.getElementById("continue-generation").click()'); await checkpointDialog(false);
-  assertCheckpointCounts(4); assert.equal(checkpointPartRequests().length, failedPartFetches);
+  assertCheckpointCounts(3); assert.equal(checkpointPartRequests().length, failedPartFetches);
   // Ordinary Create on an unchanged failed draft must continue, not silently start over.
   await evaluate(checkpointTab, 'document.getElementById("tab-compose").click();document.getElementById("lesson-form").requestSubmit()'); await checkpointDialog(); await checkpointFailed();
-  assertCheckpointCounts(5);
-  assert.deepEqual(checkpointCalls().filter(c=>c.kind==='digest').at(-1).body.input, firstDigests[3].body.input, 'Repeated failure retries exactly the failed PDF part');
+  assertCheckpointCounts(4);
+  assert.deepEqual(checkpointCalls().filter(c=>c.kind==='digest').at(-1).body.input, firstDigests[2].body.input, 'Repeated failure retries exactly the failed PDF part');
   assert.equal(checkpointPartRequests().length, failedPartFetches, 'Failed digest retry does not reread local source parts');
   assert.match(await evaluate(checkpointTab, 'document.getElementById("generation-checkpoint-summary").textContent'), /^10 successful preparation call\(s\) retained · 3\/6 parts prepared\./);
   await assertCheckpointPrivacy();
@@ -446,7 +473,7 @@ try {
   await wait(checkpointTab, 'document.getElementById("confirm-dialog").open');
   assert.equal(await evaluate(checkpointTab, 'document.getElementById("confirm-title").textContent'), 'Start a new lesson instead of continuing?');
   assert.equal(await evaluate(checkpointTab, 'document.getElementById("confirm-accept").textContent'), 'Replace checkpoint & create');
-  assertCheckpointCounts(5);
+  assertCheckpointCounts(4);
   await evaluate(checkpointTab, 'document.getElementById("confirm-cancel").click()');
   await wait(checkpointTab, '!document.getElementById("generate-button").disabled');
   await evaluate(checkpointTab, 'document.querySelector("#material-list > li:last-child button").click()'); await attachments(checkpointTab, 5);
@@ -456,7 +483,7 @@ try {
   await checkpointDialog(); await wait(checkpointTab, 'window.__checkpointPaused');
   await evaluate(checkpointTab, 'document.getElementById("stop-processing").click()'); await checkpointFailed();
   await evaluate(checkpointTab, 'window.fetch=window.__checkpointFetch;delete window.__checkpointFetch');
-  assertCheckpointCounts(5); assert.equal(checkpointPartRequests().length, failedPartFetches);
+  assertCheckpointCounts(4); assert.equal(checkpointPartRequests().length, failedPartFetches);
   assert.match(await evaluate(checkpointTab, 'document.getElementById("generation-checkpoint-summary").textContent'), /^10 successful preparation call\(s\) retained · 3\/6 parts prepared\./);
   // A new setup revision/model is adopted only by unfinished steps after renewed consent.
   const beforeCheckpointSettings = provider.calls.length;
@@ -464,25 +491,31 @@ try {
   await wait(checkpointTab, 'document.getElementById("roles-message").textContent.startsWith("Model roles saved") && !document.getElementById("roles-fields").disabled');
   assert.equal(provider.calls.length, beforeCheckpointSettings);
   await evaluate(checkpointTab, 'document.querySelector("[data-page=lesson]").click();document.getElementById("tab-compose").click();document.getElementById("learning-goal").value="EDITED_PRIVATE_NOT_FOR_RESUME";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("include-audio").checked=false;document.getElementById("include-audio").dispatchEvent(new Event("input"));document.getElementById("level").value="College/University";document.getElementById("tab-preview").click();document.getElementById("retry-preview").click()');
-  await checkpointDialog(false); assertCheckpointCounts(5);
+  await checkpointDialog(false); assertCheckpointCounts(4);
   provider.config.digestFaultAt = null; provider.config.digestFaultRepeat = false; provider.config.failKind = 'lesson';
   await evaluate(checkpointTab, 'document.getElementById("retry-preview").click()'); await checkpointDialog(); await checkpointFailed();
-  assertCheckpointCounts(8, 1, 2);
-  const resumedDigests = checkpointCalls().filter(c=>c.kind==='digest').slice(5);
-  assert.deepEqual(resumedDigests.map(c=>c.body.model), ['gpt-5.4-mini','gpt-5.4-mini','gpt-5.4-mini']);
-  for (const [index, name] of [[0,'five-pages.pdf'],[1,'test-notes.md'],[2,'checkpoint-second.wav']]) assert.ok(JSON.stringify(resumedDigests[index].body.input).includes(name));
-  assert.deepEqual(resumedDigests[0].body.input, firstDigests[3].body.input);
+  assertCheckpointCounts(5, 1, 2);
+  const resumedDigests = checkpointCalls().filter(c=>c.kind==='digest').slice(4);
+  assert.deepEqual(resumedDigests.map(c=>c.body.model), ['gpt-5.4-mini']);
+  assert.ok(JSON.stringify(resumedDigests[0].body.input).includes('five-pages.pdf'));
+  assert.deepEqual(resumedDigests[0].body.input, firstDigests[2].body.input);
   assert.ok(resumedDigests.every(c=>JSON.stringify(c.body.input).includes(checkpointGoal) && !JSON.stringify(c.body.input).includes('EDITED_PRIVATE')));
   assert.ok(firstDigests.every(c=>c.body.model==='test/vision'));
   const failedLessonInput = JSON.stringify(checkpointCalls().find(c=>c.kind==='lesson').body.input);
   assert.ok(failedLessonInput.includes(checkpointGoal)); assert.ok(failedLessonInput.includes('Primary')); assert.ok(!failedLessonInput.includes('EDITED_PRIVATE'));
   assert.match(await evaluate(checkpointTab, 'document.getElementById("generation-checkpoint-summary").textContent'), /^14 successful preparation call\(s\) retained · 6\/6 parts prepared\. Source preparation is complete/);
-  assert.equal((await assertCheckpointPrivacy()).checkpoint.preparationComplete, true);
+  const preparedReport = await assertCheckpointPrivacy();
+  assert.equal(preparedReport.checkpoint.preparationComplete, true);
+  const resumedLocals = preparedReport.operations.filter(op=>op.execution==='local');
+  assert.deepEqual(resumedLocals.map(op=>op.part.current), [5, 6]); resumedLocals.forEach(assertLocalPreparation);
+  const rawCheckpointInput = checkpointCalls().find(c=>c.kind==='lesson').body.input[0].content[0].text;
+  assert.ok(rawCheckpointInput.includes(sourceText + '\n' + longSentence), 'Entire original Markdown survives final teaching input');
+  assert.equal(rawCheckpointInput.split('Gemini-native synthetic transcript about Newton’s laws.').length - 1, 2, 'Both raw Gemini transcripts survive without AI rewriting');
   const preparedPartFetches = checkpointPartRequests().length, preparedSources = checkpointCalls().filter(c=>c.kind!=='lesson').length;
   provider.config.failKind = null;
   await evaluate(checkpointTab, 'document.getElementById("retry-preview").click()'); await checkpointDialog();
   await exactConsent(checkpointTab, false); await created(checkpointTab);
-  assertCheckpointCounts(8, 2, 2);
+  assertCheckpointCounts(5, 2, 2);
   assert.equal(checkpointCalls().filter(c=>c.kind!=='lesson').length, preparedSources);
   assert.equal(checkpointPartRequests().length, preparedPartFetches, 'Complete preparation snapshot retries only final teaching, never local source part reads');
   assert.deepEqual(checkpointCalls().filter(c=>c.kind==='lesson').map(c=>c.body.input), Array(2).fill(checkpointCalls().find(c=>c.kind==='lesson').body.input));
@@ -515,7 +548,10 @@ try {
   // A separate draft exercises digest/STT failures without disturbing prior cached work.
   const diagnosticTab = await tab(origin);
   await wait(diagnosticTab, 'document.getElementById("setup-count")?.textContent === "3/3"');
-  await upload(diagnosticTab, '#material-input', ['artifacts/test-notes.md', 'artifacts/test-audio.wav']);
+  const diagnosticSource = 'DIAGNOSTIC_PRIVATE_LONG_SOURCE ' + 'Synthetic bounded digest evidence. '.repeat(90) + ' DIAGNOSTIC_PRIVATE_TAIL';
+  assert.ok(diagnosticSource.length > 2200);
+  await writeFile('artifacts/diagnostic-long-source.md', diagnosticSource);
+  await upload(diagnosticTab, '#material-input', ['artifacts/diagnostic-long-source.md', 'artifacts/test-audio.wav']);
   await attachments(diagnosticTab, 2);
   for (const [kind, stage, part] of [['digest', 'source_preparation', 1], ['transcription', 'transcription', 2]]) {
     provider.config.failKind = kind;
@@ -530,7 +566,7 @@ try {
     assert.equal(report.lastOperation.upstreamStatus, 500);
     assert.equal(report.lastOperation.model, kind === 'digest' ? 'test/vision' : 'test/transcribe');
     assert.equal(provider.calls.filter(c => c.kind === kind).length - beforeFailure, 1, 'No automatic replay of the failed paid stage');
-    assert.doesNotMatch(JSON.stringify(report), /Markdown source|Teach me about Newton|test-notes|test-audio|data:audio|Bearer/);
+    assert.doesNotMatch(JSON.stringify(report), /DIAGNOSTIC_PRIVATE|diagnostic-long-source|Markdown source|Teach me about Newton|test-notes|test-audio|data:audio|Bearer/);
   }
   const callsBeforeCopy = provider.calls.length;
   await evaluate(diagnosticTab, 'Object.defineProperty(navigator,"clipboard",{configurable:true,value:{writeText:async text=>{window.__copiedReport=text}}});document.getElementById("copy-diagnostics").click()');
@@ -545,6 +581,40 @@ try {
   await evaluate(diagnosticTab, 'document.querySelector("#material-list button").click()');
   await attachments(diagnosticTab, 0);
   passed('safe stage/part/model/status/timing diagnostics for digest, transcription and final failures; copy/fallback; no source/key leakage or automatic paid replay');
+  // Two short parts force the checkpoint digest step; both must pass locally,
+  // including the reported 2110-character transcript, not merely bypass preparation.
+  const localTab = await tab(origin);
+  await wait(localTab, 'document.getElementById("setup-count")?.textContent === "3/3"');
+  const tinyTranscript = 'TINY_TRANSCRIPT_PRIVATE_BEGIN ' + 'a'.repeat(2052) + ' TINY_TRANSCRIPT_PRIVATE_END';
+  assert.equal(tinyTranscript.length, 2110);
+  provider.config.transcriptText = tinyTranscript;
+  const beforeLocal = provider.calls.length;
+  await upload(localTab, '#material-input', ['artifacts/test-audio.wav', 'artifacts/test-notes.md']); await attachments(localTab, 2);
+  assert.equal(provider.calls.length, beforeLocal, 'Local imports never infer');
+  await evaluate(localTab, 'document.getElementById("include-audio").checked=false;document.getElementById("include-audio").dispatchEvent(new Event("input"));document.getElementById("lesson-form").requestSubmit()');
+  await wait(localTab, 'document.getElementById("confirm-dialog").open');
+  await evaluate(localTab, 'document.getElementById("confirm-cancel").click()');
+  await wait(localTab, '!document.getElementById("generate-button").disabled');
+  assert.equal(provider.calls.length, beforeLocal, '2110-character local preparation still requires consent');
+  await evaluate(localTab, 'document.getElementById("lesson-form").requestSubmit()'); await consent(localTab); await created(localTab);
+  const localCalls = provider.calls.slice(beforeLocal);
+  assert.deepEqual(localCalls.map(c=>c.kind), ['transcription', 'lesson'], 'Zero provider digests for two bounded text parts');
+  const localInput = localCalls[1].body.input[0].content[0].text;
+  assert.ok(localInput.includes(tinyTranscript), 'All 2110 transcript characters survive verbatim');
+  assert.ok(localInput.includes(sourceText + '\n' + longSentence), 'All short Markdown survives verbatim');
+  assert.doesNotMatch(localInput, /AI digests are lossy/, 'Local preparation does not claim a lossy AI digest');
+  const localReport = await evaluate(localTab, 'JSON.parse(document.getElementById("diagnostic-report").textContent)');
+  const localOperations = localReport.operations.filter(op=>op.appEndpoint==='/materials/summarize');
+  assert.equal(localOperations.length, 2); localOperations.forEach(assertLocalPreparation);
+  assert.deepEqual(localOperations.map(op=>op.input.textCharacters), [2110, sourceText.length + 1 + longSentence.length]);
+  assert.doesNotMatch(JSON.stringify(localReport), /TINY_TRANSCRIPT_PRIVATE|Markdown source|test-audio|test-notes|Bearer|data:audio/);
+  provider.config.transcriptText = null;
+  // Release this added case's temporary originals before the existing quota-sensitive media checks.
+  await evaluate(localTab, 'document.getElementById("tab-compose").click();document.querySelector("#material-list button").click()');
+  await attachments(localTab, 1);
+  await wait(localTab, '!document.querySelector("#material-list button").disabled');
+  await evaluate(localTab, 'document.querySelector("#material-list button").click()'); await attachments(localTab, 0);
+  passed('2110-character transcript and short Markdown: two successful local preparation operations, zero provider digest calls, consent required, exact raw tails retained, no false lossy warning or diagnostic provider/model labels');
   if (fixtures.media.length) {
     const beforeMedia = provider.calls.length;
     await evaluate(s, 'document.getElementById("tab-compose").click()');
@@ -558,7 +628,11 @@ try {
     const mediaCalls = provider.calls.slice(beforeMedia);
     assert.equal(mediaCalls.filter(c=>c.kind==='transcription').length, mediaCards.reduce((sum,c)=>sum+c.parts,0), 'Every native audio part, including MP3 tail, transcribed');
     assert.ok(mediaCalls.filter(c=>c.kind==='transcription').every(c=>c.model==='test/transcribe'), 'Transcriptions use the assigned role');
-    for (const card of mediaCards) for (let part=1;part<=card.parts;part++) assert.ok(mediaCalls.some(c=>c.kind==='digest' && JSON.stringify(c.body.input).includes(card.name) && JSON.stringify(c.body.input).includes('(' + part + '/' + card.parts + ')')), 'Every native media part reaches a digest');
+    for (const card of mediaCards) for (let part=1;part<=card.parts;part++) {
+      const expectedKind = card.name.endsWith('.mp3') ? 'lesson' : 'digest';
+      assert.ok(mediaCalls.some(c=>c.kind===expectedKind && JSON.stringify(c.body.input).includes(card.name) && JSON.stringify(c.body.input).includes('(' + part + '/' + card.parts + ')')), 'Every native media part reaches a digest or verbatim final input');
+    }
+    assert.ok(mediaCalls.findLast(c=>c.kind==='lesson').body.input[0].content[0].text.includes(transcriptText), 'Short MP3 transcripts retain their final sentinel');
     await shot(s, 'app-native-media.png');
     // A fresh draft in the same private cookie session, with STT deliberately removed.
     await evaluate(s, 'document.querySelector("[data-page=providers]").click();document.getElementById("role-transcription-provider").value="";document.getElementById("role-transcription-provider").dispatchEvent(new Event("change"));document.getElementById("roles-form").requestSubmit()');
@@ -788,6 +862,7 @@ try {
   await writeFile(resolve('artifacts/browser-smoke.log'), testLog.join('\n') + '\n');
   await writeFile(resolve('artifacts/full-audio-browser.log'), testLog.join('\n') + '\n');
   await writeFile(resolve('artifacts/checkpoint-browser.log'), testLog.join('\n') + '\n');
+  await writeFile(resolve('artifacts/preparation-browser.log'), testLog.join('\n') + '\n');
   for (const targetId of targets) await call('Target.closeTarget', { targetId }).catch(() => {});
   for (const context of [browserContextId, ...extraContexts].filter(Boolean)) await call('Target.disposeBrowserContext', { browserContextId: context });
   ws.close();

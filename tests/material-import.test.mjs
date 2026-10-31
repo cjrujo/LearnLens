@@ -82,6 +82,6 @@ test('digest preparation requires explicit consent and safely validates provider
   const state = await client.request('/api/state');
   const changed = await client.request('/api/materials/summarize', { method: 'POST', json: { text: 'source', consent: true, expectedSetupRevision: state.json.setupRevision - 1 } });
   assert.equal(changed.status, 409); assert.equal(mock.calls.length, 0, 'Stale destination consent must not call a provider');
-  const result = await client.request('/api/materials/summarize', { method: 'POST', json: { text: 'source', consent: true, expectedSetupRevision: state.json.setupRevision } });
+  const result = await client.request('/api/materials/summarize', { method: 'POST', json: { text: 'source '.repeat(400), consent: true, expectedSetupRevision: state.json.setupRevision } });
   assert.equal(result.status, 200); assert.equal(result.json.text, 'Prepared source notes'); assert.equal(mock.calls.length, 1);
 });

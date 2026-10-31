@@ -77,7 +77,10 @@ function renderTrace() {
   const last = report.operations.at(-1), { operations, ...summary } = report;
   traceOutput.textContent = JSON.stringify({ ...summary, lastOperation: last, operations }, null, 2);
   traceStatus.textContent = `${report.status} · ${stageLabel(report.failedAt?.stage || last?.stage || 'Local preparation')}${last?.provider ? ` · ${last.provider} / ${last.model}` : ''}${last?.part ? ` · part ${last.part.current}/${last.part.total}` : ''}${last?.upstreamStatus ? ` · provider HTTP ${last.upstreamStatus}` : ''} · ${report.cachedResults} cached preparation result(s) retained`;
-  traceHint.textContent = last?.providerCode === 'convert_request_failed'
+  traceHint.textContent = last?.category === 'preparation_validation'
+    ? 'The provider returned text, but it did not satisfy the notes contract. The validation reason and counts below identify the rejected field without recording its contents. Completed checkpoints are retained; retrying requires confirmation and may be billable.'
+    : last?.execution === 'local' ? 'This short text part was retained verbatim locally. No provider inference request was made for this preparation step.'
+    : last?.providerCode === 'convert_request_failed'
     ? 'The gateway reported request conversion failure. Check its support for the selected endpoint/model, images/audio and thinking level. Give gateway support the provider request ID, if shown. This is not proof your files are invalid.'
     : last?.upstreamStatus >= 500 ? 'The upstream service returned a server error. This alone does not identify the cause. Check provider status/logs with the request ID before choosing another potentially billable attempt.'
     : 'Requests below are sent only after your confirmation. Successful preparation and completed audio clips are reused; failed or unknown paid calls are never automatically replayed. API Auto may try Chat only after Responses returns 404, 405 or 501. Audio progress counts completed clips, not estimated time.';
@@ -116,17 +119,21 @@ function operationStart(path, body, method) {
   trace.operations.push(entry); $('progress-title').textContent = entry.stage + (entry.part ? ` · part ${entry.part.current} of ${entry.part.total}` : ''); renderTrace();
   return { trace, entry, started: Date.now() };
 }
-function operationFinish(operation, error) {
+function operationFinish(operation, error, result) {
   if (!operation) return;
   const { trace, entry, started } = operation;
   entry.elapsedMs = Date.now() - started; entry.status = error ? error.name === 'AbortError' ? 'Stopped; upstream outcome unknown' : 'Failed' : 'Completed';
+  if (!error && entry.appEndpoint === '/materials/summarize' && result?.preparationMode === 'verbatim') {
+    entry.execution = 'local'; entry.role = 'local'; entry.apiMode = 'local';
+    delete entry.provider; delete entry.model; delete entry.thinking;
+  }
   if (error) {
     if (error.status) entry.appStatus = error.status;
     if (/^[a-f0-9-]{36}$/.test(error.requestId || '')) entry.appRequestId = error.requestId;
     const d = error.diagnostics || {};
     if (Number.isFinite(d.elapsedMs)) entry.providerElapsedMs = d.elapsedMs;
     // Keep a fixed schema, not arbitrary server fields or error prose.
-    for (const key of ['stage', 'provider', 'model', 'apiMode', 'thinking', 'category', 'endpoint', 'upstreamStatus', 'contentType', 'responseBytes', 'providerCode', 'providerRequestId', 'automaticRetry', 'responseBodyOmitted']) {
+    for (const key of ['stage', 'provider', 'model', 'apiMode', 'thinking', 'category', 'endpoint', 'upstreamStatus', 'contentType', 'responseBytes', 'providerCode', 'providerRequestId', 'automaticRetry', 'responseBodyOmitted', 'validationReason', 'outputCharacters', 'notesCharacters', 'warningCount', 'warningCharacters', 'maxOutputTokens', 'completionStatus', 'outputTokens', 'reasoningTokens']) {
       if (Object.hasOwn(d, key) && ['string', 'number', 'boolean'].includes(typeof d[key])) {
         // Audio endpoints can contain IDs. Never copy arbitrary endpoint/error text into reports.
         if (entry.role === 'speech' && ['endpoint', 'stage', 'provider', 'model', 'apiMode'].includes(key)) continue;
@@ -139,7 +146,7 @@ function operationFinish(operation, error) {
 }
 async function api(path, options = {}) {
   const operation = operationStart(path, options.body, options.method);
-  try { const result = await apiRequest(path, options, operation); operationFinish(operation); return result; }
+  try { const result = await apiRequest(path, options, operation); operationFinish(operation, null, result); return result; }
   catch (error) { operationFinish(operation, error); throw error; }
 }
 async function apiRequest(path, options = {}, operation = null) {
