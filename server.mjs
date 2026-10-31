@@ -3,9 +3,12 @@ import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
-import { AppError, boundedString, normalizeBaseUrl, publicProvider, discoverModels, generateText, generateSpeech, transcribeAudio, geminiAudioTarget, decodeDataUrl, probeImage } from './lib/provider.mjs';
+import { AppError, boundedString, normalizeBaseUrl, publicProvider, discoverModels, generateText, generateSpeech, generateSpeechBytes, transcribeAudio, geminiAudioTarget, decodeDataUrl, probeImage } from './lib/provider.mjs';
 import { validateLessonInput, lessonPrompt, parseLesson, demoLesson } from './lib/lesson.mjs';
-import { renderLesson, renderScriptHash } from './lib/render.mjs';
+import { renderLesson, renderScriptHash, fullAudioRenderScriptHash } from './lib/render.mjs';
+import { createAudioPlanStore } from './lib/audio-plans.mjs';
+import { prepareAudioEncoder } from './lib/audio-encode.mjs';
+import { audioExtractionPrompt, parseAudioExtraction } from './lib/audio-extract.mjs';
 import { documentName, documentBody, importDocument } from './lib/document-import.mjs';
 import { createMaterialStore, UPLOAD_CHUNK_BYTES } from './lib/material-store.mjs';
 import { digestInput, digestPrompt, parseDigest } from './lib/material-digest.mjs';
@@ -104,10 +107,13 @@ export function deploymentConfig(env = process.env) {
 export function createApp(options = {}) {
   const sessions = new Map();
   const materials = createMaterialStore(options.materialStoreOptions);
+  const audioPlans = createAudioPlanStore(options.audioPlanStoreOptions);
+  let encoderPromise;
+  const encoder = () => encoderPromise ||= Promise.resolve().then(() => (options.audioEncoderFactory || prepareAudioEncoder)()).catch(error => { encoderPromise = null; throw error instanceof AppError ? error : new AppError(error?.name === 'MediaImportError' ? error.message : 'Could not prepare the managed audio encoder. No speech request was made.', 422); });
   // Snapshot a coherent UI at startup: editing source files cannot break live tabs.
   const publicDirectory = options.publicDirectory || resolve(root, 'public');
   const indexHtml = readFileSync(resolve(publicDirectory, 'index.html'), 'utf8');
-  const assets = new Map(['/app.js', '/materials.js', '/media.js', '/styles.css', '/favicon.svg'].flatMap(path => {
+  const assets = new Map(['/app.js', '/materials.js', '/audio-sources.js', '/audio-client.js', '/media.js', '/styles.css', '/favicon.svg'].flatMap(path => {
     const file = resolve(publicDirectory, path.slice(1));
     return existsSync(file) ? [[path, readFileSync(file)]] : [];
   }));
@@ -125,7 +131,8 @@ export function createApp(options = {}) {
   let activeJobs = 0, activeImports = 0, loginAttempts = 0, loginWindow = Date.now();
   function prune() {
     const now = Date.now();
-    for (const [id, session] of sessions) if (now - session.touched > SESSION_IDLE_MS || now - session.created > SESSION_MAX_MS) { session.importController?.abort(); void materials.clearOwner(id).catch(() => {}); sessions.delete(id); }
+    for (const [id, session] of sessions) if (now - session.touched > SESSION_IDLE_MS || now - session.created > SESSION_MAX_MS) { session.importController?.abort(); void materials.clearOwner(id).catch(() => {}); void audioPlans.clearOwner(id).catch(() => {}); sessions.delete(id); }
+    void audioPlans.retryCleanup();
   }
   const interval = setInterval(prune, 60_000).unref();
 
@@ -133,7 +140,7 @@ export function createApp(options = {}) {
     const requestId = randomUUID(); let diagnosticContext;
     const context = (stage, provider, role) => {
       const safe = value => typeof value === 'string' && ![provider?.apiKey, accessPassword].filter(Boolean).some(secret => value.includes(secret)) ? value.slice(0, 200) : '[redacted]';
-      diagnosticContext = { stage, provider: safe(provider?.name || 'Configured provider'), model: safe(role?.model), apiMode: stage === 'transcription' ? (role?.api === 'gemini' ? 'gemini.generateContent' : 'audio/transcriptions') : ['auto', 'chat', 'responses'].includes(role?.api) ? role.api : 'auto', thinking: role?.reasoningEffort || 'default' };
+      diagnosticContext = { stage, provider: safe(provider?.name || 'Configured provider'), model: safe(role?.model), apiMode: stage === 'speech_generation' ? 'audio/speech' : stage === 'transcription' ? (role?.api === 'gemini' ? 'gemini.generateContent' : 'audio/transcriptions') : ['auto', 'chat', 'responses'].includes(role?.api) ? role.api : 'auto', thinking: role?.reasoningEffort || 'default' };
     };
     response.setHeader('X-LearnLens-Request-Id', requestId);
     response.setHeader('Cache-Control', 'no-store');
@@ -141,7 +148,7 @@ export function createApp(options = {}) {
     response.setHeader('Referrer-Policy', 'no-referrer');
     response.setHeader('X-Frame-Options', 'DENY');
     response.setHeader('Permissions-Policy', 'microphone=(self), camera=(), geolocation=()');
-    response.setHeader('Content-Security-Policy', `default-src 'self'; script-src 'self' '${renderScriptHash}'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'`);
+    response.setHeader('Content-Security-Policy', `default-src 'self'; script-src 'self' '${renderScriptHash}' '${fullAudioRenderScriptHash}'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'`);
     if (publicOrigin) response.setHeader('Strict-Transport-Security', 'max-age=31536000');
     try {
       const expectedHost = publicOrigin ? new URL(publicOrigin).host : null;
@@ -207,7 +214,7 @@ export function createApp(options = {}) {
         session.revision++;
         session.importController?.abort();
         session.providers.clear(); session.roles = initialRoles(); session.kokoroChecks = Object.create(null); session.setupRevision++; session.authorized = !accessPassword;
-        await materials.clearOwner(session.id);
+        await materials.clearOwner(session.id); await audioPlans.clearOwner(session.id);
         json(response, 200, { ok: true }); return;
       }
       if (!session.authorized) throw new AppError('Enter the LearnLens access password first.', 401);
@@ -311,6 +318,70 @@ export function createApp(options = {}) {
       }
       if (request.method === 'GET' && path === '/api/demo') {
         json(response, 200, { id: 'sample', title: demoLesson.title, lesson: demoLesson, warnings: demoLesson.warnings, html: renderLesson(demoLesson, { warnings: demoLesson.warnings, sample: true }) }); return;
+      }
+      const audioRevision = body => {
+        if (!Number.isInteger(body.expectedSetupRevision) || body.expectedSetupRevision !== session.setupRevision) throw new AppError('AI settings changed or the audio setup revision is missing. Review settings and confirm again; no speech request was made.', 409);
+        return session.setupRevision;
+      };
+      const speechSetup = () => {
+        const speech = session.roles.speech;
+        if (!speech) throw new AppError('Assign a speech role before preparing complete English audio.');
+        const provider = speech.engine === 'kokoro' ? kokoro : session.providers.get(speech.providerId);
+        if (!provider) throw new AppError('The selected speech provider is no longer available.', 409);
+        return { speech: structuredClone(speech), provider: { ...provider }, speechIdentity: JSON.stringify({ speech, baseUrl: provider.baseUrl, format: provider.speechFormat || 'mp3' }) };
+      };
+      if (request.method === 'POST' && path === '/api/audio/preflight') {
+        await readBody(); speechSetup(); audioPlans.capacity(session.id);
+        await runJob(session, async () => { await encoder(); ensureCurrent(); json(response, 200, { ready: true, limits: audioPlans.limits }); }); return;
+      }
+      if (request.method === 'POST' && path === '/api/audio/extract') {
+        const body = await readPaidBody(), snapshot = audioRevision(body), prompt = audioExtractionPrompt(body);
+        const primary = session.roles.primary;
+        if (!primary) throw new AppError('Assign a primary model for source-image text recognition.');
+        const provider = { ...session.providers.get(primary.providerId) };
+        context('source_recognition', provider, primary);
+        await runJob(session, async () => {
+          ensureCurrent(); if (session.setupRevision !== snapshot) throw new AppError('AI setup changed before source recognition.', 409);
+          const output = await generateText(provider, { ...primary, maxTokens: 12000 }, prompt);
+          ensureCurrent(); json(response, 200, parseAudioExtraction(output.text));
+        }); return;
+      }
+      if (request.method === 'POST' && path === '/api/audio/plans') {
+        const body = await readBody(), setupRevision = audioRevision(body), setup = speechSetup();
+        await runJob(session, async () => { const result = await audioPlans.create(session.id, body, { ...setup, setupRevision }); ensureCurrent(); json(response, 201, result); }); return;
+      }
+      const audioPath = /^\/api\/audio\/plans\/([a-f0-9-]{36})(?:\/(sources|seal|export|reconfirm|clips)(?:\/([a-f0-9]{64}))?)?$/.exec(path);
+      if (audioPath) {
+        const [, id, action, clipId] = audioPath;
+        // Every lookup (including GET) is scoped to the authenticated owner.
+        if (request.method === 'GET' && !action) { json(response, 200, audioPlans.status(session.id, id)); return; }
+        if (request.method === 'GET' && action === 'clips' && clipId) { json(response, 200, audioPlans.clipStatus(session.id, id, clipId)); return; }
+        if (request.method === 'GET' && action === 'export' && !clipId) {
+          await runJob(session, async () => { const result = await audioPlans.exportLesson(session.id, id); ensureCurrent(); json(response, 200, result); }); return;
+        }
+        if (request.method === 'DELETE' && !action) { await audioPlans.remove(session.id, id); ensureCurrent(); json(response, 200, { ok: true }); return; }
+        if (request.method === 'POST' && action === 'reconfirm' && !clipId) {
+          const body = await readPaidBody(), setupRevision = audioRevision(body), setup = speechSetup();
+          await runJob(session, async () => { json(response, 200, await audioPlans.reconfirm(session.id, id, { setupRevision, speechIdentity: setup.speechIdentity })); }); return;
+        }
+        if (request.method === 'POST' && ['sources', 'seal'].includes(action) && !clipId) {
+          const body = await readBody();
+          await runJob(session, async () => { const result = action === 'sources' ? await audioPlans.addSource(session.id, id, body.source) : await audioPlans.seal(session.id, id); ensureCurrent(); json(response, 200, result); }); return;
+        }
+        if (request.method === 'POST' && action === 'clips' && clipId) {
+          const body = await readPaidBody(), snapshot = audioRevision(body), setup = speechSetup();
+          const speech = audioPlans.assertSetup(session.id, id, snapshot);
+          // Reconfirmation is required after any setup revision; never retarget a plan silently.
+          context('speech_generation', setup.provider, speech);
+          await runJob(session, async () => {
+            const encode = await encoder(); ensureCurrent();
+            if (session.setupRevision !== snapshot) throw new AppError('AI setup changed before speech generation. Confirm again.', 409);
+            const result = await audioPlans.synthesize(session.id, id, clipId, { attemptId: body.attemptId, retry: body.retry === true, encode, checkCurrent: ensureCurrent,
+              generate: async text => { ensureCurrent(); if (session.setupRevision !== snapshot) throw new AppError('AI setup changed before speech generation. Confirm again.', 409); return generateSpeechBytes(setup.provider, speech, text); } });
+            ensureCurrent(); json(response, 200, result);
+          }); return;
+        }
+        throw new AppError('Unsupported audio plan operation.', 405);
       }
       if (request.method === 'POST' && path === '/api/materials') {
         const body = await readBody(); const result = await materials.create(session.id, body); ensureCurrent();
@@ -434,7 +505,7 @@ export function createApp(options = {}) {
   }
   server.requestTimeout = 30_000;
   server.headersTimeout = 15_000;
-  server.on('close', () => { clearInterval(interval); for (const session of sessions.values()) session.importController?.abort(); sessions.clear(); void materials.close().catch(() => {}); });
+  server.on('close', () => { clearInterval(interval); for (const session of sessions.values()) session.importController?.abort(); sessions.clear(); void materials.close().catch(() => {}); void audioPlans.close().catch(() => {}); });
   return { server };
 }
 

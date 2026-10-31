@@ -1,4 +1,5 @@
 // Local originals never go to a provider. Only bounded extracted parts do, after consent.
+import { AudioSourceCollector, isContiguousAudioText, validateVisionExtraction, TRANSCRIPTION_WARNING } from './audio-sources.js';
 const el = (tag, text, className) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; };
 const bytesOf = url => Math.ceil((url.split(',')[1]?.length || 0) * .75);
 const split = (text, size = 20000) => {
@@ -169,10 +170,10 @@ export class MaterialWorkspace {
       } catch (error) { if (epoch === this.epoch && error.status === 404) this.items = this.items.filter(other => other !== item); else if (epoch === this.epoch) item.error = 'Could not clean up original: ' + error.message; }
     });
   }
-  describe() {
+  describe({ completeAudio = false } = {}) {
     const audioParts = this.items.filter(item => item.kind === 'media' && item.manifest?.hasAudio !== false).reduce((n, item) => n + item.partCount, 0);
     const estimate = 1 + audioParts + (this.partCount > 1 ? this.partCount : 0);
-    return this.items.map(item => `${item.name}: ${item.partCount || '?'} automatic part(s)${item.kind === 'media' && item.manifest?.hasAudio !== false ? ', speech transcription per part' : ''}`).join('\n') + `\nEstimated base: about ${estimate} billable request(s) before cache reuse, merges, dense text/image batches or spoken examples. Work: ${this.partCount} part(s), ${this.needsTranscription ? 'one transcription per media part, ' : ''}${this.partCount > 1 ? 'one or more AI digests per part plus possible merge digests, ' : 'digests only if needed, '}then one final lesson request. Spoken examples may add calls. Actual calls depend on content; no fixed price is implied. Successful cached work is reused. Preparation stops at 512 calls.`;
+    return this.items.map(item => `${item.name}: ${item.partCount || '?'} automatic part(s)${item.kind === 'media' && item.manifest?.hasAudio !== false ? ', speech transcription per part' : ''}`).join('\n') + `\nEstimated base: about ${estimate} billable request(s) before cache reuse, merges, dense text/image batches or spoken examples. Work: ${this.partCount} part(s), ${this.needsTranscription ? 'one transcription per media part, ' : ''}${this.partCount > 1 ? 'one or more AI digests per part plus possible merge digests, ' : 'digests only if needed, '}then one final lesson request. Spoken examples may add calls. Actual calls depend on content; no fixed price is implied. Successful cached work is reused. Preparation stops at 512 calls.` + (completeAudio ? '\nFull English audio also extracts English text from every source image, with potentially billable primary-model calls per image (not just representative previews). Full source text can require many narration clips and additional billable speech calls. Extraction/transcription may omit or misread content; neither complete coverage nor an exact call count is guaranteed.' : '');
   }
   cachePut(key, value) {
     const size = JSON.stringify(value).length * 2;
@@ -180,13 +181,14 @@ export class MaterialWorkspace {
     while (this.cache.size && (this.cacheBytes + size > 8 * 1024 * 1024 || this.cache.size >= 1024)) { const first = this.cache.keys().next().value; this.cacheBytes -= this.cache.get(first).size; this.cache.delete(first); }
     this.cache.set(key, { value, size }); this.cacheBytes += size;
   }
-  async prepare({ consent, goal, roles, expectedSetupRevision, progress = () => {} }) {
+  async prepare({ consent, goal, roles, expectedSetupRevision, progress = () => {}, completeAudio = false }) {
     if (!consent) throw new Error('Explicit paid consent is required.');
     if (!Number.isInteger(expectedSetupRevision)) throw new Error('A confirmed AI setup revision is required. Refresh setup and confirm again.');
     roles = structuredClone(roles); // Fixed destinations for this entire preparation, even if /state refreshes.
     if (this.busy) throw new Error('Wait for local imports to finish.');
     if (this.items.some(item => item.status !== 'ready')) throw new Error('Resume failed local imports before creating the lesson.');
     const epoch = this.epoch; let calls = 0, processed = 0, visualCount = 0, digested = false; const representatives = [], warnings = [], notes = [];
+    const audioCollector = completeAudio ? new AudioSourceCollector() : null;
     const warn = value => { const text = String(value).slice(0, 500); if (!warnings.includes(text) && warnings.length < 29) warnings.push(text); };
     const paid = async (path, body, stable, role) => {
       this.check(epoch); const key = await hash(JSON.stringify([stable, role, body])); this.check(epoch);
@@ -194,7 +196,8 @@ export class MaterialWorkspace {
       if (++calls > 512) throw new Error('The automatic preparation safety budget of 512 calls was reached. Completed work is saved in this page. Review with your app administrator before continuing.');
       // Never retry a failed or unknown billable request automatically.
       const result = await this.local(path, { method: 'POST', body }, epoch); this.check(epoch);
-      if (typeof result.text !== 'string' || !result.text.trim() || (path.endsWith('/summarize') && result.text.length > 2200)) throw new Error('The provider returned an invalid preparation result. No further paid calls were made.');
+      if (path === '/audio/extract') validateVisionExtraction(result);
+      else if (typeof result.text !== 'string' || !result.text.trim() || (path.endsWith('/summarize') && result.text.length > 2200)) throw new Error('The provider returned an invalid preparation result. No further paid calls were made.');
       this.cachePut(key, result); return result;
     };
     const digest = async (text, images, source, stable) => {
@@ -206,22 +209,34 @@ export class MaterialWorkspace {
     for (const item of this.items) {
       this.check(epoch);
       if (item.needsUpload) { progress('Restoring local original: ' + item.name); await this.upload(item, epoch); }
+      if (audioCollector) { const key = await hash(item.id); this.check(epoch); audioCollector.beginItem({ key, source: item.name, contiguous: isContiguousAudioText(item) }); }
       for (let index = 0; index < item.partCount; index++) {
         progress(`Processing part ${++processed} of ${this.partCount} · ${item.name}`);
         const part = await this.part(item, index, epoch); this.check(epoch);
         const source = `${item.name} · ${part.label || `part ${index + 1}`} (${index + 1}/${item.partCount})`.slice(0, 200), stable = item.id + ':' + index;
         for (const warning of [...item.warnings, ...(part.warnings || [])]) warn(item.name + ': ' + warning);
         let text = part.text || '';
+        const audioSource = `${item.name} · ${part.label || `part ${index + 1}`} (${index + 1}/${item.partCount})`;
+        const extractionWarnings = [...item.warnings, ...(part.warnings || [])];
+        audioCollector?.addPart({ index, text, source: audioSource, warnings: extractionWarnings, hasAlternativeExtraction: Boolean(part.audio || part.images?.length) });
         if (part.audio) {
           if (!roles.transcription) throw new Error('Assign a transcription model for attached audio or video.');
           const result = await paid('/transcribe', { dataUrl: part.audio, name: source.slice(0, 180), consent: true, expectedSetupRevision }, stable + ':transcription', roles.transcription);
+          audioCollector?.addTranscription({ index, text: result.text, source: audioSource + ' · speech', warnings: [...extractionWarnings, ...(result.warnings || [])] });
           text = [text, result.text].filter(Boolean).join('\n'); delete part.audio;
-          warn(item.name + ': Speech is automatically transcribed and may omit words, names or equations.');
+          warn(item.name + ': ' + TRANSCRIPTION_WARNING);
         }
         const visuals = [];
         for (const original of part.images || []) {
           const image = await normalizeImage(original.dataUrl, (source + ' · ' + original.name).slice(0, 180)); this.check(epoch); visuals.push(image); visualCount++;
-          if (image.dataUrl !== original.dataUrl) warn(item.name + ': Some extracted visuals were resized; fine detail may be lost.');
+          const resizeWarning = 'Some extracted visuals were resized; fine detail may be lost.';
+          if (image.dataUrl !== original.dataUrl) warn(item.name + ': ' + resizeWarning);
+          if (audioCollector) {
+            const imageIndex = visuals.length - 1;
+            const result = await paid('/audio/extract', { image, consent: true, expectedSetupRevision }, stable + ':audio-extract:' + imageIndex, roles.primary);
+            audioCollector.addVision({ index, imageIndex, result, source: `Image ${imageIndex + 1} · ${audioSource} · ${original.name || 'visual'}`, warnings: [...extractionWarnings, ...(image.dataUrl !== original.dataUrl ? [resizeWarning] : [])] });
+            for (const warning of result.warnings) warn(source + ': ' + warning);
+          }
           if (representatives.length < 5 && representatives.reduce((n, entry) => n + bytesOf(entry.dataUrl), 0) + bytesOf(image.dataUrl) <= 8 * 1024 * 1024) representatives.push(image);
         }
         if (!text.trim() && !visuals.length) { warn(source + ': No readable text, speech or visuals were extracted.'); continue; }
@@ -232,8 +247,9 @@ export class MaterialWorkspace {
         if (batch.length) batches.push(batch);
         for (let p = 0; p < Math.max(pieces.length, batches.length); p++) notes.push(await digest(pieces[p] || '', batches[p] || [], source, stable + ':digest:' + p));
       }
+      audioCollector?.endItem();
     }
-    if (this.items.length && !notes.some(text => text.trim()) && !representatives.length) throw new Error('No readable material was extracted. Review the local previews; your attachments remain intact.');
+    if (!audioCollector && this.items.length && !notes.some(text => text.trim()) && !representatives.length) throw new Error('No readable material was extracted. Review the local previews; your attachments remain intact.');
     let merged = notes.filter(Boolean);
     while (merged.join('\n\n').length > 35000) {
       const groups = []; let group = [];
@@ -248,7 +264,7 @@ export class MaterialWorkspace {
     if (digested) warnings.unshift('AI digests are lossy and are not guaranteed verbatim. All extracted parts were processed; verify important details against the originals.');
     if (visualCount > representatives.length) warnings.unshift(`All ${visualCount} extracted visuals were processed, but only ${representatives.length} representative preview images are embedded in the lesson.`);
     if (warnings.length >= 29) warnings.splice(29, Infinity, 'Additional source limitations may be shown in the local material review.');
-    return { text: merged.join('\n\n') || (!representatives.length ? goal : ''), images: representatives, sourceWarnings: warnings };
+    return { text: merged.join('\n\n') || (!representatives.length ? goal : ''), images: representatives, sourceWarnings: warnings, ...(audioCollector ? { audioSources: audioCollector.finish() } : {}) };
   }
   render() {
     const open = new Set([...this.list.querySelectorAll('details[open]')].map(node => node.dataset.id));

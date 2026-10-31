@@ -9,7 +9,7 @@ npm test
 npm run check
 ```
 
-Latest Gemini-audio release checks: **111 passed, 0 failed, 1 optional media test skipped** in the regular suite (112 total). Syntax checks passed for 44 files. Seven native-audio regression groups cover same-origin base/model validation, exact-host auth headers, inline WAV bytes, consent/revision gates, strict completed response parsing, thought exclusion, safe failures without fallback/replay, hosted private-address rejection, and reviewable advisor protocol choices. Both multipart and native transcription require explicit server-side consent; final generation does too. No external provider inference requests were made. The real material suite separately passed **25/25** (17 media plus 8 staging tests) with offline caches on Windows and Linux. Server, adapters, import modules and frontend syntax checks passed.
+Previous Gemini-audio release checks: **111 passed, 0 failed, 1 optional media test skipped** in the regular suite (112 total). Syntax checks passed for 44 files. Seven native-audio regression groups cover same-origin base/model validation, exact-host auth headers, inline WAV bytes, consent/revision gates, strict completed response parsing, thought exclusion, safe failures without fallback/replay, hosted private-address rejection, and reviewable advisor protocol choices. Both multipart and native transcription require explicit server-side consent; final generation does too. No external provider inference requests were made. The real material suite separately passed **25/25** (17 media plus 8 staging tests) with offline caches on Windows and Linux. Server, adapters, import modules and frontend syntax checks passed.
 
 Coverage includes browser-session isolation, secret redaction, model discovery versus explicit paid probes, Responses/Chat request formats, narrow fallback rules, valid/invalid image input, body/media limits, missing/failed speech, transcription multipart encoding, untrusted output escaping, export CSP, authorization/CSRF, public IP policy, and hosted configuration guards. Additional setup tests cover reasoning fields/omission for both APIs, unsupported-effort failure without downgrade, recommendation consent/privacy/scope/candidate validation, no silent role saving, provider-edit key transfer protection, and managed Kokoro authorization/routing/failures.
 
@@ -77,6 +77,36 @@ Main-agent Windows rerun passed the full staged browser suite with real MP3/MP4/
 `.github/workflows/material-imports.yml` passed on **Windows and Linux** at `c0edea8`: [run 41090185334](https://github.com/cjrujo/LearnLens/actions/runs/41090185334). Both passed 100 regular tests (one opt-in skip), audit, setup and 25/25 real material checks. Linux processed fixtures with external networking disabled at the OS network-namespace level. The 251.25-second MP3's complete audio coverage passed on both platforms.
 
 After activating the coherent public UI, the main agent reran the complete browser suite plus actual native Kokoro export playback: PASS. Native cache-only full lesson smoke again produced a 248,444-byte WAV. Live `/health` returned 200; disposable Chromium reported no runtime exceptions and an enabled composer. Local evidence: `artifacts/import-browser-live-release.log`, `artifacts/import-final-media.log`, `artifacts/native-import-release.log`. No cloud-provider teaching or actual user gateway was exercised.
+
+## Complete source + lesson audio
+
+Full-audio working-tree verification on Windows / Node 22.23.1:
+
+- **209 passed, 0 failed, 2 opt-in skips** in the regular suite (211 total); syntax checks passed for **58 files**.
+- Full inventory tests cover more than eight targets, source first/middle/tail retention, contiguous Office/text chunks, CJK/grapheme-safe batching, exact alphanumeric words, duplicate clips, long speech splitting, source uncertainty and hidden answers.
+- API/client/storage regressions cover mandatory consent/revision, owner isolation, idempotent source/attempt IDs, failed/unknown requests without automatic replay, Stop/Continue read-only polling, completed-clip reuse, retained raw speech after encoding failure, local-only continuation, bounded two-lesson history, explicit discard and lost-plan handling.
+- Filesystem fault tests cover failed status commits at the storage boundary and deletion failures. Cleanup retains quota until actual deletion and retries independently of expired sessions. Encoding recovery is prioritized before other damaged clips.
+- **13/13 encoder tests passed** with the opt-in real cached FFmpeg checks: WAV→MP3, MP3 roundtrip/full decode, invalid input, output bounds and cancellation.
+- Real cache-only native plan smoke generated **38 source/generated word/sentence clips**, totaling **334,638 MP3 bytes**, with no cloud provider. Successful clip reuse and cleanup passed. A generated file is not proof of correct pronunciation; pronunciation remains **NOT_TESTED**.
+- Full disposable-Chromium9333 suite passed: exact-count cancellation keeps text/history; mid-batch speech500 produces an explicit partial export; renewed continuation reuses clips without OCR/STT/teaching replay; immediate Stop/Continue resolves the existing operation by GET polling. All prior import, Gemini, diagnostics, password and mobile checks remain passing.
+- Actual single-file offline MP3 decoding/playback passed for both synthetic fixtures and the real 38-clip Kokoro export: word/sentence targets, exclusive playback, rapid replacement, repeated ended events, Stop, 1×/.75×/.5×, long ordered pieces, answer/collapse protection and 320px layout. Sandboxed preview ran under both parent/export CSPs without parent DOM access. Legacy native WAV playback still passed.
+
+Reproduce after `npm run setup:speech` and `npm run setup:media`:
+
+```sh
+npm test
+npm run check
+LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1 node --test tests/audio-encode.test.mjs
+npm run test:audio-native
+# With the documented disposable Chromium on :9333 (never a user's normal browser):
+LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1 \
+  LEARNLENS_NATIVE_FULL_AUDIO_LESSON=artifacts/native-full-audio-lesson.html \
+  LEARNLENS_NATIVE_LESSON=artifacts/native-offline-lesson.html npm run test:browser
+```
+
+Evidence (ignored local artifacts): `full-audio-suite.log`, `full-audio-syntax.log`, `full-audio-recovery-fixes.log`, `full-audio-encoder-real.log`, `full-audio-native.log`, `native-full-audio-summary.json`, `full-audio-browser.log`, `full-audio-browser-run.log`, `app-full-audio.png`, `offline-full-audio.png`, `native-offline-full-audio.png`. The earlier `full-audio-stop-failure.json` records a found-and-fixed bug, not current status. The native CI workflow now also prepares the managed encoder and runs full audio on Windows/Linux, with Linux external networking disabled; current-run outcomes must be checked separately rather than inferred from old native CI results below.
+
+Scope and quotas are in [FULL-AUDIO.md](FULL-AUDIO.md). Real cloud quality, all voices, faithful recognition of every original word, mathematical pronunciation, all mobile hardware and peak memory at the maximum export quota are **not** established by these tests. No real learner material, cloud credentials or paid provider inference were used.
 
 ## Docker-free native speech
 

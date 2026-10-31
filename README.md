@@ -23,7 +23,7 @@ npm test
 npm run check
 ```
 
-The tests use local mock providers. They do not call paid models or prove the educational quality of a real model. **111 automated tests pass** (one additional opt-in media integration test runs separately), plus a Chromium browser smoke suite covering desktop/mobile layouts, provider setup, uploads, transcription, sandboxed preview, real browser download, password gating and offline audio playback. See [TESTING.md](TESTING.md) for reproduction and remaining validation gaps.
+The tests use local mock providers. They do not call paid models or prove the educational quality of a real model. Automated unit/API suites and opt-in real media/native checks are included, plus a Chromium browser smoke suite covering desktop/mobile layouts, provider setup, uploads, transcription, sandboxed preview, real browser download, password gating and offline audio playback. See [TESTING.md](TESTING.md) for reproduction and remaining validation gaps.
 
 ## What works in v0.2
 
@@ -39,7 +39,8 @@ The tests use local mock providers. They do not call paid models or prove the ed
 - Separate primary, transcription and speech model roles. Same provider/model may serve several roles when supported.
 - Responses API with narrowly scoped Chat Completions fallback, or explicit endpoint mode. Bounded completed SSE responses and UTF-8 BOMs are handled; malformed, empty and HTML responses get safe, format-specific diagnostics rather than blaming the model.
 - Voice recording and media transcription through `/audio/transcriptions` or an explicitly selected [Gemini-native audio API](GEMINI-AUDIO.md), after explicit consent. Long recordings are automatically split into independent audio parts; video also contributes sampled stills.
-- Two speech methods: an online/compatible AI provider or the included native Kokoro engine via a private `/audio/speech` adapter. Native speech is English-only and returns WAV; other languages can use a compatible online provider. Successful audio is embedded in the lesson with 1×, 0.75× and 0.5× playback. No browser speech-synthesis fallback. Voice quality depends on provider/model/language; listen to verify.
+- [Complete English audio](FULL-AUDIO.md) for words and sentence/phrase targets from **both uploaded material and the generated lesson**, not eight selected examples. Full extracted text is retained separately from teaching summaries. Click-to-play, repeat, Stop and 1× / 0.75× / 0.5× work offline; completed clips are reused on continuation without repeating paid teaching.
+- Speech uses native Kokoro or an explicitly selected compatible provider. Native output is WAV internally; managed FFmpeg compresses complete-mode exports to MP3. The exact unique clip count and local/potentially billable speech destination require a second confirmation. English/Latin-script matching is not reliable language identification; recognition and pronunciation still need review. No automatic cloud or browser-TTS fallback.
 - Downloaded HTML includes its own CSS, trusted interaction script, source images and successfully generated audio. No CDN, font download, API connection or API key is required to open it offline.
 - Responsive browser interface; separate in-memory state and credentials for each browser session.
 
@@ -58,9 +59,9 @@ That means **one required role and two optional roles**, not necessarily three d
 3. Assign models to roles. For primary, select **Auto**, **Responses** or **Chat Completions**. Auto tries Responses first and falls back only on HTTP 404, 405 or 501. It never retries authorization, quota or generic server errors against a different endpoint.
 4. If unsure, click **Use a starter primary** (when available), then **Ask primary to suggest models**. The starter is a transparent catalog-based rule: prefer matching text/vision sample checks, otherwise `gpt-5.4-mini` only if that exact ID is listed. There is no guess for an unknown catalog. The advisor uses your chosen primary model and its thinking level, requires billable-call consent, and only considers listed or already-selected manual model IDs. Review the reasons, check the suggestions you want, copy them into the form, edit anything, and **Save model roles**. Recommendations do not verify capabilities or prices. Default scope shares only the primary provider’s catalog; “All” explicitly shares other connected provider catalogs with the advisor. Keys, base URLs and learning material are excluded.
 5. Optionally run capability tests. Each requires confirmation and may incur a small provider charge. A model ID or successful listing is NOT proof of vision/audio/tools support. A verified badge means only the specific sample operation succeeded, not universal model quality.
-6. Add material, preferences and a goal, then generate. Source material is sent to the selected primary provider. Requested audio scripts go to the selected speech provider. Voice recordings go to the selected transcription provider.
+6. Add material, preferences and a goal, then generate. Source material is sent to the selected primary provider. Complete audio requires a separate exact-count confirmation; speech text then goes to the selected speech engine/provider. Voice recordings go to the selected transcription provider.
 
-**Gemini audio:** In Speech-to-text, choose **Transcription API → Gemini-native audio**, then save. Your provider/key stay on the same host; a `/v1` base maps to `/v1beta` for audio only. Configure the primary teaching API separately (Aiberm documents Chat Completions for its Gemini model). Local fixture tests pass; actual Aiberm inline-audio forwarding remains unverified. No paid probe or protocol fallback is automatic. See [setup, limits and evidence](GEMINI-AUDIO.md).
+**Gemini audio:** In Speech-to-text, choose **Transcription API → Gemini-native audio**, then save. Your provider/key stay on the same host; a `/v1` base maps to `/v1beta` for audio only. Configure the primary teaching API separately (Aiberm documents Chat Completions for its Gemini model). A user reported a successful `gemini-3.8-flash` native transcription. Automated tests remain local fixtures; broader gateway/token-group compatibility is not established. No paid probe or protocol fallback is automatic. See [setup, limits and evidence](GEMINI-AUDIO.md).
 
 **Thinking level:** Default omits the parameter entirely; it is not the same as None. Responses uses `reasoning: { effort }`; Chat uses `reasoning_effort`. Both use output-token limits that include reasoning tokens. More effort can increase latency/cost or exhaust the output budget. Not every model/gateway supports every setting; unsupported requests fail visibly, without silently downgrading effort or retrying against a different endpoint on HTTP 400. Use Default if unsure. Capability badges are scoped to API mode/thinking level (and voice for speech).
 
@@ -72,9 +73,9 @@ That means **one required role and two optional roles**, not necessarily three d
 
 ## Built-in natural speech
 
-**`npm start` starts built-in Kokoro automatically, without Docker or Python, and preselects it for new sessions. Learners do not install a speech service, configure its URL or provide a speech API key.** The Node/ONNX CPU runtime uses a pinned, checksum-verified local model, performs real warmup before declaring readiness, and runs on an authenticated private loopback port. Native US/UK English voices are supported; choose optional online speech for other languages. The older Python Docker package remains available as an alternative.
+**`npm start` starts built-in Kokoro automatically, without Docker or Python, and preselects it for new sessions. Learners do not install a speech service, configure its URL or provide a speech API key.** The Node/ONNX CPU runtime uses a pinned, checksum-verified local model, performs real warmup before declaring readiness, and runs on an authenticated private loopback port. Native US/UK English voices are supported. The complete-audio inventory currently targets English/Latin-script text, even when the chosen provider supports other languages. The older Python Docker package remains available as an alternative.
 
-See [KOKORO.md](KOKORO.md) for the learner flow and deployment architecture. This is server-side synthesis, not a large model inside each browser or HTML file. Synthesis runs locally after packaging; remote primary-model generation still needs connectivity. Successful audio from either method is embedded in the exported lesson. A Kokoro failure preserves the text lesson and **never silently switches to cloud speech**. The native engine's initial voice is English `af_heart`; native output is PCM WAV, so exports can be larger than provider MP3.
+See [KOKORO.md](KOKORO.md) for the learner flow and deployment architecture. This is server-side synthesis, not a large model inside each browser or HTML file. Synthesis runs locally after packaging; remote primary-model generation still needs connectivity. Successful audio from either method is embedded in the exported lesson. A Kokoro failure preserves the text lesson and **never silently switches to cloud speech**. The native engine's initial voice is English `af_heart`. Native output is PCM WAV internally; complete-mode audio is locally encoded to compact MP3 using the already-managed media tools, with no separate FFmpeg installation. See [coverage, recovery and quotas](FULL-AUDIO.md).
 
 ## Online app, offline lessons
 
@@ -126,7 +127,7 @@ Before broad public launch: replace the shared password with real authentication
 - State-changing requests require same-origin checks and an unpredictable session token. API keys never go directly from browser to AI providers after setup.
 - Redirects from providers are not followed. In hosted mode only public HTTPS provider destinations are permitted; all resolved addresses are checked and the selected address is pinned to the outbound TLS connection. User-configured private/local provider access is available only in local mode. The sole hosted exception is the managed internal Kokoro worker (or an explicit advanced operator override); browser input cannot choose or override its private destination.
 - Model content is untrusted. Only validated lesson JSON is rendered; every text value is escaped. Exported files have a restrictive CSP and no network connections. Preview uses a sandboxed iframe without same-origin permission.
-- The app automatically splits uploads into 4 MB transfers, PDF into three-page ranges, Office text into roughly 20k-character parts, and media into three-minute audio parts. Final model input remains bounded to 40,000 characters and 5 images (4 MB each / 8 MB combined); per-request audio remains at most 8 MB. Host storage/CPU quotas still apply; see [IMPORTS.md](IMPORTS.md). Generated audio is capped at 8 lines and 12 MB. One AI job per session, eight globally, two local processors and 200 sessions max.
+- The app automatically splits uploads into 4 MB transfers, PDF into three-page ranges, Office text into roughly 20k-character parts, and media into three-minute audio parts. Final model input remains bounded to 40,000 characters and 5 images (4 MB each / 8 MB combined); per-request audio remains at most 8 MB. Host storage/CPU quotas still apply; see [IMPORTS.md](IMPORTS.md). Complete audio is not limited to eight clips: it uses bounded session plans (128 MiB compressed audio per plan, plus metadata/markup/export limits). Older direct API clients retain the eight-line/12 MiB sample path only; see [FULL-AUDIO.md](FULL-AUDIO.md). One AI job per session, eight globally, two local processors and 200 sessions max.
 - Natural narration is clearly AI-generated. Transcription does **not** establish pronunciation quality. No phoneme-scoring claims are made.
 
 ## Architecture
@@ -137,7 +138,8 @@ Browser: material + preferences
   → Provider adapter (Responses / Chat Completions)
   → AI classifies, plans and writes LessonSpec JSON
   → Schema and size validation
-  → Optional speech synthesis
+  → Retain text lesson + complete source/lesson audio inventory
+  → Exact-count consent → resumable clips → local MP3 encoding
   → Deterministic trusted HTML renderer
   → Sandboxed preview + offline download
 ```
@@ -150,6 +152,8 @@ lib/provider.mjs     Provider adapters, discovery, probes, media validation
 lib/lesson.mjs       Input validation, tutor prompt, lesson schema, demo
 lib/setup.mjs        Bounded recommendation catalog, validation, starter rule
 deploy/              Native startup/cache/worker; optional Docker speech startup
+lib/audio-*.mjs      Source recognition, private audio plans, managed encoding
+lib/speech-inventory.mjs  Stable complete word/sentence targets and clip splitting
 lib/render.mjs       Escaped standalone HTML and offline interactions
 public/              Responsive UI (vanilla ES modules, CSS, HTML)
 tests/               Local mock-provider integration and unit tests

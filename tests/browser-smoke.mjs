@@ -6,7 +6,8 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createApp } from '../server.mjs';
 import { probeImage } from '../lib/provider.mjs';
-import { createQAProvider, wav, listen, close, importFixtures } from './browser-fixtures.mjs';
+import { prepareAudioEncoder } from '../lib/audio-encode.mjs';
+import { createQAProvider, wav, listen, close, importFixtures, sourceText, transcriptText, ocrText, longSentence } from './browser-fixtures.mjs';
 const publicDirectory = resolve(process.env.LEARNLENS_TEST_UI || 'public');
 process.env.LEARNLENS_MEDIA_OFFLINE = '1';
 // Node-side provider calls and tool acquisition must stay loopback/offline.
@@ -16,19 +17,21 @@ globalThis.fetch = (input, options) => {
   if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) throw new Error('Browser smoke forbids non-loopback network');
   return realFetch(input, options);
 };
-const testLog = [];
+const testLog = [], browserRequests = [], lifecycleFailures = [];
 function passed(message) { testLog.push('PASS: ' + message); console.log('PASS: ' + message); }
 let downloadComplete;
 const downloadFinished = new Promise(resolve => { downloadComplete = resolve; });
 const version = await (await fetch('http://127.0.0.1:9333/json/version', { signal: AbortSignal.timeout(5000) })).json();
 const ws = new WebSocket(version.webSocketDebuggerUrl);
 await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
-let seq = 0, browserContextId; const pending = new Map(), errors = [], targets = [];
+let seq = 0, browserContextId; const extraContexts = []; const pending = new Map(), errors = [], targets = [];
 ws.onmessage = event => {
   const msg = JSON.parse(event.data);
   if (msg.method === 'Browser.downloadProgress' && msg.params.state === 'completed') downloadComplete();
   if (msg.method === 'Fetch.requestPaused') {
     const url = new URL(msg.params.request.url);
+    const request = msg.params.request;
+    browserRequests.push({ path: url.pathname, method: request.method, ...(url.pathname === '/api/lessons' && request.postData ? { includeAudio: JSON.parse(request.postData).includeAudio } : {}) });
     const allowed = ['about:', 'data:', 'blob:', 'file:'].includes(url.protocol) || ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
     if (!allowed) errors.push('Blocked unexpected non-loopback browser request');
     void call(allowed ? 'Fetch.continueRequest' : 'Fetch.failRequest', { requestId: msg.params.requestId, ...(allowed ? {} : { errorReason: 'BlockedByClient' }) }, msg.sessionId).catch(() => {});
@@ -46,7 +49,14 @@ async function consent(session) {
   assert.equal(await evaluate(session, 'document.getElementById("confirm-accept").disabled'), true, 'Paid acceptance is disabled until consent');
   await evaluate(session, 'document.getElementById("confirm-consent").click();document.getElementById("confirm-accept").click()');
 }
+async function exactConsent(session, accept = true) {
+  await wait(session, 'document.getElementById("confirm-dialog").open && /complete English audio/.test(document.getElementById("confirm-title").textContent)');
+  assert.match(await evaluate(session, 'document.getElementById("confirm-description").textContent'), /\d+ unique clips exactly/);
+  await evaluate(session, accept ? 'if(!document.getElementById("confirm-consent").closest("[hidden]"))document.getElementById("confirm-consent").click();document.getElementById("confirm-accept").click()' : 'document.getElementById("confirm-cancel").click()');
+}
 async function created(session) {
+  await wait(session, 'document.getElementById("confirm-dialog").open || !document.getElementById("generate-button").disabled');
+  if (await evaluate(session, 'document.getElementById("confirm-dialog").open')) await exactConsent(session);
   await wait(session, 'document.getElementById("preview-loading").hidden && (!document.getElementById("preview-result").hidden || !document.getElementById("preview-error").hidden) && !document.getElementById("generate-button").disabled');
   assert.equal(await evaluate(session, 'document.getElementById("preview-error").hidden'), true, await evaluate(session, 'document.getElementById("preview-error-message").textContent'));
 }
@@ -56,17 +66,64 @@ async function attachments(session, count) {
 }
 async function shot(session, name) { await call('Page.bringToFront', {}, session); const { data } = await call('Page.captureScreenshot', { format: 'png' }, session); await writeFile(resolve('artifacts', name), Buffer.from(data, 'base64')); }
 async function upload(session, selector, files) { const { root } = await call('DOM.getDocument', {}, session); const { nodeId } = await call('DOM.querySelector', { nodeId: root.nodeId, selector }, session); await call('DOM.setFileInputFiles', { nodeId, files: files.map(file => resolve(file)) }, session); }
+async function gesture(session, expression) {
+  const result = await call('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true }, session);
+  if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text);
+  return result.result.value;
+}
+async function verifyFullPlayer(session, { synthetic = false } = {}) {
+  await call('Page.bringToFront', {}, session);
+  assert.equal(await evaluate(session, 'document.querySelectorAll("#course-player").length'), 1);
+  assert.equal(await evaluate(session, 'document.getElementById("course-player").hasAttribute("src")'), false, 'No initial autoplay/source');
+  assert.equal(await evaluate(session, '[...document.querySelectorAll("*")].some(n=>[...n.attributes].some(a=>/^on/i.test(a.name)))'), false, 'No injected handler attributes');
+  assert.ok(await evaluate(session, '[...document.querySelectorAll("details")].some(d=>/answer/i.test(d.querySelector("summary")?.textContent)&&d.querySelector("[data-audio-unit]")&&!d.open)'), 'Answer controls are concealed in closed details');
+  for (const speed of [1, .75, .5]) {
+    await gesture(session, `document.querySelector('[data-speed="${speed}"]').click();document.querySelector('.word-play:not(:disabled)').click()`);
+    await wait(session, 'document.getElementById("course-player").currentTime > .05');
+    assert.equal(await evaluate(session, 'document.getElementById("course-player").playbackRate'), speed);
+    assert.ok(await evaluate(session, 'document.getElementById("course-player").duration > 0'));
+    await evaluate(session, 'document.getElementById("audio-stop").click()');
+    assert.equal(await evaluate(session, 'document.getElementById("course-player").paused && !document.getElementById("course-player").hasAttribute("src")'), true);
+  }
+  for (const repeat of [1, 3, 5]) {
+    await gesture(session, `document.querySelector('[data-speed="1"]').click();document.querySelector('[data-repeat="${repeat}"]').click();document.querySelector('.word-play:not(:disabled)').click()`);
+    await wait(session, `document.getElementById('audio-status').textContent === 'Playing 1 / ${repeat}.'`);
+    if (repeat > 1) await wait(session, `document.getElementById('audio-status').textContent === 'Playing 2 / ${repeat}.'`, 30000);
+    if (synthetic) await wait(session, 'document.getElementById("audio-status").textContent === "Finished."', 30000);
+    await evaluate(session, 'document.getElementById("audio-stop").click()');
+  }
+  await gesture(session, `document.querySelector('[data-repeat="5"]').click();document.querySelector('.sentence-play:not(:disabled)').click();document.querySelector('[data-repeat="1"]').click();document.querySelector('.word-play:not(:disabled)').click()`);
+  assert.equal(await evaluate(session, 'document.getElementById("audio-status").textContent'), 'Playing 1 / 1.', 'Rapid new click cancels old repeated sentence queue');
+  await evaluate(session, 'document.getElementById("audio-stop").click()');
+  if (synthetic) {
+    const pieces = await gesture(session, `(()=>{const b=[...document.querySelectorAll('.sentence-play')].find(b=>b.dataset.clips.split(' ').length>1);if(!b)throw Error('Long sentence missing');for(let p=b.parentElement;p;p=p.parentElement)if(p.tagName==='DETAILS')p.open=true;b.click();return b.dataset.clips.split(' ').length})()`);
+    assert.ok(pieces > 1, '>500-character sentence split into sequenced clips');
+    await wait(session, `document.getElementById('audio-status').textContent === 'Playing 2 / ${pieces}.'`, 10000);
+    await wait(session, 'document.getElementById("audio-status").textContent === "Finished."', 20000);
+  }
+  await gesture(session, `(()=>{const d=[...document.querySelectorAll('details')].find(d=>/answer/i.test(d.querySelector('summary')?.textContent)&&d.querySelector('.word-play:not(:disabled)'));d.open=true;d.querySelector('.word-play:not(:disabled)').click()})()`);
+  await wait(session, 'document.getElementById("course-player").currentTime > .05');
+  await evaluate(session, 'document.querySelector("[aria-current=true]").closest("details").open=false');
+  await wait(session, 'document.getElementById("course-player").paused && !document.getElementById("course-player").hasAttribute("src")');
+  await call('Emulation.setDeviceMetricsOverride', { width: 320, height: 700, deviceScaleFactor: 1, mobile: true }, session);
+  assert.equal(await evaluate(session, 'document.documentElement.scrollWidth <= innerWidth'), true, 'Full offline course fits 320px');
+  assert.deepEqual(await evaluate(session, 'performance.getEntriesByType("resource").filter(r=>/^https?:/.test(r.name)).map(r=>r.name)'), []);
+  passed('full offline player: actual MP3 decode/playback, single player, speeds, natural ended repeat progression, Stop/rapid replacement, hidden answers/collapse, long sentence pieces and 320px');
+}
 const provider = createQAProvider(), kokoro = createQAProvider(), gated = createApp({ publicDirectory, accessPassword: 'test-private-beta-password' }).server;
 let app;
 try {
   const providerOrigin = await listen(provider.server), kokoroOrigin = await listen(kokoro.server);
-  app = createApp({ publicDirectory, kokoroBaseUrl: kokoroOrigin + '/v1', kokoroBuiltin: true, kokoroFormat: 'wav', kokoroLanguages: ['en'] }).server;
+  // Synthetic codec fixture: encode the existing one-second tone once using cached OFFLINE tools.
+  // Native synthesis/encoding is separately verified; this suite tests browser lifecycle/codec controls.
+  const fixtureMP3 = await (await prepareAudioEncoder())({ buffer: wav, mime: 'audio/wav' });
+  app = createApp({ publicDirectory, audioEncoderFactory: async () => async () => fixtureMP3, kokoroBaseUrl: kokoroOrigin + '/v1', kokoroBuiltin: true, kokoroFormat: 'wav', kokoroLanguages: ['en'] }).server;
   const origin = await listen(app), gatedOrigin = await listen(gated);
   ({ browserContextId } = await call('Target.createBrowserContext'));
   await mkdir('artifacts', { recursive: true });
   await writeFile('artifacts/test-screenshot.png', Buffer.from(probeImage().dataUrl.split(',')[1], 'base64'));
   await writeFile('artifacts/test-audio.wav', wav);
-  await writeFile('artifacts/test-notes.md', 'A short Markdown source file.');
+  await writeFile('artifacts/test-notes.md', sourceText + '\n' + longSentence);
   const downloads = resolve('artifacts', 'downloads-' + Date.now());
   await mkdir(downloads);
   await call('Browser.setDownloadBehavior', { behavior: 'allow', browserContextId, downloadPath: downloads, eventsEnabled: true });
@@ -148,6 +205,8 @@ try {
   await evaluate(s, 'document.getElementById("lesson-form").requestSubmit()');
   await consent(s);
   await created(s);
+  assert.ok(browserRequests.some(r=>r.path==='/api/audio/preflight' && r.method==='POST'));
+  assert.ok(browserRequests.filter(r=>r.path==='/api/lessons' && r.method==='POST').every(r=>r.includeAudio === false), 'Teaching endpoint receives includeAudio:false');
   assert.ok(provider.calls.slice(beforeUpload).some(c=>c.kind==='transcription'), 'Attached WAV transcribed only after creation consent');
   assert.ok(provider.calls.slice(beforeUpload).filter(c=>c.kind==='digest').length >= 3, 'Every material enters paid digest preparation');
   assert.ok(provider.calls.slice(beforeUpload).filter(c=>['lesson','digest'].includes(c.kind)).every(c=>c.body.model==='test/vision'), 'Primary role handles sources and final lesson');
@@ -155,10 +214,34 @@ try {
   passed('unified image/Markdown/WAV input; no upload/local-preparation calls; cancelled consent sends nothing; role-routed paid creation');
   assert.match(await evaluate(s, 'document.getElementById("download-lesson").href'), /^blob:/);
   const html = await evaluate(s, 'document.getElementById("lesson-frame").srcdoc');
-  assert.match(html, /data:audio\/wav;base64/);
+  assert.match(html, /data:audio\/mpeg;base64/);
+  for (const tail of ['Original text final sentinel survives.', 'Screenshot final sentinel survives.', 'The recording final sentinel survives.', 'long sentence final sentinel.']) assert.ok(await evaluate(s, `new DOMParser().parseFromString(document.getElementById('lesson-frame').srcdoc,'text/html').body.textContent.includes(${JSON.stringify(tail)})`), 'Full export retains original source tail: ' + tail);
+  assert.ok(provider.calls.slice(beforeUpload).filter(c => c.kind === 'speech').length > 8, 'Full inventory exceeds legacy eight clips');
+  assert.equal(provider.calls.slice(beforeUpload).filter(c => c.kind === 'audio-extract').length, 1, 'Original screenshot extracted once by primary role');
+  assert.doesNotMatch(html, /\son(?:click|error|load)\s*=/i, 'No inline executable handlers');
   assert.match(html, /data:image\/png;base64/);
   assert.doesNotMatch(html, /src="https?:/);
   assert.doesNotMatch(html, /<script>window\.__learnlensExportInjection=true<\/script>/, 'Provider text cannot inject executable export markup');
+  // Exercise the shipped script in the opaque sandbox under the parent's full-audio CSP hash.
+  await wait(s, 'document.getElementById("lesson-frame").srcdoc.includes("course-player")');
+  await call('Page.bringToFront', {}, s);
+  const fullTree = await call('Page.getFrameTree', {}, s);
+  let sandboxSession = s, sandboxContext;
+  if (fullTree.frameTree.childFrames?.[0]?.frame) {
+    sandboxContext = (await call('Page.createIsolatedWorld', { frameId: fullTree.frameTree.childFrames[0].frame.id, worldName: 'full-audio-qa' }, s)).executionContextId;
+  } else {
+    const { targetInfos } = await call('Target.getTargets');
+    const iframe = targetInfos.find(t => t.type === 'iframe' && t.browserContextId === browserContextId);
+    assert.ok(iframe, 'Full audio sandbox target exists');
+    sandboxSession = (await call('Target.attachToTarget', { targetId: iframe.targetId, flatten: true })).sessionId;
+  }
+  await wait(sandboxSession, '!!document.getElementById("course-player")', 15000, sandboxContext);
+  assert.equal(await evaluate(sandboxSession, '(function(){try{return Boolean(parent.document.body)}catch{return false}})()', sandboxContext), false);
+  await call('Runtime.evaluate', { expression: 'document.querySelector(".word-play:not(:disabled)").click()', userGesture: true, contextId: sandboxContext }, sandboxSession);
+  await wait(sandboxSession, 'document.getElementById("course-player").currentTime > .05', 15000, sandboxContext);
+  await evaluate(sandboxSession, 'document.getElementById("audio-stop").click()', sandboxContext);
+  if (sandboxSession !== s) await call('Target.detachFromTarget', { sessionId: sandboxSession });
+  passed('full-audio sandbox actual script plays MP3 under parent full hash; parent DOM remains inaccessible');
   await call('Runtime.evaluate', { expression: 'document.getElementById("download-lesson").click()', userGesture: true }, s);
   const downloadedPath = resolve(downloads, 'LearnLens-Browser-integration-test.html');
   let downloadTimer;
@@ -168,6 +251,7 @@ try {
   assert.equal(downloaded, html, 'Actual browser download matches the preview document');
   await writeFile('artifacts/browser-export.html', downloaded);
   await shot(s, 'app-generated.png');
+  await shot(s, 'app-full-audio.png');
   assert.ok(provider.calls.some(c => c.path === '/v1/audio/speech'), 'Online speech method used');
   await evaluate(s, 'document.querySelector("[data-page=providers]").click();document.getElementById("role-speech-engine").value="kokoro";document.getElementById("role-speech-engine").dispatchEvent(new Event("change"));document.getElementById("roles-form").requestSubmit()');
   await wait(s, 'document.getElementById("role-speech-engine").value === "kokoro" && !document.getElementById("roles-fields").disabled');
@@ -182,6 +266,8 @@ try {
   await created(s);
   assert.ok(kokoro.calls.some(c => c.body?.model === 'kokoro' && c.body.voice === 'af_heart'));
   assert.equal(provider.calls.filter(c => c.path === '/v1/audio/speech').length, beforeCloud, 'Kokoro never silently calls cloud speech');
+  // The rest of the legacy import suite exercises text-only creation; full-audio recovery is separate below.
+  await evaluate(s, 'document.getElementById("include-audio").checked=false;document.getElementById("include-audio").dispatchEvent(new Event("input"))');
   await call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true }, s);
   await evaluate(s, 'document.getElementById("tab-compose").click();scrollTo(0,0)');
   assert.equal(await evaluate(s, 'document.documentElement.scrollWidth <= innerWidth'), true, 'mobile horizontal overflow');
@@ -408,6 +494,93 @@ try {
   await wait(nativeTab, '!document.getElementById("preview-result").hidden');
   provider.config.failKind = null;
   passed('explicit Gemini-native STT selector; scoped verification/cache; cancelled and renewed consent; unchanged primary; inline WAV; thought exclusion; safe failure without replay; prior lesson/draft preserved; 320px layout');
+  // Focused complete-audio recovery uses its own draft, before shared-hostname gated logout.
+  const originalContext = browserContextId;
+  ({ browserContextId } = await call('Target.createBrowserContext')); extraContexts.push(browserContextId);
+  const full = await tab(origin);
+  browserContextId = originalContext;
+  await wait(full, 'document.getElementById("setup-label")?.textContent === "Connect your AI"');
+  await evaluate(full, `document.querySelector('[data-page="providers"]').click();document.getElementById('provider-name').value='Full audio QA';document.getElementById('provider-url').value=${JSON.stringify(providerOrigin+'/v1')};document.getElementById('provider-form').requestSubmit()`);
+  await wait(full, '!!document.querySelector(".provider-name")');
+  await evaluate(full, 'document.querySelector(".discover-button").click()');
+  await wait(full, 'document.querySelector(".provider-model-count")?.textContent === "4 listed models"');
+  await evaluate(full, `for(const [role,model] of [['primary','test/vision'],['transcription','test/transcribe']]){const p=document.getElementById('role-'+role+'-provider');p.selectedIndex=1;p.dispatchEvent(new Event('change'));const m=document.getElementById('role-'+role+'-model');m.value=model;m.dispatchEvent(new Event('change'))}document.getElementById('roles-form').requestSubmit()`);
+  await wait(full, 'document.getElementById("setup-count")?.textContent === "3/3" && !document.getElementById("roles-fields").disabled');
+  await evaluate(full, 'document.querySelector("[data-page=lesson]").click()');
+  await evaluate(full, 'document.querySelector("[data-action=demo]").click()'); await created(full);
+  const priorFull = await evaluate(full, 'document.getElementById("lesson-frame").srcdoc');
+  await evaluate(full, 'document.getElementById("tab-compose").click();document.getElementById("include-audio").checked=true;document.getElementById("include-audio").dispatchEvent(new Event("input"))');
+  await upload(full, '#material-input', ['artifacts/test-notes.md', 'artifacts/test-screenshot.png', 'artifacts/test-audio.wav']); await attachments(full, 3);
+  const beforeFull = provider.calls.length, beforeFullSpeech = kokoro.calls.filter(c=>c.kind==='speech').length;
+  await evaluate(full, 'document.getElementById("lesson-form").requestSubmit()'); await consent(full); await exactConsent(full, false); await created(full);
+  assert.equal(kokoro.calls.filter(c=>c.kind==='speech').length, beforeFullSpeech, 'Exact-count cancellation dispatches no TTS');
+  const retainedText = await evaluate(full, 'document.getElementById("lesson-frame").srcdoc');
+  assert.notEqual(retainedText, priorFull);
+  await evaluate(full, 'document.getElementById("switch-previous").click()');
+  assert.equal(await evaluate(full, 'document.getElementById("lesson-frame").srcdoc'), priorFull);
+  await evaluate(full, 'document.getElementById("switch-previous").click()');
+  assert.equal(await evaluate(full, 'document.getElementById("lesson-frame").srcdoc'), retainedText);
+  const preparedFull = provider.calls.length;
+  const resumeFull = async () => {
+    await evaluate(full, 'document.getElementById("continue-audio").click()');
+    await wait(full, 'document.getElementById("confirm-dialog").open');
+    assert.match(await evaluate(full, 'document.getElementById("confirm-title").textContent'), /Resume this retained/);
+    await evaluate(full, 'document.getElementById("confirm-accept").click()');
+    await exactConsent(full);
+    await wait(full, '!document.getElementById("generate-button").disabled');
+  };
+  kokoro.config.failAfter = beforeFullSpeech + 2;
+  await resumeFull();
+  assert.equal(provider.calls.length, preparedFull, 'Resume never re-runs primary/OCR/STT');
+  assert.equal(kokoro.calls.filter(c=>c.kind==='speech').length, beforeFullSpeech + 3, 'Two clips complete, third fails once; no automatic retry');
+  assert.match(await evaluate(full, 'document.getElementById("audio-count").textContent'), /^2\/\d+.*partial/);
+  const partial = await evaluate(full, 'document.getElementById("lesson-frame").srcdoc');
+  assert.match(partial, /data:audio\/mpeg;base64/); assert.match(partial, /Incomplete/);
+  await writeFile('artifacts/browser-partial-audio.html', partial);
+  const diagnostics = await evaluate(full, 'document.getElementById("diagnostic-report").textContent');
+  assert.doesNotMatch(diagnostics, /Original text|Screenshot final|Newton|test-notes|test-screenshot|test-audio|data:audio|Bearer|"(?:requestBody|responseBody|filename|sourceText)"/);
+  assert.deepEqual(JSON.parse(diagnostics).lastOperation.input, { clips: 1 }, 'Diagnostic input is counts only, never provider request body');
+  assert.equal(JSON.parse(diagnostics).lastOperation.responseBodyOmitted, true);
+  const totalFull = Number((await evaluate(full, 'document.getElementById("audio-count").textContent')).match(/\/(\d+)/)[1]);
+  kokoro.config.failAfter = null;
+  await resumeFull();
+  assert.equal(kokoro.calls.filter(c=>c.kind==='speech').length, beforeFullSpeech + totalFull + 1, 'Explicit resume reuses both completed clips and only retries remaining');
+  assert.equal(provider.calls.length, preparedFull, 'Recovery never repeats source/teaching calls');
+  assert.match(await evaluate(full, 'document.getElementById("audio-count").textContent'), new RegExp('^'+totalFull+'/'+totalFull+'.*complete'));
+  assert.ok(provider.calls.slice(beforeFull, preparedFull).some(c=>c.kind==='audio-extract'));
+  passed('full audio: exact-count cancellation retains new text and previous lesson; two-step resume; mid-batch 500 partial export without auto-retry; completed clips reused; no teaching/OCR/STT replay or diagnostic source leakage');
+  // Stop an in-flight speech request. A renewed explicit continuation polls GET status,
+  // not a blind POST replay, while the original delayed provider operation finishes.
+  kokoro.config.speechDelay = 5000;
+  const stopSpeechBefore = kokoro.calls.filter(c=>c.kind==='speech').length;
+  await evaluate(full, 'document.getElementById("tab-compose").click();document.getElementById("lesson-form").requestSubmit()');
+  await consent(full); await exactConsent(full);
+  const waitLocal = async predicate => { const start=Date.now(); while(!predicate()){ if(Date.now()-start>15000)throw Error('Local fixture condition timed out');await new Promise(r=>setTimeout(r,40)); } };
+  await waitLocal(()=>kokoro.calls.filter(c=>c.kind==='speech').length===stopSpeechBefore+1);
+  kokoro.config.speechDelay = 0;
+  await evaluate(full, 'document.getElementById("stop-audio").click()');
+  await wait(full, '!document.getElementById("generate-button").disabled');
+  assert.equal(kokoro.calls.filter(c=>c.kind==='speech').length, stopSpeechBefore+1);
+  const stoppedRequests = browserRequests.length, stoppedPreparation = provider.calls.length;
+  await evaluate(full, 'document.getElementById("continue-audio").click()');
+  await wait(full, 'document.getElementById("confirm-dialog").open');
+  await evaluate(full, 'document.getElementById("confirm-accept").click()');
+  await wait(full, 'document.getElementById("confirm-dialog").open || !document.getElementById("generate-button").disabled');
+  if (!await evaluate(full, 'document.getElementById("confirm-dialog").open')) {
+    const notice = await evaluate(full, 'document.getElementById("audio-message").textContent');
+    const failure = 'Immediate Stop/Continue cannot reach exact-count consent or GET clip polling: ' + notice;
+    lifecycleFailures.push(failure); testLog.push('FAIL: ' + failure);
+    await writeFile('artifacts/full-audio-stop-failure.json', JSON.stringify({ notice, requests: browserRequests.slice(stoppedRequests) }, null, 2));
+    await shot(full, 'app-full-audio-stop-failure.png');
+  } else {
+    await exactConsent(full);
+    await waitLocal(()=>browserRequests.slice(stoppedRequests).some(r=>r.method==='GET' && /\/clips\//.test(r.path)));
+    assert.equal(browserRequests.slice(stoppedRequests).filter(r=>r.method==='POST' && /\/clips\//.test(r.path)).length, 0, 'Unknown in-flight operation is GET-polled, never automatically replayed');
+    await wait(full, '!document.getElementById("generate-button").disabled');
+    assert.equal(provider.calls.length, stoppedPreparation);
+    assert.equal(kokoro.calls.filter(c=>c.kind==='speech').length, stopSpeechBefore+totalFull, 'Stop/resume completes each clip exactly once');
+    passed('Stop retains text; renewed consent resolves unknown in-flight speech with GET-only polling and no POST replay');
+  }
   const login = await tab(gatedOrigin);
   await wait(login, 'document.getElementById("login-panel")?.hidden === false');
   await evaluate(login, 'document.getElementById("access-password").value="test-private-beta-password";document.getElementById("login-form").requestSubmit()');
@@ -423,20 +596,17 @@ try {
   await wait(offline, '!!document.querySelector("[data-speed]")');
   assert.equal(await evaluate(offline, 'Boolean(window.__learnlensExportInjection)'), false, 'Direct offline HTML does not execute provider-supplied scripts');
   assert.ok(await evaluate(offline, 'document.body.textContent.includes("<script>window.__learnlensExportInjection=true</script>")'), 'Provider markup is rendered as inert text');
-  for (const speed of [1, 0.75, 0.5]) {
-    await evaluate(offline, `document.querySelector('[data-speed="${speed}"]').click();document.querySelector('audio').load()`);
-    await wait(offline, 'document.querySelector("audio").readyState >= 1');
-    assert.equal(await evaluate(offline, 'document.querySelector("audio").playbackRate'), speed, 'Offline playback rate survives media reload');
-  }
-  await evaluate(offline, `document.querySelector('[data-speed="0.5"]').click();document.querySelector('summary').click();document.querySelector('audio').load()`);
-  assert.equal(await evaluate(offline, 'document.querySelector("audio").playbackRate'), 0.5);
-  assert.equal(await evaluate(offline, 'document.querySelector("details").open'), true);
-  await wait(offline, 'document.querySelector("audio").readyState >= 1');
-  assert.equal(await evaluate(offline, 'document.querySelector("audio").duration'), 1);
-  assert.deepEqual(await evaluate(offline, 'performance.getEntriesByType("resource").filter(r=>/^https?:/.test(r.name)).map(r=>r.name)'), []);
-  const playing = await call('Runtime.evaluate', { expression: 'document.querySelector("audio").play().then(()=>true)', awaitPromise: true, returnByValue: true, userGesture: true }, offline);
-  assert.equal(playing.result.value, true, 'Offline audio starts playback');
-  await wait(offline, 'document.querySelector("audio").currentTime > 0.1');
+  await verifyFullPlayer(offline, { synthetic: true });
+  await shot(offline, 'offline-full-audio.png');
+  if (process.env.LEARNLENS_NATIVE_FULL_AUDIO_LESSON) {
+    const nativeFullPath = resolve(process.env.LEARNLENS_NATIVE_FULL_AUDIO_LESSON);
+    assert.match(await readFile(nativeFullPath, 'utf8'), /data:audio\/mpeg;base64,/);
+    await call('Page.navigate', { url: pathToFileURL(nativeFullPath).href }, offline);
+    await wait(offline, '!!document.getElementById("course-player")');
+    await verifyFullPlayer(offline);
+    await shot(offline, 'native-offline-full-audio.png');
+    passed('real native full MP3 export decoded and played offline with controls');
+  } else passed('optional real-native full export not supplied; synthetic MP3 fixture is not native voice verification');
   if (process.env.LEARNLENS_NATIVE_LESSON) {
     const nativePath = resolve(process.env.LEARNLENS_NATIVE_LESSON);
     assert.match(await readFile(nativePath, 'utf8'), /data:audio\/wav;base64,/);
@@ -461,14 +631,16 @@ try {
   }
   passed('gated login/logout; direct offline HTML script escaping, actual audio playback, 1×/0.75×/0.5× rates and revealable answers with no HTTP(S) resources');
   assert.deepEqual(errors.filter(error => !/Failed to load resource:.*502/.test(error)), [], 'Unexpected browser console/CSP errors');
+  assert.deepEqual(lifecycleFailures, [], 'Full audio lifecycle failures (recorded while allowing offline/native checks to finish)');
   passed('1440/390/320px layouts; sandbox; discovery/roles/consented probe; unified imports; generation/failure recovery; actual download; OpenAI preset; consented model advisor + thinking controls; online/Kokoro speech routing; password gate; offline audio playback/speed/answers.');
 } catch (error) {
   testLog.push('FAIL: ' + error.message);
   throw error;
 } finally {
   await writeFile(resolve('artifacts/browser-smoke.log'), testLog.join('\n') + '\n');
+  await writeFile(resolve('artifacts/full-audio-browser.log'), testLog.join('\n') + '\n');
   for (const targetId of targets) await call('Target.closeTarget', { targetId }).catch(() => {});
-  if (browserContextId) await call('Target.disposeBrowserContext', { browserContextId });
+  for (const context of [browserContextId, ...extraContexts].filter(Boolean)) await call('Target.disposeBrowserContext', { browserContextId: context });
   ws.close();
   await Promise.all([app, provider.server, kokoro.server, gated].filter(Boolean).map(close));
 }

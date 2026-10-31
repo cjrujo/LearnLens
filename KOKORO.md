@@ -4,14 +4,14 @@
 
 ## Normal startup
 
-Requires Node 22.9+ and project dependencies:
+Requires Node 22.13+ and project dependencies:
 
 ```sh
 npm ci
 npm start
 ```
 
-The first start prepares a pinned Q8 model (about 92 MB) in `.cache/speech/`, verifies every model/tokenizer file with SHA-256, loads the installed voices/phonemizer, and synthesizes a warmup before starting the app. npm dependencies take additional space/downloads. No Python, GPU, FFmpeg or system-wide eSpeak installation is needed. Some clean Windows systems may need Microsoft's official VC++ runtime for the native ONNX binary; see [WINDOWS.md](WINDOWS.md).
+The first start prepares a pinned Q8 model (about 92 MB) in `.cache/speech/`, verifies every model/tokenizer file with SHA-256, loads the installed voices/phonemizer, and synthesizes a warmup before starting the app. npm dependencies take additional space/downloads. No Python, GPU or system-wide FFmpeg/eSpeak installation is needed. Complete-audio export automatically prepares the project-managed FFmpeg encoder; the native speech adapter itself still returns WAV. Some clean Windows systems may need Microsoft's official VC++ runtime for the native ONNX binary; see [WINDOWS.md](WINDOWS.md).
 
 To prepare the cache separately:
 
@@ -26,12 +26,13 @@ See [WINDOWS.md](WINDOWS.md) and [VPS.md](VPS.md) for complete startup, tmux and
 ## Learner experience and language limits
 
 1. Connect a primary lesson model for understanding your material.
-2. Enable **Add spoken examples**. Built-in speech is already selected.
-3. Listen or download the HTML. Successful audio is embedded and works offline at 1×, 0.75× and 0.5×.
+2. Enable **Complete English audio**. Built-in speech is already selected. Full extracted sources and generated lesson fields are inventoried separately from summaries.
+3. Review the exact unique clip count after the text lesson is retained, then confirm speech. Stop/resume preserves completed clips without repeating teaching.
+4. Click words/sentences, repeat or stop playback; download the complete or clearly partial HTML. Embedded audio works offline at 1×, 0.75× and 0.5×. See [FULL-AUDIO.md](FULL-AUDIO.md).
 
-**The native JavaScript engine currently supports English US/UK voices only.** Default: `af_heart`; alternatives include `af_bella`, `am_michael` and `bf_emma`. Voice support comes from the pinned package; only specifically tested voices should be considered verified. This is not a claim that other languages are supported merely because the underlying Kokoro model has multilingual variants. Choose an online speech provider for non-English narration. Unsupported voices/scripts fail visibly; Latin-script non-English text cannot always be detected, so choose appropriately.
+**The native JavaScript engine currently supports English US/UK voices only.** Default: `af_heart`; alternatives include `af_bella`, `am_michael` and `bf_emma`. Voice support comes from the pinned package; only specifically tested voices should be considered verified. This is not a claim that other languages are supported merely because the underlying Kokoro model has multilingual variants. A compatible online provider can support other languages through the legacy speech interface, but the current complete-audio inventory targets English/Latin-script text; it does not automatically become multilingual. Unsupported voices/scripts fail visibly; Latin-script non-English text cannot always be detected, so choose appropriately.
 
-Native audio is **24 kHz mono PCM WAV**, avoiding an FFmpeg/MP3 encoder dependency. WAV files are larger than MP3; the existing export/audio limits still apply. Online providers and the optional Python container retain their MP3 request behavior. Long native input is split instead of silently truncating narration.
+Native audio is **24 kHz mono PCM WAV** at the worker boundary. Complete-mode plans encode it locally to **24 kHz mono 48 kbps MP3** using managed FFmpeg and fully decode the result for validation. This avoids the old WAV packaging bottleneck without claiming unlimited resources. Long targets are automatically split, and all pieces are kept. Container/online speech is also validated and encoded by this complete-mode path; legacy direct API calls retain their earlier sample behavior.
 
 A speech failure preserves the text lesson with a warning. There is **no automatic switch to paid online speech**. Clear-session restores the included default; learners can still explicitly disable speech or select online speech.
 
@@ -39,7 +40,7 @@ A speech failure preserves the text lesson with a warning. There is **no automat
 
 - One managed child process, CPU inference serialized through a bounded queue; main app remains responsive.
 - Speech binds an ephemeral **127.0.0.1** port and requires a random internal token. It is not a public speech API.
-- Host passwords, cloud provider keys and `NODE_OPTIONS` are not inherited by that worker. No user text/audio is cached or logged by LearnLens's speech adapter.
+- Host passwords, cloud provider keys and `NODE_OPTIONS` are not inherited by that worker. The adapter does not log narration. The application separately retains private temporary source descriptors and audio clips for session-only continuation; see [FULL-AUDIO.md](FULL-AUDIO.md).
 - Readiness is reported through parent/child IPC only after real warmup, not by trusting an arbitrary process already listening on a fixed port.
 - Ctrl+C stops the app and worker. A killed parent disconnects IPC and terminates the worker. An unexpected worker exit closes the app; it does not keep advertising a dead service.
 - The native adapter has no CORS, browser/player, model upload, cloning, tuning, SSML or filesystem-serving endpoints. Never expose its port through a firewall/proxy.
@@ -63,6 +64,6 @@ The existing Dockerfile still bundles Kokoro-FastAPI CPU v0.9.1 and Node. It use
 
 ## Verification and licensing
 
-`npm test` uses fixtures; `npm run test:native` exercises real native Kokoro with a cached model and a loopback, hand-authored lesson fixture (no cloud model or paid API). It saves `artifacts/native-offline-lesson.html` and `artifacts/native-speech.wav`. The native CI workflow tests Windows/Linux; Linux additionally runs the full smoke test inside a network namespace without external networking. See [TESTING.md](TESTING.md) for recorded outcomes and limitations.
+`npm test` uses fixtures; `npm run test:native` exercises real native Kokoro with a cached model and a loopback, hand-authored lesson fixture (no cloud model or paid API). It saves `artifacts/native-offline-lesson.html` and `artifacts/native-speech.wav`. `npm run test:audio-native` additionally exercises the real source/generated word/sentence plan and managed MP3 encoder, writing `artifacts/native-full-audio-lesson.html`. The native CI workflow tests Windows/Linux; Linux additionally runs the full smoke test inside a network namespace without external networking. See [TESTING.md](TESTING.md) for recorded outcomes and limitations.
 
 Pinned model: [onnx-community/Kokoro-82M-v1.0-ONNX](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/tree/1939ad2a8e416c0acfeecc08a694d14ef25f2231). Runtime: [kokoro-js](https://github.com/hexgrad/kokoro/tree/664c76a704021239ba59c84dcbaa4d3dece01fe9/kokoro.js), Transformers.js and ONNX Runtime. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), including embedded eSpeak licensing/provenance caveats before redistributing binaries.

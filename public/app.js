@@ -1,4 +1,5 @@
 import { MaterialWorkspace } from './materials.js';
+import { createAudioContext, prepareAudioPlan, generateAudioClips, exportAudioPlan, audioExportable, audioPath, RETRYABLE_AUDIO, lessonRetentionBlocker, retainLesson, releaseAudioSnapshots, discardAudioContext, unfinishedAudio } from './audio-client.js';
 
 const $ = id => document.getElementById(id);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -7,12 +8,14 @@ const EMPTY = { primary: null, transcription: null, speech: null };
 let state = { providers: [], roles: { ...EMPTY }, locked: false };
 let ready = false, busy = false, settingsBusy = false, page = 'lesson';
 let currentLesson = null, downloadUrl = '', lastRequest = null, clock = null;
+const lessonHistory = [];
+let activeAudio = null;
 let roleDrafts = { ...EMPTY }, roleViews = {};
 let editingProviderId = null, recommendations = null;
 let recording = null, micStream = null, recordTimer = null, micPending = false;
 let sessionEpoch = 0, confirming = false, generationController = null;
 const materials = new MaterialWorkspace({ list: $('material-list'), api, changed: () => updateStatus() });
-function cancelWork(session = false) { sessionEpoch++; generationController?.abort(); materials.cancelPending({ session }); }
+function cancelWork(session = false) { sessionEpoch++; generationController?.abort(); materials.cancelPending({ session }); if (session) for (const lesson of lessonHistory) if (lesson.audio) { lesson.audio.unavailable = true; lesson.audio.notice = 'Session changed. Retained HTML is available, but this audio plan cannot resume.'; } }
 let toastTimer;
 
 function element(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; }
@@ -43,8 +46,8 @@ tracePanel.append(traceTitle, traceStatus, traceHint, traceOutput, traceCopy,
   element('p', 'Current attempt only; up to 520 operations. Keys, request/response bodies, instructions and filenames are not collected. Provider/model labels are included—review before sharing. Reloading clears this report and the in-page preparation cache.', 'field-hint'));
 $('preview-error').after(tracePanel);
 traceStatus.style.overflowWrap = 'anywhere';
-const stageLabel = value => ({ transcription: 'Transcribing audio', source_preparation: 'Preparing source notes', lesson_generation: 'Generating final lesson' }[value] || value);
-const traceStages = { '/transcribe': 'Transcribing audio', '/materials/summarize': 'Preparing source notes', '/lessons': 'Generating final lesson' };
+const stageLabel = value => ({ transcription: 'Transcribing audio', source_preparation: 'Preparing source notes', lesson_generation: 'Generating final lesson', source_recognition: 'Recognizing source text', speech_generation: 'Generating English audio' }[value] || value);
+const traceStages = { '/transcribe': 'Transcribing audio', '/materials/summarize': 'Preparing source notes', '/lessons': 'Generating final lesson', '/audio/extract': 'source_recognition' };
 function renderTrace() {
   if (!lessonTrace) return;
   const { roles, providers, part, ...report } = lessonTrace;
@@ -54,7 +57,7 @@ function renderTrace() {
   traceHint.textContent = last?.providerCode === 'convert_request_failed'
     ? 'The gateway reported request conversion failure. Check its support for the selected endpoint/model, images/audio and thinking level. Give gateway support the provider request ID, if shown. This is not proof your files are invalid.'
     : last?.upstreamStatus >= 500 ? 'The upstream service returned a server error. This alone does not identify the cause. Check provider status/logs with the request ID before choosing another potentially billable attempt.'
-    : 'Requests below are sent only after your confirmation. Successful preparation is reused from cache; failed or unknown paid calls are never automatically replayed. API Auto may try Chat only after Responses returns 404, 405 or 501. No server-internal narration progress is available.';
+    : 'Requests below are sent only after your confirmation. Successful preparation and completed audio clips are reused; failed or unknown paid calls are never automatically replayed. API Auto may try Chat only after Responses returns 404, 405 or 501. Audio progress counts completed clips, not estimated time.';
 }
 traceCopy.onclick = async () => {
   try { await navigator.clipboard.writeText(traceOutput.textContent); toast('Diagnostic metadata copied. Review provider/model labels before sharing.'); }
@@ -64,7 +67,7 @@ function beginTrace(approvedSetup) {
   lessonTrace = { version: 1, startedAt: new Date().toISOString(), status: 'Preparing', cachedResults: materials.cache.size,
     roles: approvedSetup.roles, providers: state.providers.map(({ id, name }) => ({ id, name })), part: null, operations: [] };
   tracePanel.hidden = false; tracePanel.open = true; renderTrace();
-  $('progress-footnote').textContent = 'Current app operation is shown below, not a percentage estimate. Final lesson/narration runs inside one server request.';
+  $('progress-footnote').textContent = 'Current app operation is shown below. Teaching and optional complete audio are separate; speech requires a second confirmation after the exact inventory is ready.';
 }
 function tracePart(current, total) {
   let index = current - 1;
@@ -75,14 +78,17 @@ function tracePart(current, total) {
   }
   return { current, total };
 }
-function operationStart(path, body) {
-  if (!busy || !lessonTrace || !traceStages[path]) return null;
-  const trace = lessonTrace, role = trace.roles[path === '/transcribe' ? 'transcription' : 'primary'];
-  const entry = { number: trace.operations.length + 1, stage: traceStages[path], part: path === '/lessons' ? null : trace.part,
+function operationStart(path, body, method) {
+  const speech = /^\/audio\/plans\/[^/]+\/clips\/[^/]+$/.test(path) && method === 'POST';
+  if (!busy || !lessonTrace || (!speech && !traceStages[path])) return null;
+  const trace = lessonTrace, roleName = speech ? 'speech' : path === '/transcribe' ? 'transcription' : 'primary';
+  const role = speech ? activeAudio?.approvedSetup.roles.speech : trace.roles[roleName];
+  const entry = { number: (trace.operationCount = (trace.operationCount || 0) + 1), stage: speech ? 'speech_generation' : traceStages[path], role: roleName, part: speech || path === '/lessons' ? null : trace.part,
     startedAt: new Date().toISOString(), provider: trace.providers.find(p => p.id === role?.providerId)?.name || 'Configured provider', model: role?.model,
     apiMode: path === '/transcribe' ? (role?.api === 'gemini' ? 'gemini.generateContent' : 'audio/transcriptions') : role?.api, thinking: path === '/transcribe' ? undefined : role?.reasoningEffort || 'default',
-    appEndpoint: path, status: 'Waiting', input: { textCharacters: body?.text?.length || 0, images: body?.images?.length || 0,
+    appEndpoint: speech ? '/audio/plans/{plan}/clips/{clip}' : path, status: 'Waiting', input: speech ? { clips: 1 } : path === '/audio/extract' ? { images: 1 } : { textCharacters: body?.text?.length || 0, images: body?.images?.length || 0,
       audioBytesApprox: body?.dataUrl ? Math.floor((body.dataUrl.split(',')[1]?.length || 0) * .75) : 0 } };
+  if (speech) { entry.provider = role?.engine === 'kokoro' ? 'Built-in Kokoro' : activeAudio?.approvedSetup.speechProvider || 'Configured speech provider'; entry.apiMode = role?.engine === 'kokoro' ? 'local' : 'audio/speech'; delete entry.thinking; }
   if (trace.operations.length >= 520) trace.operations.shift();
   trace.operations.push(entry); $('progress-title').textContent = entry.stage + (entry.part ? ` · part ${entry.part.current} of ${entry.part.total}` : ''); renderTrace();
   return { trace, entry, started: Date.now() };
@@ -98,14 +104,18 @@ function operationFinish(operation, error) {
     if (Number.isFinite(d.elapsedMs)) entry.providerElapsedMs = d.elapsedMs;
     // Keep a fixed schema, not arbitrary server fields or error prose.
     for (const key of ['stage', 'provider', 'model', 'apiMode', 'thinking', 'category', 'endpoint', 'upstreamStatus', 'contentType', 'responseBytes', 'providerCode', 'providerRequestId', 'automaticRetry', 'responseBodyOmitted']) {
-      if (Object.hasOwn(d, key) && ['string', 'number', 'boolean'].includes(typeof d[key])) entry[key] = typeof d[key] === 'string' ? d[key].slice(0, 200) : d[key];
+      if (Object.hasOwn(d, key) && ['string', 'number', 'boolean'].includes(typeof d[key])) {
+        // Audio endpoints can contain IDs. Never copy arbitrary endpoint/error text into reports.
+        if (entry.role === 'speech' && ['endpoint', 'stage', 'provider', 'model', 'apiMode'].includes(key)) continue;
+        entry[key] = typeof d[key] === 'string' ? d[key].slice(0, 200) : d[key];
+      }
     }
   }
   trace.cachedResults = materials.cache.size;
   if (lessonTrace === trace) renderTrace();
 }
 async function api(path, options = {}) {
-  const operation = operationStart(path, options.body);
+  const operation = operationStart(path, options.body, options.method);
   try { const result = await apiRequest(path, options, operation); operationFinish(operation); return result; }
   catch (error) { operationFinish(operation, error); throw error; }
 }
@@ -118,7 +128,7 @@ async function apiRequest(path, options = {}, operation = null) {
   let result;
   try { result = await response.json(); } catch (cause) { if (cause.name === 'AbortError') throw cause; const error = new Error('LearnLens returned an unreadable response. Check the server connection.'); error.network = cause instanceof TypeError; error.status = response.status; error.requestId = response.headers.get('X-LearnLens-Request-Id'); throw error; }
   if (!response.ok) {
-    if (response.status === 409 && ['/transcribe', '/materials/summarize', '/lessons'].includes(path)) {
+    if (response.status === 409 && ['/transcribe', '/materials/summarize', '/audio/extract', '/lessons'].includes(path)) {
       ready = false; cancelWork();
       $('connection-banner').hidden = false; $('connection-message').textContent = 'AI setup changed after confirmation. Processing stopped without switching providers. Refresh setup, then confirm again; your completed draft work remains intact.';
     }
@@ -130,7 +140,9 @@ async function apiRequest(path, options = {}, operation = null) {
   return result;
 }
 
+function stopPreviewAudio() { $('lesson-frame').contentWindow?.postMessage({ type: 'learnlens-stop-audio' }, '*'); }
 function navigate(next, focus = false) {
+  if (next === 'providers' || state.locked) stopPreviewAudio();
   page = next === 'providers' ? 'providers' : 'lesson';
   $('login-panel').hidden = !state.locked;
   $('lesson-page').hidden = state.locked || page !== 'lesson';
@@ -141,6 +153,7 @@ function navigate(next, focus = false) {
   if (focus) $(state.locked ? 'login-title' : page + '-page-title').focus({ preventScroll: true });
 }
 function tab(which) {
+  if (which !== 'preview') stopPreviewAudio();
   for (const name of ['compose', 'preview']) { const active = name === which; $('tab-' + name).setAttribute('aria-selected', String(active)); $('tab-' + name).tabIndex = active ? 0 : -1; $(name + '-panel').hidden = !active; }
 }
 
@@ -178,7 +191,7 @@ function updateStatus() {
   $('generation-helper').textContent = state.roles.primary ? `Using ${state.roles.primary.model}` : 'One primary model is all you need to start.';
   $('include-audio').disabled = !state.roles.speech || !usable;
   if (!state.roles.speech) $('include-audio').checked = false;
-  $('speech-note').textContent = state.roles.speech?.engine === 'kokoro' ? 'Built-in Kokoro speech · no extra API key. Generated audio is included in your download. Choose a voice that matches your language.' : state.roles.speech ? `AI-generated speech via ${providerFor(state.roles.speech)?.name} · additional credits apply.` : 'A compatible speech model is needed. Audio uses additional provider credits.';
+  $('speech-note').textContent = state.roles.speech?.engine === 'kokoro' ? 'Native Kokoro supports English only (US/UK voices), runs locally and needs no API key. Audio is included in the download.' : state.roles.speech ? `English speech via ${providerFor(state.roles.speech)?.name} · potentially billable per unique clip. You confirm the exact count before speech starts.` : 'Assign an optional speech role to enable complete English audio.';
   $('speech-setup-link').hidden = Boolean(state.roles.speech);
   $('provider-fields').disabled = !usable;
   $$('.provider-remove,.provider-edit,.discover-button').forEach(button => button.disabled = !usable);
@@ -189,7 +202,7 @@ function updateStatus() {
   $('record-button').disabled = (!usable && !recording) || !navigator.mediaDevices?.getUserMedia || !window.MediaRecorder;
   for (const id of ['mini-roles', 'setup-role-list']) {
     const root = $(id); root.replaceChildren();
-    for (const [key, label] of [['primary', 'Lesson model'], ['transcription', 'Voice input'], ['speech', 'Spoken examples']]) {
+    for (const [key, label] of [['primary', 'Lesson model'], ['transcription', 'Voice input'], ['speech', 'Complete English audio']]) {
       const row = element('div'); const name = element('span', label); const value = element('span', state.roles[key]?.model || (key === 'primary' ? 'Needed' : 'Optional')); value.title = value.textContent; row.append(name, value); root.append(row);
     }
   }
@@ -197,14 +210,14 @@ function updateStatus() {
   $('mini-setup-description').textContent = `${assigned} role${assigned === 1 ? '' : 's'} assigned across ${unique} distinct model${unique === 1 ? '' : 's'}. One primary is required; the two audio roles are optional.`;
   for (const view of Object.values(roleViews)) view.refreshChecks();
   updateAdvisorControls(usable);
-  updateSummary();
+  updateSummary(); renderAudioStatus();
 }
 function updateSummary() {
   $('summary-material').textContent = materials.items.length ? `${materials.items.length} attachment(s) · ${materials.partCount} automatic part(s)${materials.busy ? ' · preparing locally' : ''}` : $('learning-goal').value.trim() ? 'Question / instructions only' : 'Nothing added yet';
   $('summary-subject').textContent = chosenSubject() === 'Auto' ? 'Auto-detect' : chosenSubject() || 'Choose a subject';
   $('summary-level').textContent = $('level').value === 'Auto' ? 'Match the material' : $('level').value;
   $('summary-language').textContent = chosenLanguage() || 'Choose a language';
-  $('summary-audio').textContent = $('include-audio').checked ? 'Natural AI voice' : 'Text-only lesson';
+  $('summary-audio').textContent = $('include-audio').checked ? 'Complete English words + sentences' : 'Text-only lesson';
   $('summary-goal').textContent = $('learning-goal').value.trim() || 'Let the material guide the lesson.';
   $('vision-warning').hidden = !materials.hasVisuals || !state.roles.primary || checkOf(state.roles.primary, 'vision')?.status === 'verified';
   $('vision-warning-text').textContent = 'Image understanding is unverified for your primary model. You can run an optional paid vision test, or generate and carefully check the result.';
@@ -318,7 +331,7 @@ function renderProviders() {
 const rolesConfig = {
   primary: { title: 'Primary lesson model', icon: 'book', description: 'Understands material, identifies subjects, and creates lessons.', kinds: ['text', 'vision'] },
   transcription: { title: 'Speech-to-text', icon: 'mic', description: 'Transcribes prepared audio and video segments for your lesson.', kinds: ['transcription'] },
-  speech: { title: 'Natural speech', icon: 'headphones', description: 'Creates human-like, AI-generated spoken examples.', kinds: ['speech'] },
+  speech: { title: 'Natural speech', icon: 'headphones', description: 'Creates complete English word and sentence audio from sources and the lesson.', kinds: ['speech'] },
 };
 function renderRoles() {
   $('role-cards').replaceChildren(); roleViews = {};
@@ -336,7 +349,7 @@ function renderRoles() {
     const draft = roleDrafts[name]; fields.provider.value = draft?.providerId || ''; fields.api.value = name === 'transcription' ? (draft?.api === 'gemini' ? 'gemini' : 'auto') : draft?.api || 'auto'; fields.voice.value = draft?.voice || ''; fields.effort.value = draft?.reasoningEffort || 'default'; fields.engine.value = draft?.engine || 'provider';
     card.querySelector('.api-field').hidden = !['primary', 'transcription'].includes(name); card.querySelector('.effort-field').hidden = name !== 'primary'; card.querySelector('.voice-field').hidden = name !== 'speech'; card.querySelector('.engine-field').hidden = name !== 'speech';
     fields.engine.querySelector('[value="kokoro"]').disabled = !state.speechServices?.kokoro?.available;
-    card.querySelector('.kokoro-hint').textContent = state.speechServices?.kokoro?.available ? (state.speechServices.kokoro.languages?.length === 1 && state.speechServices.kokoro.languages[0] === 'en' ? 'Included native Kokoro supports English (US/UK voices). Default: af_heart. Choose online speech for other languages. No installation, API key or automatic cloud fallback.' : 'Included speech runs on this server. No installation or API key needed. English voice af_heart is the default; voice and language support vary. No automatic cloud fallback.') : 'Built-in speech is unavailable on this server. You can use an online provider or contact the workspace administrator. No learner-side installation is required.';
+    card.querySelector('.kokoro-hint').textContent = state.speechServices?.kokoro?.available ? (state.speechServices.kokoro.languages?.length === 1 && state.speechServices.kokoro.languages[0] === 'en' ? 'Included native Kokoro supports English only (US/UK voices). Default: af_heart. Complete-audio matching uses English/Latin text heuristics, not reliable language identification. No API key or automatic cloud fallback.' : 'Included speech runs on this server. Complete audio covers English word/sentence targets; native Kokoro supports English only. English voice af_heart is the default. No API key or automatic cloud fallback.') : 'Built-in speech is unavailable on this server. You can use an online provider or contact the workspace administrator. No learner-side installation is required.';
     function readDraft() {
       if (name === 'speech' && fields.engine.value === 'kokoro') return { engine: 'kokoro', model: state.speechServices.kokoro.model, api: 'auto', voice: fields.voice.value.trim() || state.speechServices.kokoro.voice };
       if (!fields.provider.value) return null;
@@ -396,11 +409,137 @@ async function addFiles(files) {
   catch (error) { if (error.name !== 'AbortError') message('upload-message', error.message, 'error'); }
 }
 
+function renderAudioStatus() {
+  const context = currentLesson?.audio;
+  $('switch-previous').hidden = lessonHistory.length < 2;
+  $('switch-previous').disabled = busy || settingsBusy || confirming;
+  $('audio-progress-panel').hidden = !context;
+  if (!context) return;
+  const summary = context.manifest?.summary;
+  $('audio-count').textContent = summary ? `${summary.completedClips}/${summary.totalClips} unique clips complete · ${summary.status}` : 'Exact clip count pending local inventory';
+  $('audio-uncertainties').textContent = summary ? `Source recognition/coverage uncertainty: ${summary.sourceUncertainties || 0} source(s). Clip completion does not verify source recognition.` : 'Source recognition/coverage uncertainty count pending local inventory.';
+  $('audio-retained').textContent = context.discarded ? 'Remaining audio discarded. The last retained HTML is still available to download; it has not been replaced or regenerated.' : context.exportedComplete ? 'Complete audio HTML retained on this page. Download to keep it.' : `Text lesson retained. ${currentLesson.audioSummary ? 'Latest available audio export also retained.' : 'The current download is text-only; completed server clips are added by a successful local export.'} Unfinished audio sources stay in this page/session; reload or server restart can lose them.`;
+  $('audio-operation').textContent = context.operation;
+  message('audio-message', context.notice, context.notice ? 'warning' : '');
+  const usable = ready && !state.locked && !busy && !settingsBusy && !confirming && !context.unavailable;
+  $('continue-audio').disabled = !usable;
+  $('continue-audio').hidden = context.exportedComplete || context.discarded;
+  $('download-partial').disabled = !usable || !audioExportable(context);
+  $('download-partial').hidden = context.exportedComplete || context.discarded;
+  $('discard-audio').hidden = context.exportedComplete || context.discarded;
+  $('discard-audio').disabled = busy || settingsBusy || confirming || Boolean(recording) || micPending;
+  $('stop-audio').hidden = activeAudio !== context || !busy;
+}
+async function cleanCompletedAudio(signal) {
+  for (const lesson of lessonHistory) {
+    const context = lesson.audio;
+    if (!context?.exportedComplete || context.unavailable || context.manifest?.summary.status !== 'complete') continue;
+    try { await api(audioPath(context), { method: 'DELETE', body: {}, signal }); }
+    catch (error) { if (error.status !== 404) throw error; }
+    context.unavailable = true; context.operation = 'Finished HTML retained; completed server plan released for the next lesson.';
+  }
+}
+async function retainAudioExport(lesson, signal) {
+  const result = await exportAudioPlan(api, lesson.audio, signal);
+  // Keep recovery snapshots only while unfinished; completed HTML is retained before releasing them.
+  Object.assign(lesson, { html: result.html, title: result.title, lesson: result.lesson, warnings: result.warnings, audioSummary: result.audioSummary });
+  if (lesson.audio.exportedComplete) releaseAudioSnapshots(lesson.audio);
+  if (lesson === currentLesson) displayLesson();
+}
+async function runLessonAudio(lesson, { resume = false, signal, revision } = {}) {
+  const context = lesson.audio; activeAudio = context; context.notice = ''; context.paused = false; renderAudioStatus();
+  try {
+    const manifest = await prepareAudioPlan(api, context, { resume, revision, signal, changed: renderAudioStatus });
+    if (signal.aborted) throw new DOMException('Audio stopped. Text is retained.', 'AbortError');
+    const speech = manifest.speech || context.approvedSetup.roles.speech;
+    const local = speech.engine === 'kokoro';
+    const failures = manifest.clips.filter(clip => RETRYABLE_AUDIO.has(clip.status)).length;
+    const needsWork = manifest.clips.some(clip => clip.status !== 'complete');
+    if (needsWork) {
+      context.operation = 'Awaiting exact-count speech confirmation'; renderAudioStatus();
+      const consent = await confirmAction({ title: resume ? 'Continue complete English audio?' : 'Generate complete English audio?',
+        description: `${manifest.summary.totalClips} unique clips exactly: all matched English word targets and sentences from the uploaded sources AND generated lesson, not just AI keywords. ${manifest.summary.completedClips} already complete and reused. English/Latin matching is not reliable language identification. OCR/transcription can miss or misrecognize content; audio completeness refers to the extracted inventory, not guaranteed recognition of every original mark.`,
+        detail: `Speech role: ${local ? 'Built-in native Kokoro · local, English-only · no cloud speech charge' : 'Remote/compatible provider · potentially billable: ' + context.approvedSetup.speechProvider}\nModel: ${speech.model} · voice: ${speech.voice || (local ? 'af_heart' : 'alloy')}\n${manifest.summary.totalClips - manifest.summary.completedClips} clips remaining; ${failures} failed/damaged/encoding-failed clip(s). ${resume ? 'This is renewed consent for pending/unknown attempts and retrying these failed clips. Prior unknown attempts may already have been billed.' : 'No failed clip will be retried automatically.'}\n${manifest.summary.sourceUncertainties || 0} source(s) have recognition/coverage uncertainty; ${manifest.warnings?.length || 0} plan warning(s) apply. Teaching language is unchanged. Cancel keeps this text lesson and audio context.`,
+        paid: !local, accept: resume ? 'Continue audio with consent' : 'Generate these clips' });
+      if (signal.aborted) throw new DOMException('Audio stopped. Text is retained.', 'AbortError');
+      if (!consent) { context.notice = 'Speech cancelled. New text lesson and all audio sources are retained. Use Continue audio when ready; teaching and source preparation will not be repeated.'; return; }
+      await generateAudioClips(api, context, { consent: true, retryFailed: resume, signal, changed: renderAudioStatus });
+    }
+    context.operation = 'Exporting available audio locally'; renderAudioStatus();
+    await retainAudioExport(lesson, signal);
+    context.paused = !context.exportedComplete;
+    context.operation = context.exportedComplete ? 'Complete English audio exported and retained' : 'Partial audio export retained';
+    announce(context.exportedComplete ? 'Complete English audio is ready to download.' : 'Available audio is retained; some clips remain unfinished.');
+  } catch (error) {
+    context.paused = true;
+    context.operation = error.name === 'AbortError' ? 'Stopped; checking only local retained status' : 'Audio paused; no automatic paid retry';
+    context.notice = error.message + ' The teaching result and previous lessons are retained. Continue audio never repeats teaching or source preparation.';
+    // A fresh bounded LOCAL status/export is safe after Stop. Never call speech here.
+    if (ready && !state.locked && !context.unavailable && context.createAttempted) {
+      try { await retainAudioExport(lesson, AbortSignal.timeout(8000)); }
+      catch (exportError) {
+        context.notice += context.unavailable ? ' ' + exportError.message : ' A fresh partial export is not available now (the server may still be processing). The last retained HTML is unchanged.';
+      }
+    }
+    if (lessonTrace) { lessonTrace.status = 'Text retained; audio paused'; renderTrace(); tracePanel.open = true; }
+  } finally {
+    if (context.operation === 'Awaiting exact-count speech confirmation') context.operation = 'Audio not dispatched; text retained';
+    activeAudio = null; renderAudioStatus();
+  }
+}
+async function continueLessonAudio({ exportOnly = false } = {}) {
+  const lesson = currentLesson, context = lesson?.audio;
+  if (!context || context.unavailable || busy || settingsBusy || confirming || !ready || state.locked) return;
+  const epoch = sessionEpoch;
+  if (!exportOnly) {
+    confirming = true; updateStatus();
+    let consent;
+    try { consent = await confirmAction({ title: 'Resume this retained lesson’s audio?', description: 'Refresh local setup/status and restore the existing plan only. Teaching, OCR and transcription will NOT run again. A second confirmation will show the exact speech count and any failed/unknown attempts before potentially billable speech. Provider/model/voice identity must still match the original plan; changing settings never silently retargets audio.', accept: 'Check retained audio' }); }
+    finally { confirming = false; updateStatus(); }
+    if (!consent || epoch !== sessionEpoch) return;
+  }
+  busy = true; generationController = new AbortController(); const signal = generationController.signal; updateStatus();
+  try {
+    if (exportOnly) {
+      await retainAudioExport(lesson, signal); context.notice = 'Available clips exported locally. Unfinished clips have not been generated or retried.';
+      $('download-lesson').click();
+    } else {
+      await refreshState(false);
+      if (!ready || state.locked || epoch !== sessionEpoch || signal.aborted) return;
+      if (!Number.isInteger(state.setupRevision)) throw new Error('The current setup revision is unavailable. No speech request was made.');
+      beginTrace(context.approvedSetup);
+      await runLessonAudio(lesson, { resume: true, revision: state.setupRevision, signal });
+    }
+  } catch (error) { context.notice = error.message; }
+  finally { busy = false; generationController = null; updateStatus(); }
+}
+
+function canRetainNextLesson() {
+  if (!lessonRetentionBlocker(lessonHistory)) return true;
+  const text = 'New lesson paused: only two lessons are retained, and the oldest has unfinished audio (even if its plan expired). Open Lesson preview, switch previous lesson if needed, then finish or explicitly Discard remaining audio first. Download any HTML you want to keep. No paid generation was started.';
+  message('generation-error', text, 'error'); toast(text); return false;
+}
+async function discardLessonAudio() {
+  const context = currentLesson?.audio;
+  if (!context || context.discarded || busy || settingsBusy || confirming || recording || micPending) return;
+  confirming = true; updateStatus();
+  let consent;
+  try { consent = await confirmAction({ title: 'Discard remaining audio?', description: 'Keep the current retained HTML exactly as it is, but permanently remove this lesson’s audio continuation and full source/input snapshots. This makes no paid request and does NOT export more clips. If you want available server clips first, cancel and use Download available audio. A local DELETE will remove the plan when reachable; if disconnected/locked, server cleanup cannot be confirmed and temporary data may remain until session expiry.', accept: 'Discard remaining audio' }); }
+  finally { confirming = false; updateStatus(); }
+  if (!consent) return;
+  busy = true; updateStatus();
+  try { await discardAudioContext(api, context, { consent: true, canContact: ready && !state.locked, signal: AbortSignal.timeout(8000) }); message('generation-error'); }
+  catch (error) { context.notice = 'Audio was not discarded: ' + error.message + ' Source snapshots remain intact. Wait for running audio to finish, or retry local cleanup later.'; }
+  finally { busy = false; updateStatus(); }
+}
+
 async function preview(kind, request, approvedSetup) {
   if (busy || settingsBusy || materials.busy || confirming || recording || !ready) return;
+  if (!canRetainNextLesson()) return;
   const epoch = sessionEpoch; generationController = new AbortController();
-  const check = () => { if (epoch !== sessionEpoch || generationController.signal.aborted) throw new DOMException('Stopped. Your draft and completed preparation remain on this page.', 'AbortError'); };
-  busy = true; lastRequest = { kind, request }; navigate('lesson'); tab('preview'); updateStatus();
+  const signal = generationController.signal;
+  const check = () => { if (epoch !== sessionEpoch || signal.aborted) throw new DOMException('Stopped. Your draft and completed preparation remain on this page.', 'AbortError'); };
+  busy = true; lastRequest = { kind, request }; stopPreviewAudio(); navigate('lesson'); tab('preview'); updateStatus();
   $('preview-empty').hidden = true; $('preview-error').hidden = true; $('preview-result').hidden = true; $('preview-loading').hidden = false;
   $('request-kind').textContent = kind === 'demo' ? 'LOCAL EXAMPLE' : 'CREATING YOUR LESSON';
   $('progress-title').textContent = kind === 'demo' ? 'Opening the example' : 'Preparing your materials';
@@ -408,19 +547,32 @@ async function preview(kind, request, approvedSetup) {
   if (kind === 'demo') { lessonTrace = null; tracePanel.hidden = true; } else beginTrace(approvedSetup);
   const started = Date.now(); const tick = () => $('progress-elapsed').textContent = duration(Math.floor((Date.now() - started) / 1000)) + ' elapsed'; tick(); clock = setInterval(tick, 1000);
   try {
-    let payload = request;
+    let payload = request, audioSources = [];
+    // Release fully exported server plans before their retained result could be evicted, including text-only/demo paths.
+    await cleanCompletedAudio(signal); check();
     if (kind !== 'demo') {
-      const prepared = await materials.prepare({ consent: true, goal: request.goal, roles: approvedSetup.roles, expectedSetupRevision: approvedSetup.revision, progress: text => { check(); const part = /^Processing part (\d+) of (\d+)/.exec(text); if (lessonTrace) { lessonTrace.part = part ? tracePart(Number(part[1]), Number(part[2])) : null; lessonTrace.cachedResults = materials.cache.size; renderTrace(); } $('progress-title').textContent = text; } });
-      check(); payload = { ...request, ...prepared, consent: true };
-      $('progress-title').textContent = 'Creating the final lesson';
-      $('progress-description').textContent = 'Sending bounded source notes and representative images. Requested spoken examples follow. This may take a few minutes.';
+      if (request.includeAudio) {
+        $('progress-title').textContent = 'Checking local audio readiness and session capacity';
+        await api('/audio/preflight', { method: 'POST', body: {}, signal }); check();
+      }
+      const prepared = await materials.prepare({ consent: true, completeAudio: request.includeAudio, goal: request.goal, roles: approvedSetup.roles, expectedSetupRevision: approvedSetup.revision, progress: text => { check(); const part = /^Processing part (\d+) of (\d+)/.exec(text); if (lessonTrace) { lessonTrace.part = part ? tracePart(Number(part[1]), Number(part[2])) : null; lessonTrace.cachedResults = materials.cache.size; renderTrace(); } $('progress-title').textContent = text; } });
+      check();
+      // Complete source text travels one descriptor at a time, NEVER inside /lessons.
+      const { audioSources: sources = [], ...lessonInput } = prepared; audioSources = sources;
+      payload = { ...request, ...lessonInput, consent: true, includeAudio: false };
+      $('progress-title').textContent = 'Creating the final text lesson';
+      $('progress-description').textContent = 'Sending bounded source notes and representative images. Complete English audio has a separate confirmation after the text is retained.';
     }
     check();
-    const result = kind === 'demo' ? await api('/demo', { signal: generationController.signal }) : await api('/lessons', { method: 'POST', body: payload, signal: generationController.signal });
-    check();
+    const result = kind === 'demo' ? await api('/demo', { signal }) : await api('/lessons', { method: 'POST', body: payload, signal });
+    // Retain a received teaching result BEFORE any subsequent local operation or error.
     currentLesson = { ...result, sample: kind === 'demo', sourceDescription: kind === 'demo' ? 'Hand-authored English sample · no uploaded material' : `${materials.items.length} original attachment(s) · ${materials.partCount} parts processed · ${payload.images.length} representative image(s)` };
-    if (lessonTrace) { lessonTrace.status = 'Completed'; lessonTrace.cachedResults = materials.cache.size; renderTrace(); tracePanel.open = false; }
-    displayLesson(); announce('Your lesson is ready.'); await refreshState(false);
+    retainLesson(lessonHistory, currentLesson);
+    if (kind !== 'demo' && request.includeAudio) currentLesson.audio = createAudioContext({ sources: audioSources, approvedSetup, input: payload, result });
+    displayLesson(); announce('Your text lesson is retained and ready to download.');
+    if (currentLesson.audio) await runLessonAudio(currentLesson, { signal });
+    if (lessonTrace) { lessonTrace.status = currentLesson.audio?.exportedComplete ? 'Complete audio retained' : currentLesson.audio ? 'Text retained; see audio status' : 'Completed'; lessonTrace.cachedResults = materials.cache.size; renderTrace(); tracePanel.open = Boolean(currentLesson.audio?.paused && !currentLesson.audio?.exportedComplete); }
+    await refreshState(false);
   } catch (error) {
     if (lessonTrace) { lessonTrace.status = error.name === 'AbortError' ? 'Stopped' : 'Failed'; if (lessonTrace.operations.at(-1)?.status === 'Completed' || !lessonTrace.operations.length) lessonTrace.failedAt = { stage: 'Local preparation', part: lessonTrace.part, appStatus: error.status }; lessonTrace.cachedResults = materials.cache.size; renderTrace(); tracePanel.open = true; }
     $('preview-error').hidden = false;
@@ -432,6 +584,7 @@ async function preview(kind, request, approvedSetup) {
 }
 function displayLesson() {
   const result = currentLesson; if (!result) return;
+  stopPreviewAudio();
   $('preview-result').hidden = false; $('preview-error').hidden = true; $('preview-empty').hidden = true; $('preview-loading').hidden = true;
   $('result-kind').textContent = result.sample ? 'HAND-AUTHORED EXAMPLE · NO AI CALL' : 'YOUR AI-ASSISTED LESSON';
   $('result-title').textContent = result.title;
@@ -443,11 +596,13 @@ function displayLesson() {
   $('download-lesson').href = downloadUrl;
   $('download-lesson').download = 'LearnLens-' + result.title.replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 70).trim().replace(/\s+/g, '-') + '.html';
   $('preview-dot').hidden = false;
-  $('review-note-text').textContent = 'This HTML includes styles, exercises, source images and any successfully generated audio. It needs no internet. Open in a browser rather than a file-manager preview. Review AI explanations and answers.';
+  $('review-note-text').textContent = 'This HTML includes styles, exercises, source images and audio included in the latest successful export. It needs no internet. Open in a browser rather than a file-manager preview. Review AI explanations and answers.';
+  renderAudioStatus();
 }
 async function generate(event) {
   event?.preventDefault(); message('generation-error');
   if (busy || settingsBusy || confirming || materials.busy || !ready || micPending) return;
+  if (!canRetainNextLesson()) return;
   if (!state.roles.primary) { navigate('providers', true); toast('Connect a provider and assign a primary lesson model.'); return; }
   if (recording) { message('generation-error', 'Stop recording before generating a lesson.', 'error'); return; }
   const request = { language: chosenLanguage(), level: $('level').value, subject: chosenSubject(), goal: $('learning-goal').value.trim(), includeAudio: $('include-audio').checked };
@@ -456,12 +611,12 @@ async function generate(event) {
   if (materials.items.some(item => item.status !== 'ready')) { message('generation-error', 'Resume failed local imports before creating the lesson.', 'error'); return; }
   if (materials.needsTranscription && !state.roles.transcription) { message('generation-error', 'Assign a transcription role in AI providers for your audio or video.', 'error'); return; }
   if (!Number.isInteger(state.setupRevision)) { message('generation-error', 'Refresh AI setup before confirming: the server did not provide its setup revision.', 'error'); return; }
-  const approvedSetup = { revision: state.setupRevision, roles: structuredClone(state.roles) };
+  const approvedSetup = { revision: state.setupRevision, roles: structuredClone(state.roles), speechProvider: providerFor(state.roles.speech)?.name || 'Built-in Kokoro' };
   request.expectedSetupRevision = approvedSetup.revision;
   const epoch = sessionEpoch; confirming = true; updateStatus();
   let consent;
   try {
-    consent = await confirmAction({ title: 'Process all parts and create your lesson?', description: 'Extracted text and images go to your primary provider; prepared audio parts go to your transcription provider. Originals never go directly to providers. This can make multiple billable calls. AI digests are lossy, not guaranteed verbatim; only representative preview images are embedded. Remove sensitive material before continuing.', detail: materials.describe() + '\nPrimary: ' + approvedSetup.roles.primary.model + (materials.needsTranscription ? '\nSpeech-to-text: ' + providerFor(approvedSetup.roles.transcription)?.name + ' / ' + approvedSetup.roles.transcription.model + '\nTranscription API: ' + transcriptionMode(approvedSetup.roles.transcription) : '') + (request.includeAudio ? '\nSpoken examples enabled: additional generation calls may apply.' : ''), paid: true, accept: 'Process all parts & create' });
+    consent = await confirmAction({ title: 'Process all parts and create your lesson?', description: 'Extracted text and images go to your primary provider; prepared audio parts go to your transcription provider. Originals never go directly to providers. This can make multiple billable calls. AI digests are lossy, not guaranteed verbatim; only representative preview images are embedded. Remove sensitive material before continuing.', detail: materials.describe({ completeAudio: request.includeAudio }) + '\nPrimary: ' + providerFor(approvedSetup.roles.primary)?.name + ' / ' + approvedSetup.roles.primary.model + (materials.needsTranscription ? '\nSpeech-to-text: ' + providerFor(approvedSetup.roles.transcription)?.name + ' / ' + approvedSetup.roles.transcription.model + '\nTranscription API: ' + transcriptionMode(approvedSetup.roles.transcription) : '') + (request.includeAudio ? '\nComplete English audio: local encoder readiness/capacity is checked before any paid work; managed assets may download, but preflight uses no AI. Extra source recognition: one potentially paid primary-model OCR call per extracted visual (before cache reuse). After teaching, a second confirmation shows the exact unique word/sentence clip count and speech provider/voice. All English word targets and sentences from both sources and the generated lesson are included, not just AI keywords. English/Latin matching is not reliable language identification; OCR/transcription may miss or misrecognize content. Native Kokoro is English-only. Your teaching language stays unchanged.' : ''), paid: true, accept: 'Process all parts & create' });
   } finally { confirming = false; updateStatus(); }
   if (consent && epoch === sessionEpoch) await preview('generate', request, approvedSetup);
 }
@@ -500,6 +655,16 @@ $$('[data-action="demo"]').forEach(button => button.onclick = () => preview('dem
 for (const name of ['compose', 'preview']) { $('tab-' + name).onclick = () => tab(name); $('tab-' + name).onkeydown = event => { if (['ArrowLeft', 'ArrowRight'].includes(event.key)) { event.preventDefault(); const next = name === 'compose' ? 'preview' : 'compose'; tab(next); $('tab-' + next).focus(); } }; }
 for (const id of ['empty-back-draft', 'error-back-draft', 'back-to-draft']) $(id).onclick = () => tab('compose');
 $('show-previous').onclick = displayLesson;
+$('switch-previous').onclick = () => {
+  if (busy || settingsBusy || confirming || lessonHistory.length < 2) return;
+  const index = lessonHistory.indexOf(currentLesson);
+  currentLesson = lessonHistory[(index - 1 + lessonHistory.length) % lessonHistory.length];
+  displayLesson();
+};
+$('continue-audio').onclick = () => continueLessonAudio();
+$('download-partial').onclick = () => continueLessonAudio({ exportOnly: true });
+$('stop-audio').onclick = () => cancelWork();
+$('discard-audio').onclick = discardLessonAudio;
 $('retry-preview').onclick = () => { if (lastRequest?.kind === 'demo') preview('demo'); else generate(); };
 $('stop-processing').onclick = () => cancelWork();
 $('dismiss-toast').onclick = () => $('toast').hidden = true;
@@ -577,8 +742,8 @@ for (const id of ['learning-goal', 'custom-language', 'custom-subject', 'level',
 $$('[data-goal]').forEach(button => button.onclick = () => { const value = button.dataset.goal; const current = $('learning-goal').value; if (!current.includes(value)) $('learning-goal').value = (current + (current ? '\n' : '') + value).slice(0, 2000); button.setAttribute('aria-pressed', 'true'); updateSummary(); });
 $('lesson-form').onsubmit = generate;
 $('record-button').onclick = toggleRecording;
-window.addEventListener('pagehide', () => { cancelWork(); if (recording?.state === 'recording') recording.stop(); micStream?.getTracks().forEach(track => track.stop()); });
-window.addEventListener('beforeunload', event => { if (busy || recording || materials.busy) { event.preventDefault(); event.returnValue = ''; } });
+window.addEventListener('pagehide', () => { stopPreviewAudio(); cancelWork(); if (recording?.state === 'recording') recording.stop(); micStream?.getTracks().forEach(track => track.stop()); });
+window.addEventListener('beforeunload', event => { if (busy || recording || materials.busy || lessonHistory.some(lesson => unfinishedAudio(lesson.audio))) { event.preventDefault(); event.returnValue = ''; } });
 if (/Mac|iPhone|iPad/.test(navigator.platform)) $('paste-shortcut').textContent = '⌘ V';
 if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) message('voice-message', 'Recording is unavailable here. Use HTTPS and a supported browser, or upload an audio file.');
 await refreshState();
