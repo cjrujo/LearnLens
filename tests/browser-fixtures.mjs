@@ -60,7 +60,7 @@ export const ocrText = 'Original screenshot English, not a source digest. Screen
 // More than 500 characters, one sentence: exercises sequenced sentence pieces.
 export const longSentence = 'A ' + 'careful reader follows the original source and learns each word '.repeat(12) + 'until the long sentence final sentinel.';
 export function createQAProvider() {
-  const config = { status: 200, failKind: null, failAfter: null, speechDelay: 0 }, calls = [];
+  const config = { status: 200, failKind: null, failAfter: null, speechDelay: 0, digestFaultAt: null, digestFaultRepeat: false, digestFault: 'oversized-notes' }, calls = [];
   const lesson = structuredClone(demoLesson);
   lesson.title = 'Browser integration test';
   lesson.summary = 'Mock-provider output for testing, not AI tutoring. <script>window.__learnlensExportInjection=true</script>';
@@ -89,7 +89,10 @@ export function createQAProvider() {
       if (input.instructions.includes('LEARNLENS_AUDIO_SOURCE')) {
         text = JSON.stringify({ text: ocrText, coverage: 'complete', warnings: [] });
       } else if (input.instructions.includes('LEARNLENS_SOURCE_DIGEST')) {
-        text = JSON.stringify({ notes: 'Fixture digest of the supplied source part. This is synthetic QA, not real AI.', warnings: [] });
+        const ordinal = calls.filter(c => c.kind === 'digest').length;
+        const malformed = config.digestFaultAt !== null && (ordinal === config.digestFaultAt || (config.digestFaultRepeat && ordinal > config.digestFaultAt));
+        if (malformed) { call.malformed = true; text = config.digestFault === 'invalid-json' ? '{not valid JSON' : JSON.stringify({ notes: 'x'.repeat(2201), warnings: [] }); }
+        else text = JSON.stringify({ notes: 'Fixture digest of the supplied source part. This is synthetic QA, not real AI.', warnings: [] });
       } else if (input.instructions.includes('model setup advisor')) {
         const catalog = JSON.parse(input.input[0].content[0].text).candidates;
         const roles = Object.fromEntries(Object.entries({ primary: 'test/vision', speech: 'test/speech', transcription: 'test/transcribe' }).map(([role, model]) => [role, { candidateId: catalog.find(c => c.model === model)?.candidateId ?? null, reason: 'QA fixture recommendation.', caveat: 'This is not real model advice.' }]));

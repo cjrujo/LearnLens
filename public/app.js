@@ -9,13 +9,13 @@ let state = { providers: [], roles: { ...EMPTY }, locked: false };
 let ready = false, busy = false, settingsBusy = false, page = 'lesson';
 let currentLesson = null, downloadUrl = '', lastRequest = null, clock = null;
 const lessonHistory = [];
-let activeAudio = null;
+let activeAudio = null, generationCheckpoint = null;
 let roleDrafts = { ...EMPTY }, roleViews = {};
 let editingProviderId = null, recommendations = null;
 let recording = null, micStream = null, recordTimer = null, micPending = false;
 let sessionEpoch = 0, confirming = false, generationController = null;
 const materials = new MaterialWorkspace({ list: $('material-list'), api, changed: () => updateStatus() });
-function cancelWork(session = false) { sessionEpoch++; generationController?.abort(); materials.cancelPending({ session }); if (session) for (const lesson of lessonHistory) if (lesson.audio) { lesson.audio.unavailable = true; lesson.audio.notice = 'Session changed. Retained HTML is available, but this audio plan cannot resume.'; } }
+function cancelWork(session = false) { sessionEpoch++; generationController?.abort(); materials.cancelPending({ session }); if (session) { if (generationCheckpoint) { generationCheckpoint.unavailable = true; generationCheckpoint.prepared = null; } for (const lesson of lessonHistory) if (lesson.audio) { lesson.audio.unavailable = true; lesson.audio.notice = 'Session changed. Retained HTML is available, but this audio plan cannot resume.'; } } }
 let toastTimer;
 
 function element(tag, text, className) { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; }
@@ -48,6 +48,29 @@ $('preview-error').after(tracePanel);
 traceStatus.style.overflowWrap = 'anywhere';
 const stageLabel = value => ({ transcription: 'Transcribing audio', source_preparation: 'Preparing source notes', lesson_generation: 'Generating final lesson', source_recognition: 'Recognizing source text', speech_generation: 'Generating English audio' }[value] || value);
 const traceStages = { '/transcribe': 'Transcribing audio', '/materials/summarize': 'Preparing source notes', '/lessons': 'Generating final lesson', '/audio/extract': 'source_recognition' };
+// This private checkpoint contains source snapshots; diagnostics receive counts ONLY.
+const generationPanel = element('section', undefined, 'guide-card'); generationPanel.id = 'generation-checkpoint'; generationPanel.hidden = true;
+const generationSummary = element('p'), generationHint = element('p'), generationContinue = element('button', 'Continue generation', 'btn secondary small');
+generationSummary.id = 'generation-checkpoint-summary'; generationHint.className = 'field-hint'; generationContinue.id = 'continue-generation'; generationContinue.type = 'button';
+generationPanel.append(element('h3', 'Generation checkpoint'), generationSummary, generationHint, generationContinue); $('preview-error').after(generationPanel);
+function materialSignature() { return JSON.stringify(materials.items.map(item => [item.id, item.partCount])); }
+function requestSignature(request) { return JSON.stringify([request.goal, request.language, request.level, request.subject, request.includeAudio]); }
+function checkpointMetadata() {
+  const info = materials.checkpointInfo(), checkpoint = generationCheckpoint;
+  return { phase: checkpoint?.phase || 'preparation', completedCalls: info.completedCalls || 0, completedParts: info.completedParts || 0, totalParts: info.totalParts || 0, preparationComplete: Boolean(checkpoint?.prepared || info.complete) };
+}
+function renderGenerationCheckpoint() {
+  const checkpoint = generationCheckpoint;
+  generationPanel.hidden = !checkpoint || checkpoint.phase === 'retained';
+  if (!checkpoint || generationPanel.hidden) return;
+  const info = checkpointMetadata(), mismatch = checkpoint.materials !== materialSignature();
+  generationSummary.textContent = `${info.completedCalls} successful preparation call(s) retained · ${info.completedParts}/${info.totalParts} parts prepared. ` + (info.preparationComplete ? 'Source preparation is complete; only the final text-lesson request remains.' : 'Continue resumes the unfinished preparation step, not the beginning.');
+  generationHint.textContent = checkpoint.unavailable ? 'This checkpoint cannot resume after a session change. Your draft/retained HTML remain; a new generation needs fresh consent.' : mismatch ? 'Attachments changed. Restore the saved attachment set to continue, or explicitly create a new lesson. No old checkpoint will be silently replayed.' : 'Saved on this page for this session only—do not reload. Continue uses the saved instructions/options and current confirmed AI settings for unfinished steps. Successful steps are reused, even if performed by a previous model. Failed/unknown requests may already have been billed; continuation always asks for consent.';
+  generationContinue.hidden = !$('preview-error').hidden && lastRequest?.kind !== 'demo';
+  generationContinue.disabled = busy || settingsBusy || confirming || materials.busy || !ready || state.locked || Boolean(recording) || micPending || checkpoint.unavailable || mismatch;
+  if (lastRequest?.kind !== 'demo') { $('retry-preview').textContent = 'Continue generation'; $('retry-preview').disabled ||= generationContinue.disabled; }
+  if (lessonTrace) lessonTrace.checkpoint = info;
+}
 function renderTrace() {
   if (!lessonTrace) return;
   const { roles, providers, part, ...report } = lessonTrace;
@@ -63,8 +86,8 @@ traceCopy.onclick = async () => {
   try { await navigator.clipboard.writeText(traceOutput.textContent); toast('Diagnostic metadata copied. Review provider/model labels before sharing.'); }
   catch { const selection = getSelection(), range = document.createRange(); range.selectNodeContents(traceOutput); selection.removeAllRanges(); selection.addRange(range); toast('Select and copy the diagnostic report manually.'); }
 };
-function beginTrace(approvedSetup) {
-  lessonTrace = { version: 1, startedAt: new Date().toISOString(), status: 'Preparing', cachedResults: materials.cache.size,
+function beginTrace(approvedSetup, resume = false) {
+  lessonTrace = { version: 1, startedAt: new Date().toISOString(), status: resume ? 'Continuing from checkpoint' : 'Preparing', resumedFromCheckpoint: resume, cachedResults: materials.cache.size,
     roles: approvedSetup.roles, providers: state.providers.map(({ id, name }) => ({ id, name })), part: null, operations: [] };
   tracePanel.hidden = false; tracePanel.open = true; renderTrace();
   $('progress-footnote').textContent = 'Current app operation is shown below. Teaching and optional complete audio are separate; speech requires a second confirmation after the exact inventory is ready.';
@@ -210,7 +233,7 @@ function updateStatus() {
   $('mini-setup-description').textContent = `${assigned} role${assigned === 1 ? '' : 's'} assigned across ${unique} distinct model${unique === 1 ? '' : 's'}. One primary is required; the two audio roles are optional.`;
   for (const view of Object.values(roleViews)) view.refreshChecks();
   updateAdvisorControls(usable);
-  updateSummary(); renderAudioStatus();
+  updateSummary(); renderAudioStatus(); renderGenerationCheckpoint();
 }
 function updateSummary() {
   $('summary-material').textContent = materials.items.length ? `${materials.items.length} attachment(s) · ${materials.partCount} automatic part(s)${materials.busy ? ' · preparing locally' : ''}` : $('learning-goal').value.trim() ? 'Question / instructions only' : 'Nothing added yet';
@@ -533,18 +556,30 @@ async function discardLessonAudio() {
   finally { busy = false; updateStatus(); }
 }
 
-async function preview(kind, request, approvedSetup) {
+async function preview(kind, request, approvedSetup, { resume = false } = {}) {
   if (busy || settingsBusy || materials.busy || confirming || recording || !ready) return;
   if (!canRetainNextLesson()) return;
   const epoch = sessionEpoch; generationController = new AbortController();
   const signal = generationController.signal;
   const check = () => { if (epoch !== sessionEpoch || signal.aborted) throw new DOMException('Stopped. Your draft and completed preparation remain on this page.', 'AbortError'); };
+  let checkpoint;
+  if (kind === 'demo' && generationCheckpoint?.phase === 'retained') generationCheckpoint = null;
+  if (kind !== 'demo') {
+    if (resume) {
+      checkpoint = generationCheckpoint;
+      if (!checkpoint || checkpoint.unavailable || checkpoint.materials !== materialSignature()) { message('generation-error', 'The saved checkpoint is unavailable or attachments changed. No AI request was made.', 'error'); return; }
+    } else {
+      materials.discardCheckpoint();
+      checkpoint = generationCheckpoint = { request: structuredClone(request), materials: materialSignature(), phase: 'preparation', prepared: null, unavailable: false };
+    }
+    checkpoint.approvedSetup = approvedSetup;
+  }
   busy = true; lastRequest = { kind, request }; stopPreviewAudio(); navigate('lesson'); tab('preview'); updateStatus();
   $('preview-empty').hidden = true; $('preview-error').hidden = true; $('preview-result').hidden = true; $('preview-loading').hidden = false;
   $('request-kind').textContent = kind === 'demo' ? 'LOCAL EXAMPLE' : 'CREATING YOUR LESSON';
-  $('progress-title').textContent = kind === 'demo' ? 'Opening the example' : 'Preparing your materials';
-  $('progress-description').textContent = kind === 'demo' ? 'No AI credits are used.' : 'All automatic parts are processed in order. Successful preparation is cached for retries on this page.';
-  if (kind === 'demo') { lessonTrace = null; tracePanel.hidden = true; } else beginTrace(approvedSetup);
+  $('progress-title').textContent = kind === 'demo' ? 'Opening the example' : resume ? 'Continuing from your retained checkpoint' : 'Preparing your materials';
+  $('progress-description').textContent = kind === 'demo' ? 'No AI credits are used.' : resume ? 'Completed preparation is reused. Only unfinished requests run after your renewed confirmation.' : 'Successful preparation is checkpointed on this page. A failed model response never triggers an automatic retry.';
+  if (kind === 'demo') { lessonTrace = null; tracePanel.hidden = true; $('retry-preview').textContent = 'Try again'; } else beginTrace(approvedSetup, resume);
   const started = Date.now(); const tick = () => $('progress-elapsed').textContent = duration(Math.floor((Date.now() - started) / 1000)) + ' elapsed'; tick(); clock = setInterval(tick, 1000);
   try {
     let payload = request, audioSources = [];
@@ -555,8 +590,15 @@ async function preview(kind, request, approvedSetup) {
         $('progress-title').textContent = 'Checking local audio readiness and session capacity';
         await api('/audio/preflight', { method: 'POST', body: {}, signal }); check();
       }
-      const prepared = await materials.prepare({ consent: true, completeAudio: request.includeAudio, goal: request.goal, roles: approvedSetup.roles, expectedSetupRevision: approvedSetup.revision, progress: text => { check(); const part = /^Processing part (\d+) of (\d+)/.exec(text); if (lessonTrace) { lessonTrace.part = part ? tracePart(Number(part[1]), Number(part[2])) : null; lessonTrace.cachedResults = materials.cache.size; renderTrace(); } $('progress-title').textContent = text; } });
-      check();
+      let prepared = checkpoint.prepared;
+      if (!prepared) {
+        const resumePreparation = resume && checkpoint.preparationStarted;
+        checkpoint.preparationStarted = true;
+        prepared = await materials.prepare({ consent: true, resume: Boolean(resumePreparation), completeAudio: request.includeAudio, goal: request.goal, roles: approvedSetup.roles, expectedSetupRevision: approvedSetup.revision, progress: text => { check(); const part = /^Processing part (\d+) of (\d+)/.exec(text); if (lessonTrace) { lessonTrace.part = part ? tracePart(Number(part[1]), Number(part[2])) : null; lessonTrace.cachedResults = materials.cache.size; renderGenerationCheckpoint(); renderTrace(); } $('progress-title').textContent = text; } });
+      }
+      if (checkpoint.unavailable) check();
+      checkpoint.prepared = prepared; checkpoint.phase = 'lesson';
+      renderGenerationCheckpoint(); check();
       // Complete source text travels one descriptor at a time, NEVER inside /lessons.
       const { audioSources: sources = [], ...lessonInput } = prepared; audioSources = sources;
       payload = { ...request, ...lessonInput, consent: true, includeAudio: false };
@@ -565,10 +607,12 @@ async function preview(kind, request, approvedSetup) {
     }
     check();
     const result = kind === 'demo' ? await api('/demo', { signal }) : await api('/lessons', { method: 'POST', body: payload, signal });
+    if (checkpoint?.unavailable) check();
     // Retain a received teaching result BEFORE any subsequent local operation or error.
     currentLesson = { ...result, sample: kind === 'demo', sourceDescription: kind === 'demo' ? 'Hand-authored English sample · no uploaded material' : `${materials.items.length} original attachment(s) · ${materials.partCount} parts processed · ${payload.images.length} representative image(s)` };
     retainLesson(lessonHistory, currentLesson);
     if (kind !== 'demo' && request.includeAudio) currentLesson.audio = createAudioContext({ sources: audioSources, approvedSetup, input: payload, result });
+    if (checkpoint) { checkpoint.phase = 'retained'; checkpoint.lesson = currentLesson; checkpoint.prepared = null; materials.discardCheckpoint(); }
     displayLesson(); announce('Your text lesson is retained and ready to download.');
     if (currentLesson.audio) await runLessonAudio(currentLesson, { signal });
     if (lessonTrace) { lessonTrace.status = currentLesson.audio?.exportedComplete ? 'Complete audio retained' : currentLesson.audio ? 'Text retained; see audio status' : 'Completed'; lessonTrace.cachedResults = materials.cache.size; renderTrace(); tracePanel.open = Boolean(currentLesson.audio?.paused && !currentLesson.audio?.exportedComplete); }
@@ -578,7 +622,7 @@ async function preview(kind, request, approvedSetup) {
     $('preview-error').hidden = false;
     const failedStage = lessonTrace?.operations.at(-1);
     $('preview-error-message').textContent = (failedStage?.status === 'Failed' ? stageLabel(failedStage.stage) + ': ' : '') + error.message;
-    $('preview-error-note').textContent = 'Your attachments, instructions, previous lesson and successful cached preparation remain intact. Retry asks for paid consent and skips cached successes. A failed or unknown AI request may still incur charges.';
+    $('preview-error-note').textContent = checkpoint?.unavailable ? 'The session changed. This checkpoint cannot resume; your draft and any retained HTML remain. No automatic paid retry was made.' : 'Your attachments, saved instructions, previous lesson and successful preparation checkpoints remain intact. Continue generation retries the unfinished step with renewed consent—not successful transcription, recognition or notes. A failed or unknown request may already have been billed. Keep this page open.';
     $('show-previous').hidden = !currentLesson; announce('Processing stopped. Your draft is intact.');
   } finally { clearInterval(clock); busy = false; generationController = null; $('preview-loading').hidden = true; updateStatus(); }
 }
@@ -597,28 +641,36 @@ function displayLesson() {
   $('download-lesson').download = 'LearnLens-' + result.title.replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 70).trim().replace(/\s+/g, '-') + '.html';
   $('preview-dot').hidden = false;
   $('review-note-text').textContent = 'This HTML includes styles, exercises, source images and audio included in the latest successful export. It needs no internet. Open in a browser rather than a file-manager preview. Review AI explanations and answers.';
-  renderAudioStatus();
+  renderAudioStatus(); renderGenerationCheckpoint();
 }
-async function generate(event) {
+async function generate(event, { resume = false } = {}) {
   event?.preventDefault(); message('generation-error');
   if (busy || settingsBusy || confirming || materials.busy || !ready || micPending) return;
   if (!canRetainNextLesson()) return;
   if (!state.roles.primary) { navigate('providers', true); toast('Connect a provider and assign a primary lesson model.'); return; }
   if (recording) { message('generation-error', 'Stop recording before generating a lesson.', 'error'); return; }
-  const request = { language: chosenLanguage(), level: $('level').value, subject: chosenSubject(), goal: $('learning-goal').value.trim(), includeAudio: $('include-audio').checked };
+  const draft = { language: chosenLanguage(), level: $('level').value, subject: chosenSubject(), goal: $('learning-goal').value.trim(), includeAudio: $('include-audio').checked };
+  const saved = generationCheckpoint;
+  // The ordinary create button also recognizes an unchanged interrupted request.
+  if (!resume && saved && saved.phase !== 'retained' && !saved.unavailable && saved.materials === materialSignature() && requestSignature(saved.request) === requestSignature(draft)) resume = true;
+  if (resume && (!saved || saved.unavailable || saved.materials !== materialSignature())) { message('generation-error', 'This checkpoint is unavailable or attachments changed. No AI request was made. Restore the attachments or explicitly start a new lesson.', 'error'); return; }
+  if (resume && saved.phase === 'retained') { currentLesson = saved.lesson; displayLesson(); if (currentLesson.audio) await continueLessonAudio(); return; }
+  const request = resume ? structuredClone(saved.request) : draft;
   if (!request.goal && !materials.items.length) { message('generation-error', 'Add material or ask a question in Instructions.', 'error'); $('learning-goal').focus(); return; }
   if (!request.language || !request.subject) { message('generation-error', 'Enter your chosen language and subject, or choose automatic detection.', 'error'); return; }
   if (materials.items.some(item => item.status !== 'ready')) { message('generation-error', 'Resume failed local imports before creating the lesson.', 'error'); return; }
-  if (materials.needsTranscription && !state.roles.transcription) { message('generation-error', 'Assign a transcription role in AI providers for your audio or video.', 'error'); return; }
+  if (!resume && materials.needsTranscription && !state.roles.transcription) { message('generation-error', 'Assign a transcription role in AI providers for your audio or video.', 'error'); return; }
   if (!Number.isInteger(state.setupRevision)) { message('generation-error', 'Refresh AI setup before confirming: the server did not provide its setup revision.', 'error'); return; }
   const approvedSetup = { revision: state.setupRevision, roles: structuredClone(state.roles), speechProvider: providerFor(state.roles.speech)?.name || 'Built-in Kokoro' };
   request.expectedSetupRevision = approvedSetup.revision;
   const epoch = sessionEpoch; confirming = true; updateStatus();
   let consent;
   try {
-    consent = await confirmAction({ title: 'Process all parts and create your lesson?', description: 'Extracted text and images go to your primary provider; prepared audio parts go to your transcription provider. Originals never go directly to providers. This can make multiple billable calls. AI digests are lossy, not guaranteed verbatim; only representative preview images are embedded. Remove sensitive material before continuing.', detail: materials.describe({ completeAudio: request.includeAudio }) + '\nPrimary: ' + providerFor(approvedSetup.roles.primary)?.name + ' / ' + approvedSetup.roles.primary.model + (materials.needsTranscription ? '\nSpeech-to-text: ' + providerFor(approvedSetup.roles.transcription)?.name + ' / ' + approvedSetup.roles.transcription.model + '\nTranscription API: ' + transcriptionMode(approvedSetup.roles.transcription) : '') + (request.includeAudio ? '\nComplete English audio: local encoder readiness/capacity is checked before any paid work; managed assets may download, but preflight uses no AI. Extra source recognition: one potentially paid primary-model OCR call per extracted visual (before cache reuse). After teaching, a second confirmation shows the exact unique word/sentence clip count and speech provider/voice. All English word targets and sentences from both sources and the generated lesson are included, not just AI keywords. English/Latin matching is not reliable language identification; OCR/transcription may miss or misrecognize content. Native Kokoro is English-only. Your teaching language stays unchanged.' : ''), paid: true, accept: 'Process all parts & create' });
+    const info = resume ? checkpointMetadata() : null;
+    const replace = !resume && saved && saved.phase !== 'retained' && !saved.unavailable;
+    consent = await confirmAction({ title: resume ? 'Continue generation from the last checkpoint?' : replace ? 'Start a new lesson instead of continuing?' : 'Process all parts and create your lesson?', description: resume ? 'Reuse successful transcription, image recognition and preparation notes. Only the failed/unknown step and remaining work can make new billable requests. The saved instructions/options are used; current form edits are not applied. Current confirmed model settings apply only to unfinished steps; earlier successful results may come from a previous model. Incomplete model output is not treated as a successful checkpoint.' : (replace ? 'Starting this changed request replaces the unfinished checkpoint and may repeat paid preparation. Cancel and use Continue generation to keep the saved request. ' : '') + 'Extracted text and images go to your primary provider; prepared audio parts go to your transcription provider. Originals never go directly to providers. This can make multiple billable calls. AI digests are lossy, not guaranteed verbatim; only representative preview images are embedded. Remove sensitive material before continuing.', detail: (resume ? `${info.completedCalls} successful preparation call(s) retained; ${info.completedParts}/${info.totalParts} parts prepared. ${info.preparationComplete ? 'Preparation is complete: retry only final lesson generation.' : 'Resume the unfinished preparation step, then generate the final lesson.'}\nNo successful checkpoint is evicted to make room for another request; quotas stop before new paid work. Failed/unknown attempts may already have been billed.\n` : '') + materials.describe({ completeAudio: request.includeAudio }) + '\nPrimary: ' + providerFor(approvedSetup.roles.primary)?.name + ' / ' + approvedSetup.roles.primary.model + (materials.needsTranscription && approvedSetup.roles.transcription ? '\nSpeech-to-text: ' + providerFor(approvedSetup.roles.transcription)?.name + ' / ' + approvedSetup.roles.transcription.model + '\nTranscription API: ' + transcriptionMode(approvedSetup.roles.transcription) : '') + (request.includeAudio ? '\nComplete English audio: local encoder readiness/capacity is checked before any paid work; managed assets may download, but preflight uses no AI. Extra source recognition: one potentially paid primary-model OCR call per extracted visual (before cache reuse). After teaching, a second confirmation shows the exact unique word/sentence clip count and speech provider/voice. All English word targets and sentences from both sources and the generated lesson are included, not just AI keywords. English/Latin matching is not reliable language identification; OCR/transcription may miss or misrecognize content. Native Kokoro is English-only. Your teaching language stays unchanged.' : ''), paid: true, accept: resume ? 'Continue from checkpoint' : replace ? 'Replace checkpoint & create' : 'Process all parts & create' });
   } finally { confirming = false; updateStatus(); }
-  if (consent && epoch === sessionEpoch) await preview('generate', request, approvedSetup);
+  if (consent && epoch === sessionEpoch) await preview('generate', request, approvedSetup, { resume });
 }
 
 async function toggleRecording() {
@@ -665,13 +717,14 @@ $('continue-audio').onclick = () => continueLessonAudio();
 $('download-partial').onclick = () => continueLessonAudio({ exportOnly: true });
 $('stop-audio').onclick = () => cancelWork();
 $('discard-audio').onclick = discardLessonAudio;
-$('retry-preview').onclick = () => { if (lastRequest?.kind === 'demo') preview('demo'); else generate(); };
+$('retry-preview').onclick = () => { if (lastRequest?.kind === 'demo') preview('demo'); else generate(undefined, { resume: true }); };
+generationContinue.onclick = () => generate(undefined, { resume: true });
 $('stop-processing').onclick = () => cancelWork();
 $('dismiss-toast').onclick = () => $('toast').hidden = true;
 $('retry-state').onclick = () => refreshState();
 $('reload-session').onclick = async () => { if (await confirmAction({ title: 'Reload your session?', description: 'Download any finished lesson and copy your draft first. Reloading clears the current draft.', accept: 'Reload' })) location.reload(); };
 $('clear-session').onclick = async () => {
-  if (!await confirmAction({ title: 'Clear this browser’s session?', description: 'Your provider keys and custom model assignments will be removed. Included speech returns to its default where available. Your current draft stays on this page. Already submitted AI requests cannot be undone.', accept: 'Clear session' })) return;
+  if (!await confirmAction({ title: 'Clear this browser’s session?', description: 'Your provider keys and custom model assignments will be removed. Included speech returns to its default where available. Your current draft stays on this page, but generation and audio continuation checkpoints become unavailable. Keep any downloaded lessons. Already submitted AI requests cannot be undone.', accept: 'Clear session' })) return;
   cancelWork(true);
   try { await api('/logout', { method: 'POST', body: {} }); lessonTrace = null; tracePanel.hidden = true; resetProviderForm(); await refreshState(); toast('Your provider settings were cleared.'); } catch (error) { toast(error.message); }
 };

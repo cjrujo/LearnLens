@@ -31,7 +31,7 @@ async function normalizeImage(dataUrl, name) {
 }
 export class MaterialWorkspace {
   constructor({ list, api, changed }) {
-    this.list = list; this.api = api; this.changed = changed; this.items = []; this.epoch = 0; this.locked = false; this.pending = 0; this.queue = Promise.resolve(); this.controllers = new Set(); this.cache = new Map(); this.cacheBytes = 0;
+    this.list = list; this.api = api; this.changed = changed; this.items = []; this.epoch = 0; this.locked = false; this.pending = 0; this.queue = Promise.resolve(); this.controllers = new Set(); this.cache = new Map(); this.cacheBytes = 0; this.checkpoint = null; this.preparing = false;
   }
   get busy() { return this.pending > 0; }
   get partCount() { return this.items.reduce((n, item) => n + (item.partCount || 0), 0); }
@@ -41,6 +41,8 @@ export class MaterialWorkspace {
   check(epoch) { if (epoch !== this.epoch) throw new DOMException('Stopped. Your draft and completed work remain on this page.', 'AbortError'); }
   cancelPending({ session = false } = {}) {
     this.epoch++; for (const controller of this.controllers) controller.abort();
+    if (session) this.discardCheckpoint();
+    else if (this.checkpoint) this.checkpointProgress(this.checkpoint);
     for (const item of this.items) {
       if (item.status === 'preparing') { item.status = 'error'; item.error = 'Import stopped. Resume local import to continue.'; }
       if (session && item.remote) item.needsUpload = true;
@@ -181,38 +183,153 @@ export class MaterialWorkspace {
     while (this.cache.size && (this.cacheBytes + size > 8 * 1024 * 1024 || this.cache.size >= 1024)) { const first = this.cache.keys().next().value; this.cacheBytes -= this.cache.get(first).size; this.cache.delete(first); }
     this.cache.set(key, { value, size }); this.cacheBytes += size;
   }
-  async prepare({ consent, goal, roles, expectedSetupRevision, progress = () => {}, completeAudio = false }) {
+  checkpointInfo() {
+    const job = this.checkpoint;
+    if (!job || job.invalidated) return { available: false, complete: false, completedCalls: 0, completedParts: 0, totalParts: 0, stage: 'unavailable', unavailable: true };
+    return { available: true, complete: Boolean(job.result), completedCalls: job.pinned.size, completedParts: job.completedParts.size, totalParts: job.totalParts, stage: job.stage,
+      ...(job.part === undefined ? {} : { part: job.part }), ...(job.failed ? { failed: true } : {}), ...(job.unavailable ? { unavailable: true } : {}) };
+  }
+  discardCheckpoint() {
+    const job = this.checkpoint;
+    if (!job) return;
+    job.invalidated = true; job.pinned.clear(); job.pinnedBytes = 0; job.generator = null; job.pending = null; job.accepted = undefined; job.result = null;
+    this.checkpoint = null;
+    this.checkpointProgress(job, 'Saved preparation discarded.');
+  }
+  checkpointProgress(job, message = job.message) {
+    job.message = message;
+    // A display callback must not turn an accepted paid result into lost work.
+    try { job.progress?.(message, this.checkpointInfo()); } catch {}
+  }
+  checkPreparation(job) {
+    if (job.invalidated || this.checkpoint !== job) throw new DOMException('Saved preparation was discarded. Start a new request.', 'AbortError');
+    this.check(job.epoch);
+  }
+  pinPreparation(job, key, result) {
+    if (job.pinned.has(key)) return;
+    const size = JSON.stringify(result).length * 2;
+    if (size > 1024 * 1024 || job.pinned.size >= 4096 || job.pinnedBytes + size > 64 * 1024 * 1024) {
+      job.unavailable = true;
+      throw new Error('Preparation checkpoint quota exceeded (64 MiB, 4096 results, 1 MiB per result). Earlier successes remain saved; no further paid calls were made.');
+    }
+    job.pinned.set(key, result); job.pinnedBytes += size;
+  }
+  async preparationRequest(job, request) {
+    this.checkPreparation(job);
+    const key = await hash(JSON.stringify([request.path, request.stable, request.body]));
+    this.checkPreparation(job);
+    if (job.pinned.has(key)) return job.pinned.get(key);
+    if (!job.roles?.[request.role]) throw new Error(request.role === 'transcription' ? 'Assign a transcription model for attached audio or video.' : 'Assign a primary model for unfinished material preparation.');
+    // Consent and current revision are attached only at dispatch, never captured by a suspended yield.
+    const body = request.path === '/materials/summarize'
+      ? { consent: true, expectedSetupRevision: job.revision, ...request.body }
+      : { ...request.body, consent: true, expectedSetupRevision: job.revision };
+    const cacheKey = await hash(JSON.stringify([request.stable, job.roles[request.role], body]));
+    this.checkPreparation(job);
+    const cached = this.cache.get(cacheKey);
+    if (cached) {
+      this.pinPreparation(job, key, cached.value); this.checkpointProgress(job);
+      this.checkPreparation(job); return cached.value;
+    }
+    // Reserve worst-case response space before incurring any new billable request. Never evict a checkpoint.
+    if (job.pinned.size >= 4096 || job.pinnedBytes + 1024 * 1024 > 64 * 1024 * 1024) {
+      job.unavailable = true;
+      throw new Error('Preparation checkpoint quota reached (64 MiB / 4096 results). Earlier successes remain saved; no further paid calls were made.');
+    }
+    if (job.calls >= 512) throw new Error('The automatic preparation safety budget of 512 calls was reached. Completed work is saved in this page. Review with your app administrator before continuing.');
+    job.calls++;
+    const controller = new AbortController(); this.controllers.add(controller);
+    try {
+      // Unlike local imports, an acknowledged success is saved even if ordinary Stop raced its response.
+      const result = await this.api(request.path, { method: 'POST', body, signal: controller.signal });
+      if (job.invalidated || this.checkpoint !== job) this.checkPreparation(job);
+      if (request.path === '/audio/extract') validateVisionExtraction(result);
+      else if (typeof result?.text !== 'string' || !result.text.trim() || (request.path.endsWith('/summarize') && result.text.length > 2200)) throw new Error('The provider returned an invalid preparation result. No further paid calls were made.');
+      this.pinPreparation(job, key, result);
+      this.cachePut(cacheKey, result);
+      this.checkpointProgress(job);
+      this.checkPreparation(job);
+      return result;
+    } finally { this.controllers.delete(controller); }
+  }
+  async prepare({ consent, goal, roles, expectedSetupRevision, progress = () => {}, completeAudio = false, resume = false }) {
+    if (this.preparing) throw new Error('A preparation request is already running. Stop or wait before continuing.');
     if (!consent) throw new Error('Explicit paid consent is required.');
     if (!Number.isInteger(expectedSetupRevision)) throw new Error('A confirmed AI setup revision is required. Refresh setup and confirm again.');
-    roles = structuredClone(roles); // Fixed destinations for this entire preparation, even if /state refreshes.
+    const inputs = JSON.stringify([goal, completeAudio, this.items.map(item => [item.id, item.partCount])]);
+    if (resume && (!this.checkpoint || this.checkpoint.inputs !== inputs)) throw new Error('No matching preparation checkpoint. The goal, audio option and ordered materials must match; start a new request.');
     if (this.busy) throw new Error('Wait for local imports to finish.');
     if (this.items.some(item => item.status !== 'ready')) throw new Error('Resume failed local imports before creating the lesson.');
-    const epoch = this.epoch; let calls = 0, processed = 0, visualCount = 0, digested = false; const representatives = [], warnings = [], notes = [];
+    const approvedRoles = structuredClone(roles);
+    if (!resume) {
+      this.discardCheckpoint();
+      this.checkpoint = { inputs, items: [...this.items], goal, completeAudio, totalParts: this.partCount, pinned: new Map(), pinnedBytes: 0, completedParts: new Set(), stage: 'starting', message: 'Preparing materials…' };
+    }
+    const job = this.checkpoint;
+    Object.assign(job, { epoch: this.epoch, roles: approvedRoles, revision: expectedSetupRevision, progress, calls: 0, failed: false, unavailable: false });
+    this.preparing = true;
+    try {
+      this.checkpointProgress(job);
+      this.checkPreparation(job);
+      if (job.result) return job.result;
+      for (;;) {
+        this.checkPreparation(job);
+        if (!job.pending) {
+          job.generator ||= this.preparationSteps(job);
+          let step;
+          try { step = await job.generator.next(job.accepted); }
+          catch (error) {
+            // Local failures close generators. Rebuild their collector from pinned successes, never paid replay.
+            job.generator = null; job.accepted = undefined;
+            throw error;
+          }
+          job.accepted = undefined;
+          if (job.invalidated || this.checkpoint !== job) this.checkPreparation(job);
+          if (step.done) {
+            job.result = step.value; job.generator = null; job.stage = 'complete';
+            this.checkpointProgress(job, 'Material preparation complete.');
+            this.checkPreparation(job); return job.result;
+          }
+          // Save the yielded position before checking an ordinary Stop race.
+          job.pending = step.value;
+          this.checkPreparation(job);
+        }
+        job.stage = job.pending.stage; this.checkpointProgress(job);
+        const result = await this.preparationRequest(job, job.pending);
+        this.checkPreparation(job);
+        job.pending = null; job.accepted = result;
+      }
+    } catch (error) {
+      if (!job.invalidated) { job.failed = true; this.checkpointProgress(job); }
+      throw error;
+    } finally {
+      this.preparing = false;
+      // Keep no approved setup or callback closure in a dormant checkpoint.
+      job.roles = null; job.progress = null;
+    }
+  }
+  async * preparationSteps(job) {
+    const { goal, completeAudio } = job;
+    let processed = 0, visualCount = 0, digested = false;
+    const representatives = [], warnings = [], notes = [];
     const audioCollector = completeAudio ? new AudioSourceCollector() : null;
+    const progress = message => this.checkpointProgress(job, message);
+    const completePart = () => { job.completedParts.add(processed); this.checkpointProgress(job); };
     const warn = value => { const text = String(value).slice(0, 500); if (!warnings.includes(text) && warnings.length < 29) warnings.push(text); };
-    const paid = async (path, body, stable, role) => {
-      this.check(epoch); const key = await hash(JSON.stringify([stable, role, body])); this.check(epoch);
-      const cached = this.cache.get(key); if (cached) return cached.value;
-      if (++calls > 512) throw new Error('The automatic preparation safety budget of 512 calls was reached. Completed work is saved in this page. Review with your app administrator before continuing.');
-      // Never retry a failed or unknown billable request automatically.
-      const result = await this.local(path, { method: 'POST', body }, epoch); this.check(epoch);
-      if (path === '/audio/extract') validateVisionExtraction(result);
-      else if (typeof result.text !== 'string' || !result.text.trim() || (path.endsWith('/summarize') && result.text.length > 2200)) throw new Error('The provider returned an invalid preparation result. No further paid calls were made.');
-      this.cachePut(key, result); return result;
-    };
-    const digest = async (text, images, source, stable) => {
+    const digest = async function* (text, images, source, stable) {
       digested = true;
-      const result = await paid('/materials/summarize', { consent: true, expectedSetupRevision, text, images, goal, source: source.slice(0, 200) }, stable, roles.primary);
+      const result = yield { path: '/materials/summarize', body: { text, images, goal, source: source.slice(0, 200) }, stable, role: 'primary', stage: stable === 'merge' ? 'merge' : 'digest' };
       for (const warning of result.warnings || []) warn(source + ': ' + warning);
       return `[Source: ${source.slice(0, 200)}]\n${result.text}`;
     };
-    for (const item of this.items) {
-      this.check(epoch);
-      if (item.needsUpload) { progress('Restoring local original: ' + item.name); await this.upload(item, epoch); }
-      if (audioCollector) { const key = await hash(item.id); this.check(epoch); audioCollector.beginItem({ key, source: item.name, contiguous: isContiguousAudioText(item) }); }
+    for (const item of job.items) {
+      this.checkPreparation(job);
+      if (item.needsUpload) { progress('Restoring local original: ' + item.name); await this.upload(item, job.epoch); }
+      if (audioCollector) { const key = await hash(item.id); this.checkPreparation(job); audioCollector.beginItem({ key, source: item.name, contiguous: isContiguousAudioText(item) }); }
       for (let index = 0; index < item.partCount; index++) {
-        progress(`Processing part ${++processed} of ${this.partCount} · ${item.name}`);
-        const part = await this.part(item, index, epoch); this.check(epoch);
+        job.part = ++processed; job.stage = 'reading';
+        progress(`Processing part ${processed} of ${job.totalParts} · ${item.name}`);
+        const part = await this.part(item, index, job.epoch); this.checkPreparation(job);
         const source = `${item.name} · ${part.label || `part ${index + 1}`} (${index + 1}/${item.partCount})`.slice(0, 200), stable = item.id + ':' + index;
         for (const warning of [...item.warnings, ...(part.warnings || [])]) warn(item.name + ': ' + warning);
         let text = part.text || '';
@@ -220,47 +337,47 @@ export class MaterialWorkspace {
         const extractionWarnings = [...item.warnings, ...(part.warnings || [])];
         audioCollector?.addPart({ index, text, source: audioSource, warnings: extractionWarnings, hasAlternativeExtraction: Boolean(part.audio || part.images?.length) });
         if (part.audio) {
-          if (!roles.transcription) throw new Error('Assign a transcription model for attached audio or video.');
-          const result = await paid('/transcribe', { dataUrl: part.audio, name: source.slice(0, 180), consent: true, expectedSetupRevision }, stable + ':transcription', roles.transcription);
+          const result = yield { path: '/transcribe', body: { dataUrl: part.audio, name: source.slice(0, 180) }, stable: stable + ':transcription', role: 'transcription', stage: 'transcription' };
           audioCollector?.addTranscription({ index, text: result.text, source: audioSource + ' · speech', warnings: [...extractionWarnings, ...(result.warnings || [])] });
           text = [text, result.text].filter(Boolean).join('\n'); delete part.audio;
           warn(item.name + ': ' + TRANSCRIPTION_WARNING);
         }
         const visuals = [];
         for (const original of part.images || []) {
-          const image = await normalizeImage(original.dataUrl, (source + ' · ' + original.name).slice(0, 180)); this.check(epoch); visuals.push(image); visualCount++;
+          const image = await normalizeImage(original.dataUrl, (source + ' · ' + original.name).slice(0, 180)); this.checkPreparation(job); visuals.push(image); visualCount++;
           const resizeWarning = 'Some extracted visuals were resized; fine detail may be lost.';
           if (image.dataUrl !== original.dataUrl) warn(item.name + ': ' + resizeWarning);
           if (audioCollector) {
             const imageIndex = visuals.length - 1;
-            const result = await paid('/audio/extract', { image, consent: true, expectedSetupRevision }, stable + ':audio-extract:' + imageIndex, roles.primary);
+            const result = yield { path: '/audio/extract', body: { image }, stable: stable + ':audio-extract:' + imageIndex, role: 'primary', stage: 'extraction' };
             audioCollector.addVision({ index, imageIndex, result, source: `Image ${imageIndex + 1} · ${audioSource} · ${original.name || 'visual'}`, warnings: [...extractionWarnings, ...(image.dataUrl !== original.dataUrl ? [resizeWarning] : [])] });
             for (const warning of result.warnings) warn(source + ': ' + warning);
           }
           if (representatives.length < 5 && representatives.reduce((n, entry) => n + bytesOf(entry.dataUrl), 0) + bytesOf(image.dataUrl) <= 8 * 1024 * 1024) representatives.push(image);
         }
-        if (!text.trim() && !visuals.length) { warn(source + ': No readable text, speech or visuals were extracted.'); continue; }
-        const mustDigest = this.partCount > 1 || text.length + source.length + 12 > 35000 || visuals.length > 5 || visuals.reduce((n, image) => n + bytesOf(image.dataUrl), 0) > 8 * 1024 * 1024;
-        if (!mustDigest) { notes.push(text ? `[Source: ${source}]\n${text}` : ''); continue; }
+        if (!text.trim() && !visuals.length) { warn(source + ': No readable text, speech or visuals were extracted.'); completePart(); continue; }
+        const mustDigest = job.totalParts > 1 || text.length + source.length + 12 > 35000 || visuals.length > 5 || visuals.reduce((n, image) => n + bytesOf(image.dataUrl), 0) > 8 * 1024 * 1024;
+        if (!mustDigest) { notes.push(text ? `[Source: ${source}]\n${text}` : ''); completePart(); continue; }
         const pieces = split(text); const batches = []; let batch = [], size = 0;
         for (const image of visuals) { if (batch.length === 5 || size + bytesOf(image.dataUrl) > 8 * 1024 * 1024) { batches.push(batch); batch = []; size = 0; } batch.push(image); size += bytesOf(image.dataUrl); }
         if (batch.length) batches.push(batch);
-        for (let p = 0; p < Math.max(pieces.length, batches.length); p++) notes.push(await digest(pieces[p] || '', batches[p] || [], source, stable + ':digest:' + p));
+        for (let p = 0; p < Math.max(pieces.length, batches.length); p++) notes.push(yield* digest(pieces[p] || '', batches[p] || [], source, stable + ':digest:' + p));
+        completePart();
       }
       audioCollector?.endItem();
     }
-    if (!audioCollector && this.items.length && !notes.some(text => text.trim()) && !representatives.length) throw new Error('No readable material was extracted. Review the local previews; your attachments remain intact.');
+    if (!audioCollector && job.items.length && !notes.some(text => text.trim()) && !representatives.length) throw new Error('No readable material was extracted. Review the local previews; your attachments remain intact.');
     let merged = notes.filter(Boolean);
     while (merged.join('\n\n').length > 35000) {
       const groups = []; let group = [];
       for (const note of merged) { if ([...group, note].join('\n\n').length > 30000 && group.length) { groups.push(group.join('\n\n')); group = []; } group.push(note); }
       if (group.length) groups.push(group.join('\n\n'));
       const next = [];
-      for (let i = 0; i < groups.length; i++) { progress(`Merging source notes ${i + 1} of ${groups.length}`); next.push(await digest(groups[i], [], 'Merged source notes (retain source labels)', 'merge')); }
+      for (let i = 0; i < groups.length; i++) { progress(`Merging source notes ${i + 1} of ${groups.length}`); next.push(yield* digest(groups[i], [], 'Merged source notes (retain source labels)', 'merge')); }
       if (next.join('\n\n').length >= merged.join('\n\n').length) throw new Error('AI notes did not become shorter. Completed work is saved; no further calls were made.');
       merged = next;
     }
-    this.check(epoch);
+    this.checkPreparation(job);
     if (digested) warnings.unshift('AI digests are lossy and are not guaranteed verbatim. All extracted parts were processed; verify important details against the originals.');
     if (visualCount > representatives.length) warnings.unshift(`All ${visualCount} extracted visuals were processed, but only ${representatives.length} representative preview images are embedded in the lesson.`);
     if (warnings.length >= 29) warnings.splice(29, Infinity, 'Additional source limitations may be shown in the local material review.');

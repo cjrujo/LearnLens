@@ -337,13 +337,14 @@ test('image extraction shares the 512-call budget and 8 MiB result cache', async
   await assert.rejects(value.prepare({ ...settings, completeAudio: true }), /512 calls/);
   assert.equal(calls, 512);
   assert.ok(value.cacheBytes <= 8 * 1024 * 1024);
-  // Existing cache sizing is JSON UTF-16 bytes. Oversize successes are returned
-  // but not cached, and a subsequent paid attempt still requires consent.
+  // General-cache sizing remains bounded. A fabricated response far above the
+  // server's40k OCR contract must now fail explicitly, not become an unretained success.
   const bigText = 'a '.repeat(2100000);
   let largeCalls = 0;
   const large = visualWorkspace(1, async () => { largeCalls++; return { text: bigText, warnings: [], coverage: 'complete' }; });
-  const result = await large.prepare({ ...settings, completeAudio: true });
-  assert.equal(result.audioSources.filter(source => source.extraction === 'vision').map(source => source.text).join(''), bigText);
+  await assert.rejects(large.prepare({ ...settings, completeAudio: true }), /1 MiB per result/);
+  assert.equal(large.checkpointInfo().completedCalls, 0);
+  large.cachePut('oversized-cache-fixture', { text: bigText });
   assert.equal(large.cacheBytes, 0);
   assert.equal(largeCalls, 1);
   await assert.rejects(large.prepare({ ...settings, completeAudio: true, consent: false }), /Explicit paid consent/);
@@ -358,4 +359,396 @@ test('unreadable-only sources return explicit inventory on opt-in; legacy still 
   assert.equal(audioSources[0].coverage, 'unavailable');
   assert.equal(audioSources[0].text, ' \n');
   assert.deepEqual((await workspace([]).prepare({ ...settings, completeAudio: true })).audioSources, []);
+});
+
+// Checkpoint regressions use synthetic local parts and paid responses only.
+const checkpointAudio = api => {
+  const value = workspace([{ id: 'checkpoint-audio', name: 'private-voice.mp3', kind: 'media', status: 'ready', partCount: 2, warnings: [] }], api);
+  value.render = () => {};
+  value.reads = [];
+  value.part = async (_item, index) => {
+    value.reads.push(index);
+    return { text: '', audio: `synthetic-${index}`, images: [], label: `segment ${index}` };
+  };
+  return value;
+};
+const evictGeneralCache = value => value.cachePut('pressure', { text: 'x'.repeat(4194280) });
+
+test('checkpoint: cache eviction cannot replay successful speech or earlier digests on Continue', async () => {
+  const calls = []; let fail = true;
+  const value = checkpointAudio(async (path, { body }) => {
+    calls.push(path);
+    return { text: path === '/transcribe' ? `Exact ${body.dataUrl}\n` : fail && body.source.includes('segment 1') ? '' : 'Digest', warnings: [] };
+  });
+  await assert.rejects(value.prepare({ ...settings, completeAudio: true }), /invalid preparation/);
+  assert.deepEqual(calls, ['/transcribe', '/materials/summarize', '/transcribe', '/materials/summarize']);
+  evictGeneralCache(value);
+  fail = false;
+  const result = await value.prepare({ ...settings, completeAudio: true, resume: true });
+  assert.equal(calls.length, 5, 'Continue dispatches only the failed digest, even after general-cache eviction');
+  assert.deepEqual(value.reads, [0, 1], 'suspended generator keeps the current local part');
+  assert.deepEqual(result.audioSources.map(source => source.text), ['Exact synthetic-0\n', 'Exact synthetic-1\n']);
+});
+
+
+test('checkpoint: repeated invalid digest keeps STT/OCR and dispatches unfinished work with new approved setup', async t => {
+  stubImage(t);
+  const calls = [], updates = []; let fail = true, reads = 0;
+  const value = visualWorkspace(1, async (path, { body }) => {
+    calls.push({ path, revision: body.expectedSetupRevision });
+    if (path === '/transcribe') return { text: ' Full speech tail.\n', warnings: [] };
+    if (path === '/audio/extract') return { text: ' Full image tail.\n', warnings: [], coverage: 'complete' };
+    return { text: fail ? '' : 'DIGEST', warnings: [] };
+  }, 2);
+  const part = value.part;
+  value.part = async (...args) => { reads++; return { ...await part(...args), ...(args[1] === 0 ? { audio: 'synthetic' } : {}) }; };
+  const progress = (text, info) => updates.push({ text, info });
+  const options = { ...settings, completeAudio: true, progress };
+  await assert.rejects(value.prepare(options), /invalid preparation/);
+  assert.deepEqual(value.checkpointInfo(), { available: true, complete: false, completedCalls: 2, completedParts: 0, totalParts: 2, stage: 'digest', part: 1, failed: true });
+  evictGeneralCache(value);
+  await assert.rejects(value.prepare({ ...options, resume: true }), /invalid preparation/);
+  assert.equal(calls.length, 4);
+  assert.equal(reads, 1);
+  fail = false;
+  const changed = { ...options, resume: true, expectedSetupRevision: 7, roles: { primary: { model: 'new-primary' }, transcription: null } };
+  const result = await value.prepare(changed);
+  assert.deepEqual(calls.map(call => call.path), ['/transcribe', '/audio/extract', '/materials/summarize', '/materials/summarize', '/materials/summarize', '/audio/extract', '/materials/summarize']);
+  assert.deepEqual(calls.slice(4).map(call => call.revision), [7, 7, 7]);
+  assert.equal(reads, 2);
+  assert.deepEqual(result.audioSources.map(source => source.text), [' Full speech tail.\n', ' Full image tail.\n', ' Full image tail.\n']);
+  assertDescriptors(result.audioSources);
+  assert.equal(value.checkpointInfo().completedCalls, 5);
+  assert.equal(value.checkpointInfo().completedParts, 2);
+  assert.equal(value.checkpointInfo().complete, true);
+  assert.ok(updates.some(({ info }) => info.stage === 'transcription' && info.completedCalls === 1 && info.completedParts === 0));
+  assert.ok(updates.some(({ info }) => info.stage === 'extraction' && info.completedCalls === 2));
+  const allowed = ['available', 'complete', 'completedCalls', 'completedParts', 'totalParts', 'stage', 'part', 'failed', 'unavailable'];
+  assert.ok(updates.every(({ info }) => Object.keys(info).every(key => allowed.includes(key))));
+  assert.ok(!JSON.stringify(updates.map(update => update.info)).includes('scans'));
+  assert.equal(value.checkpoint.roles, null, 'dormant checkpoints retain no approved setup');
+});
+
+test('checkpoint: final teaching failure can reuse finished preparation without any reads or paid calls', async () => {
+  let calls = 0;
+  const value = checkpointAudio(async () => { calls++; return { text: 'Exact accepted words\n', warnings: [] }; });
+  const result = await value.prepare({ ...settings, completeAudio: true });
+  const priorCalls = calls;
+  value.part = async () => { throw new Error('Must not reopen a local source'); };
+  value.api = async () => { throw new Error('Must not dispatch a paid request'); };
+  evictGeneralCache(value);
+  const continued = await value.prepare({ ...settings, completeAudio: true, resume: true, expectedSetupRevision: 9, roles: { primary: { model: 'new' }, transcription: null } });
+  assert.strictEqual(continued, result);
+  assert.equal(calls, priorCalls);
+  assert.equal(value.checkpointInfo().complete, true);
+});
+
+test('checkpoint: unmatched inputs, missing checkpoint or missing consent reject before dispatch', async () => {
+  let calls = 0;
+  const items = ['first', 'second'].map(id => ({ id, name: id + '.txt', kind: 'text', status: 'ready', partCount: 1, textParts: [id], warnings: [] }));
+  const value = workspace(items, async () => { calls++; return { text: 'Digest', warnings: [] }; });
+  await assert.rejects(value.prepare({ ...settings, resume: true }), /matching preparation checkpoint/);
+  assert.equal(calls, 0);
+  await value.prepare(settings);
+  const saved = calls;
+  for (const changed of [{ goal: 'different' }, { completeAudio: true }]) {
+    await assert.rejects(value.prepare({ ...settings, ...changed, resume: true }), /matching preparation checkpoint/);
+  }
+  value.items.reverse();
+  await assert.rejects(value.prepare({ ...settings, resume: true }), /matching preparation checkpoint/);
+  value.items.reverse();
+  value.items[0].id = 'different';
+  await assert.rejects(value.prepare({ ...settings, resume: true }), /matching preparation checkpoint/);
+  value.items[0].id = 'first'; value.items[0].partCount = 2;
+  await assert.rejects(value.prepare({ ...settings, resume: true }), /matching preparation checkpoint/);
+  value.items[0].partCount = 1;
+  await assert.rejects(value.prepare({ ...settings, resume: true, consent: false }), /Explicit paid consent/);
+  await assert.rejects(value.prepare({ ...settings, resume: true, expectedSetupRevision: undefined }), /confirmed AI setup revision/);
+  assert.equal(calls, saved);
+  assert.equal(value.checkpointInfo().complete, true);
+});
+
+const deferred = () => {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
+};
+
+test('checkpoint: ordinary Stop retains acknowledged late success and concurrent runners are rejected', async () => {
+  const entered = deferred(), response = deferred(), calls = [], updates = [];
+  const value = checkpointAudio(async (path, options) => {
+    calls.push(path);
+    if (calls.length === 1) { entered.resolve(options.signal); return response.promise; }
+    return { text: 'Accepted', warnings: [] };
+  });
+  const running = value.prepare({ ...settings, completeAudio: true, progress: (_text, info) => updates.push(info) });
+  const signal = await entered.promise;
+  await assert.rejects(value.prepare({ ...settings, resume: true, completeAudio: true }), /already running/);
+  await assert.rejects(value.prepare(settings), /already running/);
+  value.cancelPending();
+  assert.equal(signal.aborted, true);
+  response.resolve({ text: 'Saved despite Stop\n', warnings: [] });
+  await assert.rejects(running, { name: 'AbortError' });
+  assert.equal(calls.length, 1);
+  assert.equal(value.checkpointInfo().completedCalls, 1);
+  assert.equal(value.cache.size, 1, 'ordinary Stop does not clear general cache');
+  assert.ok(updates.some(info => info.completedCalls === 1));
+  evictGeneralCache(value);
+  const result = await value.prepare({ ...settings, completeAudio: true, resume: true });
+  assert.deepEqual(calls, ['/transcribe', '/materials/summarize', '/transcribe', '/materials/summarize']);
+  assert.deepEqual(value.reads, [0, 1]);
+  assert.equal(result.audioSources[0].text, 'Saved despite Stop\n');
+});
+
+test('checkpoint: discard and logout invalidate prior successes and cannot be resurrected by late responses', async () => {
+  for (const invalidate of [value => value.discardCheckpoint(), value => value.cancelPending({ session: true })]) {
+    const entered = deferred(), response = deferred(); let calls = 0;
+    const value = checkpointAudio(async path => {
+      calls++;
+      if (path === '/materials/summarize') { entered.resolve(); return response.promise; }
+      return { text: 'Prior success', warnings: [] };
+    });
+    const running = value.prepare({ ...settings, completeAudio: true });
+    await entered.promise;
+    assert.equal(value.checkpointInfo().completedCalls, 1);
+    invalidate(value);
+    assert.equal(value.checkpointInfo().available, false);
+    response.resolve({ text: 'Late digest must not survive', warnings: [] });
+    await assert.rejects(running, { name: 'AbortError' });
+    assert.equal(value.checkpointInfo().available, false);
+    assert.equal(value.cache.size, 1, 'invalidated late response is not cached');
+    await assert.rejects(value.prepare({ ...settings, completeAudio: true, resume: true }), /matching preparation checkpoint/);
+    assert.equal(calls, 2);
+  }
+});
+
+test('checkpoint: local part errors and local Stop rebuild the collector solely from pinned paid successes', async () => {
+  for (const failure of ['error', 'abort', 'stop']) {
+    let calls = 0, fail = true;
+    const value = checkpointAudio(async (_path, { body }) => { calls++; return { text: body.dataUrl ? body.dataUrl + '\n' : 'Digest', warnings: [] }; });
+    const read = value.part;
+    value.part = async (...args) => {
+      const part = await read(...args);
+      if (args[1] === 1 && fail) {
+        fail = false;
+        if (failure === 'stop') value.cancelPending();
+        else if (failure === 'abort') throw new DOMException('Synthetic local abort', 'AbortError');
+        else throw new Error('Synthetic local read failure');
+      }
+      return part;
+    };
+    await assert.rejects(value.prepare({ ...settings, completeAudio: true }), /Synthetic|Stopped/);
+    assert.equal(calls, 2);
+    assert.equal(value.checkpointInfo().completedParts, 1);
+    assert.equal(value.checkpointInfo().completedCalls, 2);
+    assert.equal(value.checkpoint.generator, null, 'closed generator is reset');
+    evictGeneralCache(value);
+    const result = await value.prepare({ ...settings, completeAudio: true, resume: true, expectedSetupRevision: 2, roles: { primary: { model: 'changed' }, transcription: { model: 'changed-speech' } } });
+    assert.equal(calls, 4, 'only the previously unread part needs paid work');
+    assert.deepEqual(value.reads, [0, 1, 0, 1]);
+    assert.deepEqual(result.audioSources.map(source => source.text), ['synthetic-0\n', 'synthetic-1\n']);
+    assert.equal(value.checkpointInfo().completedParts, 2);
+    assertDescriptors(result.audioSources);
+  }
+});
+
+test('checkpoint: rebuilt successful speech requires no transcription role when only a later document remains', async () => {
+  let calls = 0, fail = true;
+  const value = checkpointAudio(async () => { calls++; return { text: 'Saved speech', warnings: [] }; });
+  value.items[0].partCount = 1;
+  value.items.push({ id: 'document', name: 'later.pdf', kind: 'document', status: 'ready', partCount: 1, warnings: [] });
+  value.part = async item => {
+    if (item.id === 'document') {
+      if (fail) { fail = false; throw new Error('Local document unavailable'); }
+      return { text: 'Later text', images: [] };
+    }
+    return { text: '', audio: 'synthetic', images: [] };
+  };
+  await assert.rejects(value.prepare({ ...settings, completeAudio: true }), /Local document unavailable/);
+  assert.equal(calls, 2);
+  evictGeneralCache(value);
+  const result = await value.prepare({ ...settings, completeAudio: true, resume: true, expectedSetupRevision: 2, roles: { primary: { model: 'new' }, transcription: null } });
+  assert.equal(calls, 3);
+  assert.deepEqual(result.audioSources.map(source => source.text), ['Saved speech', 'Later text']);
+});
+
+test('checkpoint: missing current transcription role blocks only its unfinished dispatch', async () => {
+  let calls = 0;
+  const value = checkpointAudio(async () => { calls++; throw new Error('Unknown paid outcome'); });
+  await assert.rejects(value.prepare({ ...settings, completeAudio: true }), /Unknown paid outcome/);
+  assert.equal(calls, 1, 'unknown outcomes are not automatically retried');
+  await assert.rejects(value.prepare({ ...settings, completeAudio: true, resume: true, roles: { primary: settings.roles.primary, transcription: null } }), /Assign a transcription model/);
+  assert.equal(calls, 1);
+  assert.equal(value.checkpointInfo().completedCalls, 0);
+});
+
+test('checkpoint: contiguous full sources and exact tails survive suspended digest and generator rebuild', async () => {
+  for (const localFailure of [false, true]) {
+    const original = ' FIRST mid' + 'dle words. '.repeat(6000) + '\nLAST 😀  ';
+    const textParts = Array.from({ length: Math.ceil(original.length / 20000) }, (_, index) => original.slice(index * 20000, (index + 1) * 20000));
+    let fail = true, calls = 0; const reads = [];
+    const value = workspace([{ id: 'contiguous', name: 'private.txt', kind: 'text', status: 'ready', textParts, partCount: textParts.length, warnings: [] }], async (_path, { body }) => {
+      calls++;
+      return { text: !localFailure && fail && body.source.includes('(' + textParts.length + '/') ? '' : 'Lossy digest', warnings: [] };
+    });
+    const part = value.part.bind(value);
+    value.part = async (...args) => {
+      reads.push(args[1]);
+      if (localFailure && fail && args[1] === textParts.length - 1) throw new Error('Synthetic last local part failure');
+      return part(...args);
+    };
+    await assert.rejects(value.prepare({ ...settings, completeAudio: true }), /invalid preparation|Synthetic last local part/);
+    const before = calls, readCount = reads.length;
+    evictGeneralCache(value); fail = false;
+    const result = await value.prepare({ ...settings, completeAudio: true, resume: true });
+    assert.equal(calls, before + 1);
+    assert.equal(reads.length, readCount + (localFailure ? textParts.length : 0));
+    assert.equal(result.audioSources.map(source => source.text).join(''), original);
+    assertDescriptors(result.audioSources);
+    assert.equal(value.checkpointInfo().completedParts, textParts.length);
+  }
+});
+
+test('checkpoint: blank parts count as complete and full source inventory remains intact', async () => {
+  const value = workspace([{ id: 'blank-checkpoint', name: 'blank.pdf', kind: 'document', status: 'ready', partCount: 2, warnings: [] }], async () => { throw new Error('No paid work expected'); });
+  value.part = async (_item, index) => ({ text: index ? '\t' : ' \n', images: [] });
+  const result = await value.prepare({ ...settings, completeAudio: true });
+  assert.deepEqual(result.audioSources.map(source => source.text), [' \n', '\t']);
+  assert.equal(value.checkpointInfo().completedParts, 2);
+  assert.equal(value.checkpointInfo().completedCalls, 0);
+  assert.equal(value.checkpointInfo().complete, true);
+});
+
+test('checkpoint: each Continue gets a new 512-call safety budget without rereading or replaying prior results', async t => {
+  stubImage(t);
+  let calls = 0, reads = 0;
+  const value = visualWorkspace(513, async path => {
+    calls++;
+    return path === '/audio/extract' ? { text: 'Image words', coverage: 'complete', warnings: [] } : { text: 'Digest', warnings: [] };
+  });
+  const part = value.part;
+  value.part = async (...args) => { reads++; return part(...args); };
+  await assert.rejects(value.prepare({ ...settings, completeAudio: true }), /512 calls/);
+  assert.equal(calls, 512);
+  assert.equal(value.checkpointInfo().completedCalls, 512);
+  assert.equal(value.checkpointInfo().completedParts, 0);
+  evictGeneralCache(value);
+  const result = await value.prepare({ ...settings, completeAudio: true, resume: true, expectedSetupRevision: 3 });
+  assert.equal(calls, 616, 'one remaining OCR and 103 image-batch digests');
+  assert.equal(reads, 1);
+  assert.equal(result.audioSources.length, 513);
+  assert.equal(value.checkpointInfo().completedCalls, 616);
+  assert.equal(value.checkpointInfo().completedParts, 1);
+});
+
+test('checkpoint: byte headroom and entry quota stop before paid dispatch without evicting accepted results', async () => {
+  for (const quota of ['bytes', 'entries']) {
+    let calls = 0;
+    const value = checkpointAudio(async path => {
+      calls++;
+      return { text: path === '/transcribe' ? 'Accepted speech' : '', warnings: [] };
+    });
+    await assert.rejects(value.prepare(settings), /invalid preparation/);
+    const job = value.checkpoint, accepted = [...job.pinned.entries()][0];
+    // Synthetic saturation avoids allocating 64 MiB or making 4096 fake API calls.
+    if (quota === 'bytes') job.pinnedBytes = 64 * 1024 * 1024 - 1024 * 1024 + 1;
+    else for (let index = job.pinned.size; index < 4096; index++) job.pinned.set('synthetic-' + index, { text: 'Reserved' });
+    const size = job.pinned.size;
+    await assert.rejects(value.prepare({ ...settings, resume: true }), /checkpoint quota/);
+    assert.equal(calls, 2);
+    assert.equal(job.pinned.size, size);
+    assert.strictEqual(job.pinned.get(accepted[0]), accepted[1]);
+    assert.equal(value.checkpointInfo().unavailable, true);
+  }
+});
+
+test('checkpoint: oversized responses stop explicitly while preserving earlier paid success', async t => {
+  stubImage(t);
+  let calls = 0;
+  const value = visualWorkspace(2, async () => {
+    calls++;
+    return { text: calls === 1 ? 'Accepted first image' : 'x'.repeat(524288), coverage: 'complete', warnings: [] };
+  });
+  await assert.rejects(value.prepare({ ...settings, completeAudio: true }), /1 MiB per result/);
+  assert.equal(calls, 2);
+  assert.equal(value.checkpointInfo().completedCalls, 1);
+  assert.equal(value.checkpointInfo().unavailable, true);
+  assert.equal(value.cache.size, 1);
+});
+
+test('checkpoint: cache hits are pinned before progress and default new requests still respect role/revision cache identity', async () => {
+  let calls = 0;
+  const value = checkpointAudio(async () => { calls++; return { text: 'Accepted', warnings: [] }; });
+  await value.prepare(settings);
+  const first = value.checkpoint;
+  const updates = [];
+  const cachePut = value.cachePut.bind(value);
+  value.cachePut = (key, result) => { updates.push(value.checkpointInfo().completedCalls); cachePut(key, result); };
+  await value.prepare({ ...settings, progress: (_text, info) => updates.push(info.completedCalls) });
+  assert.notStrictEqual(value.checkpoint, first);
+  assert.equal(first.invalidated, true);
+  assert.equal(calls, 4);
+  assert.equal(value.checkpointInfo().completedCalls, 4, 'all cache hits are retained independently of LRU');
+  evictGeneralCache(value);
+  value.part = async () => { throw new Error('Completed continuation must not read parts'); };
+  await value.prepare({ ...settings, resume: true });
+  assert.equal(calls, 4);
+  assert.ok(updates.includes(4));
+});
+
+
+test('checkpoint: failed merge resumes at its yield with all local parts already complete', async () => {
+  const textParts = Array.from({ length: 20 }, (_, index) => `Exact part ${index}\n`);
+  let calls = 0, merges = 0, fail = true, reads = 0;
+  const value = workspace([{ id: 'merge-item', name: 'merge.txt', kind: 'text', status: 'ready', partCount: 20, textParts, warnings: [] }], async (_path, { body }) => {
+    calls++;
+    if (body.source.startsWith('Merged source notes')) { merges++; if (fail && merges === 2) return { text: '', warnings: [] }; }
+    return { text: 'digest '.repeat(285), warnings: [] };
+  });
+  const part = value.part.bind(value);
+  value.part = async (...args) => { reads++; return part(...args); };
+  await assert.rejects(value.prepare({ ...settings, completeAudio: true }), /invalid preparation/);
+  assert.equal(calls, 22);
+  assert.equal(value.checkpointInfo().completedParts, 20);
+  assert.equal(value.checkpointInfo().completedCalls, 21);
+  assert.equal(value.checkpointInfo().stage, 'merge');
+  evictGeneralCache(value); fail = false;
+  const updates = [];
+  const result = await value.prepare({ ...settings, completeAudio: true, resume: true, progress: (text, info) => updates.push({ text, info }) });
+  assert.equal(calls, 23);
+  assert.equal(reads, 20);
+  assert.match(updates[0].text, /Merging source notes 2 of 2/);
+  assert.equal(updates[0].info.part, 20);
+  assert.equal(result.audioSources.map(source => source.text).join(''), textParts.join(''));
+  assertDescriptors(result.audioSources);
+});
+
+test('checkpoint: success counts advance before cachePut, and a Stop from progress retains the paused request', async () => {
+  let calls = 0, stopped = false; const beforeCachePut = [];
+  const value = checkpointAudio(async () => { calls++; return { text: 'Accepted', warnings: [] }; });
+  const cachePut = value.cachePut.bind(value);
+  value.cachePut = (key, result) => { beforeCachePut.push(value.checkpointInfo().completedCalls); cachePut(key, result); };
+  await assert.rejects(value.prepare({
+    ...settings, completeAudio: true,
+    progress: (_text, info) => { if (!stopped && info.completedCalls === 1) { stopped = true; value.cancelPending(); } }
+  }), { name: 'AbortError' });
+  assert.deepEqual(beforeCachePut, [1]);
+  assert.equal(calls, 1);
+  assert.equal(value.checkpointInfo().completedParts, 0);
+  await value.prepare({ ...settings, completeAudio: true, resume: true });
+  assert.equal(calls, 4);
+  assert.deepEqual(beforeCachePut, [1, 2, 3, 4]);
+  assert.deepEqual(value.reads, [0, 1]);
+});
+
+test('checkpoint: missing primary blocks an unfinished digest but not completed preparation', async () => {
+  let calls = 0, fail = true;
+  const value = checkpointAudio(async path => { calls++; return { text: path === '/materials/summarize' && fail ? '' : 'Accepted', warnings: [] }; });
+  await assert.rejects(value.prepare(settings), /invalid preparation/);
+  await assert.rejects(value.prepare({ ...settings, resume: true, roles: { primary: null, transcription: settings.roles.transcription } }), /Assign a primary model/);
+  assert.equal(calls, 2);
+  fail = false;
+  const result = await value.prepare({ ...settings, resume: true });
+  assert.strictEqual(await value.prepare({ ...settings, resume: true, roles: { primary: null, transcription: null } }), result);
+  assert.equal(calls, 5);
 });
