@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve, dirname, isAbsolute } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -14,9 +15,9 @@ import { runOwnedProcess, youtubeChildEnvironment, DENO_PROVIDER_ARGS, HELPER_OU
 const root = fileURLToPath(new URL('../artifacts/', import.meta.url));
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-function scratch(t) {
-  fs.mkdirSync(root, { recursive: true });
-  const directory = fs.mkdtempSync(join(root, 'youtube-tools-test-'));
+function scratch(t, base = root) {
+  fs.mkdirSync(base, { recursive: true });
+  const directory = fs.mkdtempSync(join(base, 'youtube-tools-test-'));
   // Async removal lets libuv release native process handles after the close
   // callback; blocking rmSync retries can otherwise retain a Windows cwd lock.
   t.after(() => fs.promises.rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })); return directory;
@@ -60,7 +61,15 @@ function recordOwnedStorage(directory) {
       const child = join(path, entry.name), key = relative + '/' + entry.name;
       let stat; try { stat = fs.lstatSync(child); } catch (error) { report.errors.push(error.code === 'ENOENT' ? 'disappeared' : 'stat_failed'); continue; }
       const type = stat.isSymbolicLink() ? 'symlink' : stat.isDirectory() ? 'directory' : stat.isFile() ? 'file' : 'special';
-      report.entries.push({ pathHash: hash(key), type, bytes: stat.size, links: stat.nlink });
+      const item = { pathHash: hash(key), type, bytes: stat.size, links: stat.nlink };
+      if (type === 'symlink') {
+        const reference = fs.readlinkSync(child), destination = resolve(dirname(child), reference);
+        item.targetAbsolute = isAbsolute(reference);
+        item.targetInsideOwner = destination === resolve(directory) || destination.startsWith(resolve(directory) + '/');
+        const modules = resolve(root, '../node_modules');
+        item.targetProjectModules = destination === modules || destination.startsWith(modules + '/');
+      }
+      report.entries.push(item);
       report.logicalBytes += stat.size;
       if (type === 'directory') { try { walk(child, key); } catch { report.errors.push('directory_unavailable'); } }
     }
@@ -275,7 +284,8 @@ test('pinned Deno runtime-compiled untrusted code permissions (offline assets on
     if (process.env.LEARNLENS_YOUTUBE_INTEGRATION === '1') throw error;
     t.skip('NOT TESTED: pinned official Deno/yt-dlp assets are not present and verified locally; no network install or public video trial.'); return;
   }
-  const directory = scratch(t), sentinel = join(directory, 'owned-sentinel.txt'), canary = join(directory, 'must-not-write.txt');
+  const directory = scratch(t, process.env.LEARNLENS_TEST_RUNTIME_TEMP === '1' ? tmpdir() : root);
+  const sentinel = join(directory, 'owned-sentinel.txt'), canary = join(directory, 'must-not-write.txt');
   let networkConnections = 0;
   const target = createServer((_req, res) => res.end('OWNED_TEST_ONLY'));
   target.on('connection', () => networkConnections++);

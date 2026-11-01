@@ -134,6 +134,13 @@ jobs:
         env:
           LEARNLENS_YOUTUBE_INTEGRATION: '1'
           LEARNLENS_YOUTUBE_OFFLINE: '1'
+      - name: Native runtime from an owned OS-temporary directory
+        if: ${{ !cancelled() }}
+        run: node --test --test-name-pattern="pinned Deno runtime-compiled" tests/youtube-tools.test.mjs
+        env:
+          LEARNLENS_YOUTUBE_INTEGRATION: '1'
+          LEARNLENS_YOUTUBE_OFFLINE: '1'
+          LEARNLENS_TEST_RUNTIME_TEMP: '1'
       - name: Retain synthetic boundary evidence
         if: always()
         uses: actions/upload-artifact@v4
