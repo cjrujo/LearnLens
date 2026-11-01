@@ -1,6 +1,6 @@
 # Public URL sources and whole-video lessons
 
-**Unreleased working-tree feature.** Local synthetic/browser and Windows native-media checks pass; real public retrieval, pinned YouTube runtime execution and native Linux whole-video behavior still need verification. This document does not mean an already-running LearnLens instance has been updated. See [verification status](TESTING.md#url-sources-and-whole-video-unreleased).
+**Unreleased validation-branch feature.** Local synthetic/browser, Windows native-media and fresh Linux native-media checks pass. Public HTML/TXT/WAV/MP4 acquisition and 66 native-media checks also pass on Windows/Linux CI. The complete pinned YouTube runtime/permission checks and public YouTube acquisition remain blocking release gates; see the exact-run status below. This document does not mean an already-running LearnLens instance has been updated. See [verification status](TESTING.md#url-sources-and-whole-video-unreleased).
 
 ## How to import a public link
 
@@ -15,7 +15,7 @@ Successful review shows a ready source with chronological parts. A shortened pre
 - Static HTML, UTF-8 or BOM-marked UTF-16 text/Markdown; direct PDF/DOCX/PPTX and supported media files.
 - Static HTML text preserves inline word boundaries, CJK adjacency and preformatted indentation/newlines. Scripts, styles, hidden content, navigation, images, embeds and CSS layout are not rendered or fetched. This is not a visual webpage capture.
 - Public single-video YouTube watch/shorts/youtu.be links are **best-effort**. The managed helper accepts finished videos up to two hours and selects a complete progressive audiovisual resource (which can be lower quality than YouTube's separate-stream formats); captions, title/description, audio-only files and a few stills are not substitutes. Streaming-only formats, live/playlist/login/age/region/DRM challenges or unavailable helper assets can prevent import. Upload the original video instead; no cookies, browser login, DRM bypass or proxy rotation is offered.
-- Dynamic lessons that require scripts or authentication are unsupported. Error/login pages and incomplete, ambiguous, oversized or invalid media fail explicitly rather than becoming a misleading lesson.
+- Dynamic lessons that require scripts or authentication are unsupported. HTTP errors and recognized short login/error pages are rejected, but detection of all access walls is not guaranteed: review the saved text. Incomplete, ambiguous, oversized or invalid media fail explicitly rather than being silently reduced.
 
 ## How to configure whole-video analysis
 
@@ -65,7 +65,7 @@ URL acquisition requires HTTPS port 443, no URL credentials, exclusively public 
 
 The destination website sees the actual request URL, including query tokens. Citations strip query/fragment (except canonical YouTube video ID); **citation origin/path and retained source content may be shared with chosen providers and included in lessons**. Full private fetch URLs and local paths are not diagnostic fields. This is not a guarantee that sensitive information already written in source content will be removed.
 
-Existing 1 GiB/media, four-hour, ten-original/session, 1 GiB/session and 4 GiB/instance original-storage limits remain. Retained HTML plus selected media and text sidecars count toward storage. Static input is capped at 8 MiB and decoded text at two million UTF-16 code units. Missing-timing inspection has a 120-second total deadline, 128 MiB packet-output cap and two-million-record limit; buffering can transiently approach twice that output cap. Denser/unsupported sources fail rather than being truncated. Native-video results additionally reserve up to 64 MiB/owner, 256 MiB/instance, 512 KiB/result and 64 attempts/clip. These are safety ceilings, not measured peak-load guarantees.
+Existing 1 GiB/media, four-hour general-media (two-hour managed YouTube), ten-original/session, 1 GiB/session and 4 GiB/instance original-storage limits remain. Retained HTML plus selected media and text sidecars count toward storage. Static input is capped at 8 MiB and decoded text at two million UTF-16 code units. Missing-timing inspection has a 120-second total deadline, 128 MiB packet-output cap and two-million-record limit; buffering can transiently approach twice that output cap. Denser/unsupported sources fail rather than being truncated. Native-video results additionally reserve up to 64 MiB/owner, 256 MiB/instance, 512 KiB/result and 64 attempts/clip. These are safety ceilings, not measured peak-load guarantees.
 
 ## Troubleshooting
 

@@ -1,10 +1,16 @@
 name: Real material imports
 on:
   workflow_dispatch:
+    inputs:
+      boundary_only:
+        description: Investigate the pinned EJS boundary with synthetic code only
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
   material-imports:
+    if: ${{ inputs.boundary_only != true }}
     strategy:
       fail-fast: false
       matrix:
@@ -66,5 +72,46 @@ jobs:
           path: |
             artifacts/url-public-smoke-*.json
             artifacts/youtube-public-smoke-*.json
+          if-no-files-found: warn
+          retention-days: 7
+  boundary-investigation:
+    if: ${{ inputs.boundary_only == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: yt-dlp/yt-dlp
+          ref: f264a6cbd1f630894da0f368df00f8aae50140e0
+          path: artifacts/pinned-yt-dlp
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: '3.12'
+      - run: npm ci
+      - run: npm run check
+      - run: npm run setup:youtube
+      - name: Synthetic pinned EJS boundary investigation (not the release gate)
+        run: node tests/youtube-boundary.mjs
+        env:
+          LEARNLENS_YOUTUBE_BOUNDARY_TEST: '1'
+          LEARNLENS_TEST_PYTHON: ${{ steps.python.outputs.python-path }}
+          LEARNLENS_TEST_UPSTREAM: ${{ github.workspace }}/artifacts/pinned-yt-dlp
+      - name: Retain synthetic boundary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-boundary-${{ runner.os }}
+          path: artifacts/youtube-boundary-*/
           if-no-files-found: warn
           retention-days: 7

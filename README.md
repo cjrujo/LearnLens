@@ -47,7 +47,7 @@ The tests use local mock providers. They do not call paid models or prove the ed
 
 ## Public links and videos (unreleased)
 
-The working tree adds explicit **fetch → private review → separate AI approval** for public webpage/audio/video/YouTube links. Whole-video analysis requires a separately configured native-video role and saved results for every interval before teaching. See [setup, recovery, privacy and limits](URL-SOURCES.md). Local tests are not proof of public YouTube availability or perfect video understanding; the release/activation gates remain in [TESTING.md](TESTING.md#url-sources-and-whole-video-unreleased).
+The unreleased validation branch adds explicit **fetch → private review → separate AI approval** for public webpage/audio/video/YouTube links. Whole-video analysis requires a separately configured native-video role and saved results for every interval before teaching. See [setup, recovery, privacy and limits](URL-SOURCES.md). Local tests are not proof of public YouTube availability or perfect video understanding; the release/activation gates remain in [TESTING.md](TESTING.md#url-sources-and-whole-video-unreleased).
 
 ## Choose models
 
