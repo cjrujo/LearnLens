@@ -141,6 +141,11 @@ jobs:
           LEARNLENS_YOUTUBE_INTEGRATION: '1'
           LEARNLENS_YOUTUBE_OFFLINE: '1'
           LEARNLENS_TEST_RUNTIME_TEMP: '1'
+      - name: Attribute Linux runtime cache side effects
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: node tests/youtube-cache-probe.mjs
+        env:
+          LEARNLENS_YOUTUBE_BOUNDARY_TEST: '1'
       - name: Retain synthetic boundary evidence
         if: always()
         uses: actions/upload-artifact@v4

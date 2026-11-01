@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { join, resolve, dirname, isAbsolute } from 'node:path';
+import { join, resolve, dirname, isAbsolute, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
@@ -65,9 +65,10 @@ function recordOwnedStorage(directory) {
       if (type === 'symlink') {
         const reference = fs.readlinkSync(child), destination = resolve(dirname(child), reference);
         item.targetAbsolute = isAbsolute(reference);
-        item.targetInsideOwner = destination === resolve(directory) || destination.startsWith(resolve(directory) + '/');
-        const modules = resolve(root, '../node_modules');
-        item.targetProjectModules = destination === modules || destination.startsWith(modules + '/');
+        const normalized = value => process.platform === 'win32' ? value.toLowerCase() : value;
+        const inside = parent => normalized(destination) === normalized(parent) || normalized(destination).startsWith(normalized(parent + sep));
+        item.targetInsideOwner = inside(resolve(directory));
+        item.targetProjectModules = inside(resolve(root, '../node_modules'));
       }
       report.entries.push(item);
       report.logicalBytes += stat.size;
