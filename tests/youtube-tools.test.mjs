@@ -193,7 +193,7 @@ test('combined stdout/stderr cap and hang deadline terminate the owned tree befo
     { cwd: directory, env: env(directory), maxBytes: 1000 }), /output limit/);
   const marker = join(directory, 'loop-started');
   await assert.rejects(runOwnedProcess(process.execPath, ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)},'ready');while(true){}`],
-    { cwd: directory, env: env(directory), timeoutMs: 5000 }), /deadline/);
+    { cwd: directory, env: env(directory), timeoutMs: process.platform === 'win32' ? 20000 : 5000 }), /deadline/);
   assert.equal(fs.existsSync(marker), true, 'deadline fixture must actually execute its infinite loop');
 });
 
@@ -239,10 +239,17 @@ test('Windows wrapper closes its kill-on-close job when its Node parent crashes'
 test('pinned Deno adversarial local permissions under exact bundled-provider flags (offline assets only)', async t => {
   let assets;
   try { assets = await prepareYouTubeAssets({ offline: true }); }
-  catch { t.skip('NOT TESTED: pinned official Deno/yt-dlp assets are not present and verified locally; no network install or public video trial.'); return; }
+  catch (error) {
+    if (process.env.LEARNLENS_YOUTUBE_INTEGRATION === '1') throw error;
+    t.skip('NOT TESTED: pinned official Deno/yt-dlp assets are not present and verified locally; no network install or public video trial.'); return;
+  }
   const directory = scratch(t), sentinel = join(directory, 'owned-sentinel.txt'), canary = join(directory, 'must-not-write.txt');
   fs.writeFileSync(sentinel, 'OWNED_TEST_SENTINEL');
-  const localModule = join(directory, 'must-not-import.mjs'); fs.writeFileSync(localModule, 'export default 123;');
+  const version = await runOwnedProcess(assets.ytdlp, ['--ignore-config', '--no-plugin-dirs', '--version'], { cwd: directory, env: env(directory) });
+  assert.equal(version.toString().trim(), YTDLP_VERSION, 'The actual pinned yt-dlp executable runs without network');
+  const localModule = join(directory, 'must-not-import.mjs'); fs.writeFileSync(localModule, 'globalThis.postMessage?.("GRANTED"); export default 123;');
+  const ready = await runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'console.log("READY")' });
+  assert.equal(ready.toString().trim(), 'READY', 'Pinned Deno starts under the exact runtime flags');
   const fixture = `
     const out={};
     async function deny(name,fn){try{await fn();out[name]='GRANTED'}catch(e){out[name]=e.name+':'+e.message}}
@@ -254,7 +261,15 @@ test('pinned Deno adversarial local permissions under exact bundled-provider fla
       await deny('env',()=>Deno.env.get('OWNED_TEST_SECRET'));
       await deny('run',()=>new Deno.Command(${JSON.stringify(process.execPath)},{args:['-e','process.exit(0)']}).output());
       await deny('import',()=>import(${JSON.stringify(pathToFileURL(localModule).href)}));
-      await deny('worker',()=>new Worker(${JSON.stringify(pathToFileURL(localModule).href)},{type:'module'}));
+      await deny('worker',()=>new Promise((resolve,reject)=>{
+        let worker;
+        const timer=setTimeout(()=>{worker?.terminate();reject(new Error('Worker test timed out'));},5000);
+        try {
+          worker=new Worker(${JSON.stringify(pathToFileURL(localModule).href)},{type:'module'});
+          worker.onerror=e=>{e.preventDefault();clearTimeout(timer);worker.terminate();reject(new Error(e.message));};
+          worker.onmessage=()=>{clearTimeout(timer);worker.terminate();resolve();};
+        } catch(e){clearTimeout(timer);reject(e);}
+      }));
       for(const name of ['net','read','write','env','run','ffi','sys']) out['request-'+name]=(await Deno.permissions.request({name})).state;
     };await code();console.log(JSON.stringify(out));`;
   const output = await runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: { ...env(directory), OWNED_TEST_SECRET: 'DO_NOT_READ' }, input: fixture });
@@ -262,6 +277,6 @@ test('pinned Deno adversarial local permissions under exact bundled-provider fla
   for (const name of ['fetch', 'socket', 'read', 'write', 'env', 'run', 'import', 'worker']) assert.match(results[name], /NotCapable|PermissionDenied|Requires .* access|not permitted/i, name);
   for (const name of ['net','read','write','env','run','ffi','sys']) assert.equal(results[`request-${name}`], 'denied');
   assert.equal(fs.existsSync(canary), false);
-  await assert.rejects(runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'while(true){}', timeoutMs: 5000 }), /deadline/);
+  await assert.rejects(runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'while(true){}', timeoutMs: process.platform === 'win32' ? 20000 : 5000 }), /deadline/);
   await assert.rejects(runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'while(true)console.log("x".repeat(65536))', maxBytes: 100_000 }), /output limit/);
 });

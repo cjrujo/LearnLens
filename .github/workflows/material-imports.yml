@@ -16,28 +16,42 @@ jobs:
         with:
           node-version: '22'
       - run: npm ci
+        id: install
       - run: npm audit --omit=dev
       - run: npm run check
       - run: npm test
       - run: npm run setup:media
+        id: media
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - run: npm run setup:youtube
+        id: youtube
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
       - name: Real Windows media from cache
-        if: runner.os == 'Windows'
-        run: node --test tests/native-media.test.mjs tests/material-import.test.mjs tests/video-clips.test.mjs tests/video-timing.test.mjs tests/video-store-native.test.mjs tests/audio-encode.test.mjs tests/youtube-tools.test.mjs
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.media.outcome == 'success' }}
+        run: node --test tests/native-media.test.mjs tests/material-import.test.mjs tests/video-clips.test.mjs tests/video-timing.test.mjs tests/video-store-native.test.mjs tests/audio-encode.test.mjs
         env:
           LEARNLENS_MEDIA_OFFLINE: '1'
           LEARNLENS_MEDIA_INTEGRATION: '1'
       - name: Real Linux media without external networking
-        if: runner.os == 'Linux'
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.media.outcome == 'success' }}
         shell: bash
         run: |
-          sudo unshare --net -- bash -c 'ip link set lo up; export LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1; exec "$1" --test tests/native-media.test.mjs tests/material-import.test.mjs tests/video-clips.test.mjs tests/video-timing.test.mjs tests/video-store-native.test.mjs tests/audio-encode.test.mjs tests/youtube-tools.test.mjs' _ "$(command -v node)"
+          sudo unshare --net -- bash -c 'ip link set lo up; export LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1; exec "$1" --test tests/native-media.test.mjs tests/material-import.test.mjs tests/video-clips.test.mjs tests/video-timing.test.mjs tests/video-store-native.test.mjs tests/audio-encode.test.mjs' _ "$(command -v node)"
+      - name: Pinned helper runtime and permissions
+        id: helper
+        if: ${{ !cancelled() && steps.youtube.outcome == 'success' }}
+        run: node --test tests/youtube-tools.test.mjs
+        env:
+          LEARNLENS_YOUTUBE_INTEGRATION: '1'
+          LEARNLENS_YOUTUBE_OFFLINE: '1'
       - name: Public DNS and full source acquisition (no AI)
+        if: ${{ !cancelled() && steps.media.outcome == 'success' }}
         run: node tests/url-public-smoke.mjs
         env:
           LEARNLENS_PUBLIC_URL_TEST: '1'
           LEARNLENS_MEDIA_OFFLINE: '1'
       - name: Best-effort public YouTube trial (no login or AI)
+        if: ${{ !cancelled() && steps.media.outcome == 'success' && steps.helper.outcome == 'success' }}
         continue-on-error: true
         run: node tests/url-public-smoke.mjs --youtube
         env:
