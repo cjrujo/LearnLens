@@ -43,7 +43,9 @@ function zip(entries) {
   return Buffer.concat([...local, cd, end]);
 }
 async function waitFile(file) {
-  const deadline = Date.now() + 20000;
+  // Actual Windows CI wrapper startup measured 32.7s. Stay below the
+  // unchanged 60s production cap, while requiring the fixture to start.
+  const deadline = Date.now() + (process.platform === 'win32' ? 55000 : 20000);
   while (!fs.existsSync(file) && Date.now() < deadline) await delay(20);
   assert.ok(fs.existsSync(file), 'owned fixture did not become ready');
   return JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -194,7 +196,7 @@ test('combined stdout/stderr cap and hang deadline terminate the owned tree befo
     { cwd: directory, env: env(directory), maxBytes: 1000 }), /output limit/);
   const marker = join(directory, 'loop-started');
   await assert.rejects(runOwnedProcess(process.execPath, ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)},'ready');while(true){}`],
-    { cwd: directory, env: env(directory), timeoutMs: process.platform === 'win32' ? 20000 : 5000 }), /deadline/);
+    { cwd: directory, env: env(directory), timeoutMs: process.platform === 'win32' ? 60000 : 5000 }), /deadline/);
   assert.equal(fs.existsSync(marker), true, 'deadline fixture must actually execute its infinite loop');
 });
 
@@ -219,10 +221,16 @@ test('abort kills descendants and awaits Job Object/group cleanup; normal root e
     const script = `const fs=require('node:fs'),cp=require('node:child_process');const c=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({root:process.pid,child:c.pid}));${normal ? 'process.exit(0)' : 'setInterval(()=>{},1000)'}`;
     const work = runOwnedProcess(process.execPath, ['-e', script], { cwd: directory, env: env(directory), signal: controller.signal });
     work.catch(() => {});
-    const pids = await waitFile(ready);
-    if (normal) await work; else { controller.abort(); await assert.rejects(work, /cancelled/); }
-    await assertDead(pids.root); await assertDead(pids.child);
-    fs.unlinkSync(ready);
+    try {
+      const pids = await waitFile(ready);
+      if (normal) await work; else { controller.abort(); await assert.rejects(work, /cancelled/); }
+      await assertDead(pids.root); await assertDead(pids.child);
+      fs.unlinkSync(ready);
+    } finally {
+      // A failed startup assertion must not leave a writer running while the
+      // test's temporary-directory cleanup executes.
+      controller.abort(); await work.catch(() => {});
+    }
   }
 });
 
@@ -232,12 +240,16 @@ test('Windows wrapper closes its kill-on-close job when its Node parent crashes'
   const moduleUrl = new URL('../deploy/owned-process.mjs', import.meta.url).href;
   fs.writeFileSync(launcher, `import {runOwnedProcess,youtubeChildEnvironment} from ${JSON.stringify(moduleUrl)}; await runOwnedProcess(process.execPath,['-e',${JSON.stringify(script)}],{cwd:${JSON.stringify(directory)},env:youtubeChildEnvironment(${JSON.stringify(directory)},'http://127.0.0.1:9')});`);
   const child = spawn(process.execPath, [launcher], { stdio: 'ignore', env: env(directory), windowsHide: true });
-  t.after(() => child.kill());
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      const closed = once(child, 'close'); child.kill('SIGKILL'); await closed;
+    }
+  });
   const pids = await waitFile(ready), closed = once(child, 'close'); child.kill('SIGKILL'); await closed;
   await assertDead(pids.root); await assertDead(pids.child); await assertDead(pids.wrapper);
 });
 
-test('pinned Deno adversarial local permissions under exact bundled-provider flags (offline assets only)', async t => {
+test('pinned Deno runtime-compiled untrusted code permissions (offline assets only)', async t => {
   let assets;
   try { assets = await prepareYouTubeAssets({ offline: true }); }
   catch (error) {
@@ -254,11 +266,12 @@ test('pinned Deno adversarial local permissions under exact bundled-provider fla
   fs.writeFileSync(sentinel, 'OWNED_TEST_SENTINEL');
   const version = await runOwnedProcess(assets.ytdlp, ['--ignore-config', '--no-plugin-dirs', '--version'], { cwd: directory, env: env(directory) });
   assert.equal(version.toString().trim(), YTDLP_VERSION, 'The actual pinned yt-dlp executable runs without network');
-  const localModule = join(directory, 'must-not-import.mjs'); fs.writeFileSync(localModule, 'globalThis.postMessage?.("GRANTED"); export default 123;');
+  const localModule = join(directory, 'must-not-import.mjs'), workerModule = join(directory, 'must-not-load-worker.mjs');
+  fs.writeFileSync(localModule, 'export default 123;'); fs.writeFileSync(workerModule, 'postMessage("GRANTED");');
   const ready = await runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'console.log("READY")' });
   assert.equal(ready.toString().trim(), 'READY', 'Pinned Deno starts under the exact runtime flags');
   const fixture = `
-    const out={};
+    const out={executed:true};
     async function deny(name,fn){try{await fn();out[name]='GRANTED'}catch(e){out[name]=e.name+':'+e.message}}
     const code=async()=>{
       await deny('fetch',()=>fetch('http://127.0.0.1:${targetPort}/'));
@@ -267,24 +280,30 @@ test('pinned Deno adversarial local permissions under exact bundled-provider fla
       await deny('write',()=>Deno.writeTextFile(${JSON.stringify(canary)},'BAD'));
       await deny('env',()=>Deno.env.get('OWNED_TEST_SECRET'));
       await deny('run',()=>new Deno.Command(${JSON.stringify(process.execPath)},{args:['-e','process.exit(0)']}).output());
+      await deny('ffi',()=>Deno.dlopen(${JSON.stringify(sentinel)},{}));
+      await deny('sys',()=>Deno.osRelease());
       await deny('import',()=>import(${JSON.stringify(pathToFileURL(localModule).href)}));
       await deny('worker',()=>new Promise((resolve,reject)=>{
         let worker;
         const timer=setTimeout(()=>{worker?.terminate();reject(new Error('Worker test timed out'));},5000);
         try {
-          worker=new Worker(${JSON.stringify(pathToFileURL(localModule).href)},{type:'module'});
+          worker=new Worker(${JSON.stringify(pathToFileURL(workerModule).href)},{type:'module'});
           worker.onerror=e=>{e.preventDefault();clearTimeout(timer);worker.terminate();reject(new Error(e.message));};
           worker.onmessage=()=>{clearTimeout(timer);worker.terminate();resolve();};
         } catch(e){clearTimeout(timer);reject(e);}
       }));
       for(const name of ['net','read','write','env','run','ffi','sys']) out['request-'+name]=(await Deno.permissions.request({name})).state;
     };await code();console.log(JSON.stringify(out));`;
-  const output = await runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: { ...env(directory), OWNED_TEST_SECRET: 'DO_NOT_READ' }, input: fixture });
-  const results = JSON.parse(output);
-  for (const name of ['fetch', 'socket', 'read', 'write', 'env', 'run', 'import', 'worker']) assert.match(results[name], /NotCapable|PermissionDenied|Requires .* access|not permitted/i, name);
+  // Pinned source + Windows/Linux run41273057282 prove player data reaches
+  // Function, not initial-module syntax. The literal-import control remains
+  // in the separately required full EJS boundary check; do not preload it here.
+  const input = `await Function(${JSON.stringify(`return(async()=>{${fixture}})();`)})();`;
+  const output = await runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: { ...env(directory), OWNED_TEST_SECRET: 'DO_NOT_READ' }, input });
+  const results = JSON.parse(output); assert.equal(results.executed, true);
+  for (const name of ['fetch', 'socket', 'read', 'write', 'env', 'run', 'ffi', 'sys', 'import', 'worker']) assert.match(results[name], /NotCapable|PermissionDenied|Requires .* access|not permitted/i, name);
   for (const name of ['net','read','write','env','run','ffi','sys']) assert.equal(results[`request-${name}`], 'denied');
   assert.equal(fs.existsSync(canary), false);
   assert.equal(networkConnections, 0, 'Permission checks reject before connecting to the owned listener');
-  await assert.rejects(runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'while(true){}', timeoutMs: process.platform === 'win32' ? 20000 : 5000 }), /deadline/);
+  await assert.rejects(runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'while(true){}', timeoutMs: process.platform === 'win32' ? 60000 : 5000 }), /deadline/);
   await assert.rejects(runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'while(true)console.log("x".repeat(65536))', maxBytes: 100_000 }), /output limit/);
 });

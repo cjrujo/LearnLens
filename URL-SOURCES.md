@@ -1,6 +1,6 @@
 # Public URL sources and whole-video lessons
 
-**Unreleased validation-branch feature.** Local synthetic/browser, Windows native-media and fresh Linux native-media checks pass. Public HTML/TXT/WAV/MP4 acquisition and 66 native-media checks also pass on Windows/Linux CI. The complete pinned YouTube runtime/permission checks and public YouTube acquisition remain blocking release gates; see the exact-run status below. This document does not mean an already-running LearnLens instance has been updated. See [verification status](TESTING.md#url-sources-and-whole-video-unreleased).
+**Unreleased validation-branch feature.** Local synthetic/browser, Windows native-media and fresh Linux native-media checks pass. Public HTML/TXT/WAV/MP4 acquisition and 66 native-media checks also pass on Windows/Linux CI. The pinned EJS permission-boundary checks pass; the amended full helper/process suite and public YouTube acquisition remain release gates; see the exact-run status below. This document does not mean an already-running LearnLens instance has been updated. See [verification status](TESTING.md#url-sources-and-whole-video-unreleased).
 
 ## How to import a public link
 
@@ -59,7 +59,7 @@ npm run setup:youtube
 LEARNLENS_YOUTUBE_OFFLINE=1 npm run setup:youtube
 ```
 
-Imports never install/update YouTube helpers automatically. Windows/Linux x64 are the implemented targets; the exact pinned runtime still has an outstanding verification gate. Preserve verified caches because upstream availability is not guaranteed. Bundled licenses differ from the projects' top-level licenses; see [notices](THIRD-PARTY-NOTICES.md).
+Imports never install/update YouTube helpers automatically. Windows/Linux x64 are the implemented targets; runtime execution and the tested EJS permission boundary are verified, but the full process-suite/public-acquisition release gates remain. Preserve verified caches because upstream availability is not guaranteed. Bundled licenses differ from the projects' top-level licenses; see [notices](THIRD-PARTY-NOTICES.md).
 
 URL acquisition requires HTTPS port 443, no URL credentials, exclusively public DNS answers, pinned connections and peer checks on every redirect. Private, loopback, link-local and benchmarking addresses remain forbidden even when LearnLens itself runs on localhost. Source fetches inherit no provider authentication, browser cookies, operator proxy credentials or user downloader configuration. Redirect, deadline, response and byte bounds apply; there is no automatic network retry. A network that resolves public hosts to private/benchmarking addresses must be fixed or replaced by the operator, not bypassed by relaxing these checks.
 
