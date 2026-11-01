@@ -128,6 +128,12 @@ jobs:
           LEARNLENS_YOUTUBE_BOUNDARY_TEST: '1'
           LEARNLENS_TEST_PYTHON: ${{ steps.python.outputs.python-path }}
           LEARNLENS_TEST_UPSTREAM: ${{ github.workspace }}/artifacts/pinned-yt-dlp
+      - name: Native runtime storage and deadline regression
+        if: ${{ !cancelled() }}
+        run: node --test --test-name-pattern="pinned Deno runtime-compiled" tests/youtube-tools.test.mjs
+        env:
+          LEARNLENS_YOUTUBE_INTEGRATION: '1'
+          LEARNLENS_YOUTUBE_OFFLINE: '1'
       - name: Retain synthetic boundary evidence
         if: always()
         uses: actions/upload-artifact@v4

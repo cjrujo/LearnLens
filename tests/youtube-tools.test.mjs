@@ -50,6 +50,25 @@ async function waitFile(file) {
   assert.ok(fs.existsSync(file), 'owned fixture did not become ready');
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
+function recordOwnedStorage(directory) {
+  // Test-only metadata from this fixture's private directory. No file contents,
+  // symlink targets, environment values, original names or absolute paths.
+  const report = { entries: [], logicalBytes: 0, truncated: false, errors: [] };
+  function walk(path, relative = '') {
+    for (const entry of fs.readdirSync(path, { withFileTypes: true })) {
+      if (report.entries.length >= 2049) { report.truncated = true; return; }
+      const child = join(path, entry.name), key = relative + '/' + entry.name;
+      let stat; try { stat = fs.lstatSync(child); } catch (error) { report.errors.push(error.code === 'ENOENT' ? 'disappeared' : 'stat_failed'); continue; }
+      const type = stat.isSymbolicLink() ? 'symlink' : stat.isDirectory() ? 'directory' : stat.isFile() ? 'file' : 'special';
+      report.entries.push({ pathHash: hash(key), type, bytes: stat.size, links: stat.nlink });
+      report.logicalBytes += stat.size;
+      if (type === 'directory') { try { walk(child, key); } catch { report.errors.push('directory_unavailable'); } }
+    }
+  }
+  try { walk(directory); } catch { report.errors.push('root_unavailable'); }
+  const output = join(root, `youtube-boundary-${process.platform}`); fs.mkdirSync(output, { recursive: true });
+  fs.writeFileSync(join(output, 'owned-storage-failure.json'), JSON.stringify(report, null, 2));
+}
 async function assertDead(pid) {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
@@ -304,6 +323,9 @@ test('pinned Deno runtime-compiled untrusted code permissions (offline assets on
   for (const name of ['net','read','write','env','run','ffi','sys']) assert.equal(results[`request-${name}`], 'denied');
   assert.equal(fs.existsSync(canary), false);
   assert.equal(networkConnections, 0, 'Permission checks reject before connecting to the owned listener');
-  await assert.rejects(runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'while(true){}', timeoutMs: process.platform === 'win32' ? 60000 : 5000 }), /deadline/);
+  await assert.rejects(runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'while(true){}', timeoutMs: process.platform === 'win32' ? 60000 : 5000 }).catch(error => {
+    if (/private storage/.test(error.message)) recordOwnedStorage(directory);
+    throw error;
+  }), /deadline/);
   await assert.rejects(runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'while(true)console.log("x".repeat(65536))', maxBytes: 100_000 }), /output limit/);
 });
