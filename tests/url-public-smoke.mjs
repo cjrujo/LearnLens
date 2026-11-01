@@ -18,6 +18,7 @@ if (process.env.LEARNLENS_PUBLIC_URL_TEST !== '1' || !/^[a-f0-9]{40}$/.test(sha 
 const directory = await mkdtemp(join(tmpdir(), 'learnlens-public-smoke-'));
 const materials = createMaterialStore({ directory, limits: { minFreeBytes: 0, mediaBytes: 64 * 1024 * 1024 } });
 const report = { commit: sha, platform: process.platform, startedAt: new Date().toISOString(), aiRequests: 0, automaticRetries: 0, checks: [] };
+let currentCheck = 'initialization';
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 async function acquire(url, mode) {
   const id = randomUUID(); await materials.startImport('public-smoke', { id, url, mode });
@@ -41,6 +42,7 @@ try {
         url: `https://raw.githubusercontent.com/cjrujo/LearnLens/${sha}/tests/fixtures/url-public.${extension}`, mode: extension === 'wav' ? 'audio' : extension === 'mp4' ? 'video' : 'webpage' })),
     ];
   for (const source of sources) {
+    currentCheck = source.name;
     const { id, result } = await acquire(source.url, source.mode);
     const check = { name: source.name, status: 'PASS', bytes: result.size, parts: result.partCount, sourceHash: result.sourceHash };
     if (source.extension) {
@@ -50,7 +52,8 @@ try {
     }
     if (source.mode === 'webpage') {
       const part = await materials.part('public-smoke', id, 0);
-      assert.match(part.text, source.extension ? /END_OF_COMPLETE_SOURCE/ : /Example Domain/i);
+      if (source.extension) assert.match(part.text, /END_OF_COMPLETE_SOURCE/);
+      else assert.ok(part.text.trim().length > 40 && !/<html[\s>]/i.test(part.text), 'Public HTML yields readable parsed text');
     } else if (source.mode === 'audio') {
       assert.equal(result.hasVideo, false); assert.equal(result.hasAudio, true);
       const part = await materials.part('public-smoke', id, 0); assert.match(part.audio, /^data:audio\/wav;base64,/);
@@ -70,7 +73,10 @@ try {
   }
   report.status = 'PASS';
 } catch (error) {
-  report.status = 'FAILED_OR_BLOCKED'; report.error = error.message;
+  report.status = 'FAILED_OR_BLOCKED'; report.failedCheck = currentCheck;
+  // AssertionError can include the entire source or private filesystem paths.
+  report.error = error.name === 'AssertionError' ? 'Verification assertion failed; source content omitted.' :
+    'Public-source check failed; source content and local paths omitted.';
   process.exitCode = 1;
 } finally {
   await materials.close(); await rm(directory, { recursive: true, force: true });

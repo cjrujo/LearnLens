@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { YOUTUBE_ASSETS, YTDLP_VERSION, DENO_VERSION, createYouTubeAssetLoader, extractDenoArchive,
   prepareYouTubeAssets, verifyYouTubeAsset } from '../deploy/youtube-assets.mjs';
 import { runOwnedProcess, youtubeChildEnvironment, DENO_PROVIDER_ARGS, HELPER_OUTPUT_LIMIT } from '../deploy/owned-process.mjs';
@@ -244,6 +245,12 @@ test('pinned Deno adversarial local permissions under exact bundled-provider fla
     t.skip('NOT TESTED: pinned official Deno/yt-dlp assets are not present and verified locally; no network install or public video trial.'); return;
   }
   const directory = scratch(t), sentinel = join(directory, 'owned-sentinel.txt'), canary = join(directory, 'must-not-write.txt');
+  let networkConnections = 0;
+  const target = createServer((_req, res) => res.end('OWNED_TEST_ONLY'));
+  target.on('connection', () => networkConnections++);
+  await new Promise(resolve => target.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { target.close(resolve); target.closeAllConnections(); }));
+  const targetPort = target.address().port;
   fs.writeFileSync(sentinel, 'OWNED_TEST_SENTINEL');
   const version = await runOwnedProcess(assets.ytdlp, ['--ignore-config', '--no-plugin-dirs', '--version'], { cwd: directory, env: env(directory) });
   assert.equal(version.toString().trim(), YTDLP_VERSION, 'The actual pinned yt-dlp executable runs without network');
@@ -254,8 +261,8 @@ test('pinned Deno adversarial local permissions under exact bundled-provider fla
     const out={};
     async function deny(name,fn){try{await fn();out[name]='GRANTED'}catch(e){out[name]=e.name+':'+e.message}}
     const code=async()=>{
-      await deny('fetch',()=>fetch('http://127.0.0.1:9/'));
-      await deny('socket',()=>Deno.connect({hostname:'127.0.0.1',port:9}));
+      await deny('fetch',()=>fetch('http://127.0.0.1:${targetPort}/'));
+      await deny('socket',()=>Deno.connect({hostname:'127.0.0.1',port:${targetPort}}));
       await deny('read',()=>Deno.readTextFile(${JSON.stringify(sentinel)}));
       await deny('write',()=>Deno.writeTextFile(${JSON.stringify(canary)},'BAD'));
       await deny('env',()=>Deno.env.get('OWNED_TEST_SECRET'));
@@ -277,6 +284,7 @@ test('pinned Deno adversarial local permissions under exact bundled-provider fla
   for (const name of ['fetch', 'socket', 'read', 'write', 'env', 'run', 'import', 'worker']) assert.match(results[name], /NotCapable|PermissionDenied|Requires .* access|not permitted/i, name);
   for (const name of ['net','read','write','env','run','ffi','sys']) assert.equal(results[`request-${name}`], 'denied');
   assert.equal(fs.existsSync(canary), false);
+  assert.equal(networkConnections, 0, 'Permission checks reject before connecting to the owned listener');
   await assert.rejects(runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'while(true){}', timeoutMs: process.platform === 'win32' ? 20000 : 5000 }), /deadline/);
   await assert.rejects(runOwnedProcess(assets.deno, [...DENO_PROVIDER_ARGS], { cwd: directory, env: env(directory), input: 'while(true)console.log("x".repeat(65536))', maxBytes: 100_000 }), /output limit/);
 });
