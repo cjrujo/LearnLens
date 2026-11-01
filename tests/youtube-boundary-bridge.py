@@ -17,7 +17,9 @@ assert vendor.VERSION == "0.8.0"
 lib = pathlib.Path(config["lib"]).read_text(encoding="utf-8")
 core = pathlib.Path(config["core"]).read_text(encoding="utf-8")
 for name, code in [("yt.solver.lib.min.js", lib), ("yt.solver.core.min.js", core)]:
-    assert hashlib.sha512(code.encode()).hexdigest() == vendor.HASHES[name]
+    kind = ejs.ScriptType.LIB if name.startswith("yt.solver.lib") else ejs.ScriptType.CORE
+    script = ejs.Script(kind, ejs.ScriptVariant.MINIFIED, ejs.ScriptSource.PYPACKAGE, vendor.VERSION, code)
+    assert script.hash == vendor.HASHES[name]  # Upstream uses SHA3-512, not SHA-512.
 
 captured = {}
 class CapturePopen:
