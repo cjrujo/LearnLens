@@ -135,6 +135,40 @@ export class AudioSourceCollector {
     // Even a provider's "complete" OCR report is not verified verbatim coverage.
     this.emit({ key: `part:${index}:image:${imageIndex}`, text: result.text, source, extraction: 'vision', coverage: result.coverage === 'no_english' ? 'no_english' : 'uncertain', warnings: [...warnings, ...result.warnings, VISION_WARNING] });
   }
+  addVideoAnalysis({ index, result, source, warnings = [] }) {
+    checkIndex(index);
+    if (!this.current || index >= this.current.count) throw new Error('Collect the original video part before its analysis.');
+    // Receipts come from the native-video ledger. Never turn derived descriptions
+    // into purported original speech, and never request STT/OCR from this method.
+    const bad = () => { throw new Error('The retained native-video analysis is incomplete. No video, transcription or OCR request was made.'); };
+    if (!result || result.version !== 1 || !Number.isFinite(result.start) || !Number.isFinite(result.end) || result.start < 0 || result.end <= result.start || result.end - result.start > 30.5 || !/^[a-f0-9]{64}$/.test(result.videoSha256) || !Array.isArray(result.windows) || !result.windows.length || result.windows.length > 7 || !Array.isArray(result.warnings) || result.warnings.some(w => typeof w !== 'string')) bad();
+    let next = 0, bytes = 0;
+    const duration = Math.round((result.end - result.start) * 1_000_000) / 1_000_000;
+    for (const window of result.windows) {
+      const end = Math.min(duration, next + 5);
+      if (!window || next >= duration || window.start !== next || window.end !== end || !['complete', 'uncertain', 'no_speech', 'no_audio'].includes(window.audioCoverage) || !['complete', 'uncertain'].includes(window.visualCoverage)) bad();
+      for (const key of ['transcript', 'visibleText']) {
+        if (typeof window[key] !== 'string' || !window[key].isWellFormed() || window[key].length > 10000 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(window[key])) bad();
+        bytes += encoder.encode(window[key]).byteLength;
+      }
+      if (typeof window.observations !== 'string' || !window.observations.trim() || (window.audioCoverage === 'complete' && !window.transcript.trim()) || (['no_speech', 'no_audio'].includes(window.audioCoverage) && window.transcript !== '')) bad();
+      next = end;
+    }
+    if (next !== duration) bad();
+    // Atomic headroom check: a failed inventory append never leaves half a clip.
+    if (this.retainedBytes + bytes > this.maxBytes) throw new Error('Full audio sources exceed the retained-text limit. No video text was truncated and no analysis was repeated.');
+    this.retainedBytes += bytes;
+    const cautions = [...warnings, ...result.warnings, 'Video source text is model-recognized, not verified verbatim coverage. Visual interpretations are not original quoted text.'];
+    result.windows.forEach((window, windowIndex) => {
+      const start = Math.round((result.start + window.start) * 1_000_000) / 1_000_000;
+      const end = Math.round((result.start + window.end) * 1_000_000) / 1_000_000;
+      const base = { source: `${start}–${end}s · ${source}`, coverage: 'uncertain', warnings: cautions };
+      const key = `part:${index}:video:window:${windowIndex}`;
+      if (window.transcript.length) this.emit({ ...base, key: `${key}:transcription`, text: window.transcript, extraction: 'transcription', warnings: [...cautions, TRANSCRIPTION_WARNING] });
+      if (window.visibleText.length) this.emit({ ...base, key: `${key}:visible-text`, text: window.visibleText, extraction: 'vision' });
+      if (!window.transcript.length && !window.visibleText.length) this.emit({ ...base, key: `${key}:no-text`, text: '', extraction: 'vision', warnings: [...cautions, 'The video model reported no speech or readable text in this interval. No description was substituted as original text.'] });
+    });
+  }
   endItem() {
     const current = this.current;
     if (!current) throw new Error('No audio source item is active.');

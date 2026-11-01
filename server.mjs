@@ -13,6 +13,8 @@ import { audioExtractionPrompt, parseAudioExtraction } from './lib/audio-extract
 import { documentName, documentBody, importDocument } from './lib/document-import.mjs';
 import { createMaterialStore, UPLOAD_CHUNK_BYTES } from './lib/material-store.mjs';
 import { digestInput, digestPrompt, parseDigest, localDigest } from './lib/material-digest.mjs';
+import { createVideoPlanStore } from './lib/video-plans.mjs';
+import { analyzeVideo, videoAnalysisSettings } from './lib/video-analysis.mjs';
 import { reasoningEffort, starterPrimary, recommendationCatalog, recommendationPrompt, parseRecommendations } from './lib/setup.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
@@ -56,7 +58,7 @@ async function bodyJson(request) {
 function roleFor(session, value, name) {
   if (value === null) return null;
   if (!value || typeof value !== 'object') throw new AppError(`Invalid ${name} role.`);
-  if (value.timeoutSeconds !== undefined && name !== 'primary') throw new AppError('Request timeout applies only to the primary lesson model.');
+  if (value.timeoutSeconds !== undefined && !['primary', 'video'].includes(name)) throw new AppError('Request timeout applies only to the primary lesson model.');
   if (value.engine === 'kokoro') {
     if (name !== 'speech' || !session.kokoro) throw new AppError('Kokoro is only available for speech when configured by the server operator.');
     const voice = boundedString(value.voice || session.kokoro.voice, 'Voice ID', 200);
@@ -70,7 +72,9 @@ function roleFor(session, value, name) {
   const model = boundedString(value.model, 'Model ID', 200);
   if (/[\r\n]/.test(model)) throw new AppError('Model ID cannot contain newlines.');
   const api = value.api || 'auto';
-  if (!['auto', 'chat', 'responses'].includes(api) && !(name === 'transcription' && api === 'gemini')) throw new AppError('API mode must be auto, chat, or responses; gemini is available only for speech-to-text.');
+  if (name === 'video') videoAnalysisSettings({ ...value, api });
+  else if (value.fps !== undefined) throw new AppError('Video sampling applies only to the native-video role.');
+  if (!['auto', 'chat', 'responses'].includes(api) && !(['transcription', 'video'].includes(name) && api === 'gemini')) throw new AppError('API mode must be auto, chat, or responses; gemini is available for explicitly configured transcription or video roles.');
   const role = { providerId, model, api };
   if (api === 'gemini') role.model = geminiAudioTarget(session.providers.get(providerId), model).model;
   if (value.reasoningEffort !== undefined) {
@@ -78,7 +82,8 @@ function roleFor(session, value, name) {
     const effort = reasoningEffort(value.reasoningEffort);
     if (effort !== 'default') role.reasoningEffort = effort;
   }
-  if (value.timeoutSeconds !== undefined) role.timeoutSeconds = primaryTimeoutSeconds(value.timeoutSeconds);
+  if (name === 'video') Object.assign(role, videoAnalysisSettings({ ...value, api }));
+  else if (value.timeoutSeconds !== undefined) role.timeoutSeconds = primaryTimeoutSeconds(value.timeoutSeconds);
   if (name === 'speech') role.voice = boundedString(value.voice || 'alloy', 'Voice ID', 200);
   return role;
 }
@@ -111,12 +116,13 @@ export function createApp(options = {}) {
   const sessions = new Map();
   const materials = createMaterialStore(options.materialStoreOptions);
   const audioPlans = createAudioPlanStore(options.audioPlanStoreOptions);
+  const videoPlans = createVideoPlanStore({ ...options.videoPlanStoreOptions, materials });
   let encoderPromise;
   const encoder = () => encoderPromise ||= Promise.resolve().then(() => (options.audioEncoderFactory || prepareAudioEncoder)()).catch(error => { encoderPromise = null; throw error instanceof AppError ? error : new AppError(error?.name === 'MediaImportError' ? error.message : 'Could not prepare the managed audio encoder. No speech request was made.', 422); });
   // Snapshot a coherent UI at startup: editing source files cannot break live tabs.
   const publicDirectory = options.publicDirectory || resolve(root, 'public');
   const indexHtml = readFileSync(resolve(publicDirectory, 'index.html'), 'utf8');
-  const assets = new Map(['/app.js', '/materials.js', '/audio-sources.js', '/audio-client.js', '/audio-policy.js', '/media.js', '/styles.css', '/favicon.svg'].flatMap(path => {
+  const assets = new Map(['/app.js', '/materials.js', '/audio-sources.js', '/audio-client.js', '/audio-policy.js', '/video-client.js', '/media.js', '/styles.css', '/favicon.svg'].flatMap(path => {
     const file = resolve(publicDirectory, path.slice(1));
     return existsSync(file) ? [[path, readFileSync(file)]] : [];
   }));
@@ -134,8 +140,8 @@ export function createApp(options = {}) {
   let activeJobs = 0, activeImports = 0, loginAttempts = 0, loginWindow = Date.now();
   function prune() {
     const now = Date.now();
-    for (const [id, session] of sessions) if (now - session.touched > SESSION_IDLE_MS || now - session.created > SESSION_MAX_MS) { session.importController?.abort(); void materials.clearOwner(id).catch(() => {}); void audioPlans.clearOwner(id).catch(() => {}); sessions.delete(id); }
-    void audioPlans.retryCleanup();
+    for (const [id, session] of sessions) if (now - session.touched > SESSION_IDLE_MS || now - session.created > SESSION_MAX_MS) { session.clearing = true; session.importController?.abort(); sessions.delete(id); void clearOwnedData(id).catch(() => {}); }
+    void audioPlans.retryCleanup(); void materials.retryCleanup(); void videoPlans.retryCleanup();
   }
   const interval = setInterval(prune, 60_000).unref();
 
@@ -193,7 +199,7 @@ export function createApp(options = {}) {
       session.touched = Date.now();
       const revision = session.revision;
       const ensureCurrent = () => {
-        if (session.revision !== revision || !sessions.has(session.id)) throw new AppError('Session changed or expired. Reload LearnLens.', 401);
+        if (session.clearing || session.revision !== revision || !sessions.has(session.id)) throw new AppError('Session changed or expired. Reload LearnLens.', 401);
       };
       const readBody = async () => { const body = await bodyJson(request); ensureCurrent(); return body; };
       const readPaidBody = async () => {
@@ -203,8 +209,9 @@ export function createApp(options = {}) {
         return body;
       };
       if (request.method === 'GET' && path === '/api/state') {
-        json(response, 200, { locked: !session.authorized, setupRevision: session.setupRevision, providers: session.authorized ? [...session.providers.values()].map(publicProvider) : [], roles: session.authorized ? session.roles : emptyRoles(), starter: session.authorized ? starterPrimary([...session.providers.values()]) : null, speechServices: { kokoro: { available: Boolean(kokoro), bundled: builtInSpeech, languages: kokoro?.languages || null, voices: kokoro?.voices || null, model: kokoro?.model || 'kokoro', voice: kokoro?.voice || 'af_heart', checks: session.authorized ? session.kokoroChecks : {} } } }); return;
+        json(response, 200, { locked: !session.authorized || Boolean(session.clearing), setupRevision: session.setupRevision, providers: session.authorized ? [...session.providers.values()].map(publicProvider) : [], roles: session.authorized ? session.roles : emptyRoles(), starter: session.authorized ? starterPrimary([...session.providers.values()]) : null, speechServices: { kokoro: { available: Boolean(kokoro), bundled: builtInSpeech, languages: kokoro?.languages || null, voices: kokoro?.voices || null, model: kokoro?.model || 'kokoro', voice: kokoro?.voice || 'af_heart', checks: session.authorized ? session.kokoroChecks : {} } } }); return;
       }
+      if (session.clearing) throw new AppError('Session cleanup is still in progress. No new work was started.', 409);
       if (request.method === 'POST' && path === '/api/login') {
         const { password } = await readBody();
         if (Date.now() - loginWindow > 60_000) { loginAttempts = 0; loginWindow = Date.now(); }
@@ -214,10 +221,10 @@ export function createApp(options = {}) {
       }
       if (request.method === 'POST' && path === '/api/logout') {
         await readBody();
-        session.revision++;
+        session.clearing = true; session.revision++;
         session.importController?.abort();
         session.providers.clear(); session.roles = initialRoles(); session.kokoroChecks = Object.create(null); session.setupRevision++; session.authorized = !accessPassword;
-        await materials.clearOwner(session.id); await audioPlans.clearOwner(session.id);
+        try { await clearOwnedData(session.id); } finally { session.clearing = false; }
         json(response, 200, { ok: true }); return;
       }
       if (!session.authorized) throw new AppError('Enter the LearnLens access password first.', 401);
@@ -317,6 +324,9 @@ export function createApp(options = {}) {
         const body = await readBody();
         const roles = {};
         for (const name of ['primary', 'transcription', 'speech']) roles[name] = roleFor(session, body[name] ?? null, name);
+        // Additive role: older clients do not silently erase a native-video assignment.
+        if (Object.hasOwn(body, 'video')) roles.video = roleFor(session, body.video, 'video');
+        else if (session.roles.video !== undefined) roles.video = session.roles.video;
         session.roles = roles; session.setupRevision++; json(response, 200, { roles }); return;
       }
       if (request.method === 'GET' && path === '/api/demo') {
@@ -387,6 +397,76 @@ export function createApp(options = {}) {
         }
         throw new AppError('Unsupported audio plan operation.', 405);
       }
+      if (request.method === 'POST' && path === '/api/materials/from-url') {
+        const body = await readBody();
+        if (body.publicFetchConsent !== true) throw new AppError('Confirm public source retrieval before contacting the website. This is separate from AI consent.');
+        const result = await materials.startImport(session.id, { id: body.id, url: body.url, mode: body.mode },
+          { acquireJob: () => acquireLocalJob(session), checkCurrent: ensureCurrent });
+        ensureCurrent(); json(response, 202, result); return;
+      }
+      const videoPlanPath = /^\/api\/materials\/([a-f0-9-]{36})\/video-plan$/.exec(path);
+      if (videoPlanPath) {
+        const materialId = videoPlanPath[1];
+        if (request.method === 'GET') {
+          const fps = url.searchParams.has('fps') ? Number(url.searchParams.get('fps')) : 24;
+          json(response, 200, videoPlans.find(session.id, materialId, fps)); return;
+        }
+        if (request.method === 'POST') {
+          const body = await readBody();
+          await runJob(session, async () => { const result = await videoPlans.create(session.id, materialId, { fps: body.fps }); ensureCurrent(); json(response, 201, result); }); return;
+        }
+        throw new AppError('Unsupported video plan operation.', 405);
+      }
+      const videoPath = /^\/api\/video\/plans\/([a-f0-9]{64})(?:\/clips\/([a-f0-9]{64}))?$/.exec(path);
+      if (videoPath) {
+        const [, planId, clipId] = videoPath;
+        if (request.method === 'GET') {
+          const result = clipId ? await videoPlans.clipStatus(session.id, planId, clipId) : videoPlans.status(session.id, planId);
+          ensureCurrent(); json(response, 200, result); return;
+        }
+        if (request.method === 'POST' && clipId) {
+          const body = await readBody();
+          if (body.consent !== true) throw new AppError('Explicit consent is required before analyzing video.');
+          let setup;
+          const currentVideoSetup = () => {
+            ensureCurrent();
+            if (!Number.isInteger(body.expectedSetupRevision) || body.expectedSetupRevision !== session.setupRevision) throw new AppError('AI settings changed. Confirm remaining video analysis again; no new provider request was made.', 409);
+            if (!setup) {
+              const role = session.roles.video;
+              videoAnalysisSettings(role);
+              const sourceProvider = session.providers.get(role.providerId);
+              if (!sourceProvider) throw new AppError('Assign a video provider before analyzing unfinished clips.');
+              setup = { role: structuredClone(role), provider: { ...sourceProvider }, revision: session.setupRevision };
+            }
+            return setup;
+          };
+          // The ledger evaluates this getter only for NEW provider work. Replays,
+          // polling and local checkpoint repair do not require a current role.
+          const dependencies = {
+            acquireJob: () => acquireLocalJob(session), checkCurrent: ensureCurrent,
+            get analysisIdentity() {
+              const { role, revision } = currentVideoSetup();
+              return { providerId: role.providerId, model: role.model, api: role.api, fps: role.fps, setupRevision: revision };
+            },
+            analyzeClip: async (clip, markDispatched) => {
+              const { role, provider, revision } = currentVideoSetup();
+              if (session.setupRevision !== revision) throw new AppError('AI settings changed before video dispatch. Confirm again.', 409);
+              markDispatched();
+              const result = await analyzeVideo(provider, role, clip);
+              ensureCurrent();
+              if (session.setupRevision === revision && session.providers.has(role.providerId)) {
+                const recorded = session.providers.get(role.providerId);
+                recorded.checks[role.model] ||= Object.create(null);
+                recorded.checks[role.model].video = { ...check('verified', 'Accepted a native audiovisual clip with structurally complete output. Model perception and recognition still require review.', role), fps: role.fps };
+              }
+              return result;
+            },
+          };
+          const result = await videoPlans.startAnalysis(session.id, planId, clipId, { attemptId: body.attemptId, retry: body.retry === true }, dependencies);
+          ensureCurrent(); json(response, 202, result); return;
+        }
+        throw new AppError('Unsupported video analysis operation.', 405);
+      }
       if (request.method === 'POST' && path === '/api/materials') {
         const body = await readBody(); const result = await materials.create(session.id, body); ensureCurrent();
         json(response, 201, result); return;
@@ -413,7 +493,7 @@ export function createApp(options = {}) {
       if (materialPath) {
         const [, id, action] = materialPath;
         if (request.method === 'GET' && !action) { json(response, 200, materials.status(session.id, id)); return; }
-        if (request.method === 'DELETE' && !action) { await materials.remove(session.id, id); ensureCurrent(); json(response, 200, { ok: true }); return; }
+        if (request.method === 'DELETE' && !action) { await settleCleanup([videoPlans.removeMaterial(session.id, id), materials.remove(session.id, id)]); ensureCurrent(); json(response, 200, { ok: true }); return; }
         if (request.method === 'PUT' && action === 'content') {
           await runJob(session, async () => {
             const data = await documentBody(request, undefined, UPLOAD_CHUNK_BYTES); ensureCurrent();
@@ -464,7 +544,7 @@ export function createApp(options = {}) {
         }); return;
       }
       if (request.method === 'POST' && path === '/api/lessons') {
-        const input = validateLessonInput(await readPaidBody());
+        const body = await readPaidBody(), input = validateLessonInput(body);
         const primary = session.roles.primary, speech = session.roles.speech;
         if (!primary) throw new AppError('Assign a primary lesson model in AI providers first.');
         if (input.includeAudio && !speech) throw new AppError('Assign a speech generation model or turn off lesson audio.');
@@ -472,6 +552,11 @@ export function createApp(options = {}) {
         context('lesson_generation', provider, primary);
         const speechProvider = speech && (speech.engine === 'kokoro' ? kokoro : session.providers.get(speech.providerId));
         await runJob(session, async () => {
+          const attachedVideos = materials.list(session.id).filter(item => item.analysisMode === 'whole-video' && item.hasVideo !== false);
+          const refs = body.videoPlans ?? [];
+          if (!Array.isArray(refs) || refs.length !== attachedVideos.length || attachedVideos.some(item => item.status !== 'ready' || !refs.some(ref => ref?.materialId === item.id && ref?.snapshotId === item.snapshotId))) throw new AppError('Every attached whole video must have complete analysis receipts before teaching. No lesson request was made.', 409);
+          if (refs.length) await videoPlans.assertComplete(session.id, refs);
+          ensureCurrent();
           const output = await generateText(provider, primary, lessonPrompt(input));
           ensureCurrent();
           const lesson = parseLesson(output.text);
@@ -512,15 +597,28 @@ export function createApp(options = {}) {
     }
   });
 
-  async function runJob(session, work) {
+  function acquireJob(session) {
+    if (session.clearing || !sessions.has(session.id)) throw new AppError('Session changed or expired. No new work was started.', 401);
     if (session.busy) throw new AppError('Another AI request is running in this session. Please wait for it to finish.', 409);
     if (activeJobs >= 8) throw new AppError('Server is busy. Please try again shortly.', 503);
     session.busy = true; activeJobs++;
-    try { return await work(); } finally { session.busy = false; activeJobs--; }
+    let released = false;
+    return () => { if (!released) { released = true; session.busy = false; activeJobs--; } };
   }
+  function acquireLocalJob(session) {
+    if (activeImports >= 2) throw new AppError('Local material processing is busy. Try again shortly.', 503);
+    const release = acquireJob(session); activeImports++; let released = false;
+    return () => { if (!released) { released = true; activeImports--; release(); } };
+  }
+  async function runJob(session, work) { const release = acquireJob(session); try { return await work(); } finally { release(); } }
+  async function settleCleanup(operations) {
+    const results = await Promise.allSettled(operations), failure = results.find(result => result.status === 'rejected');
+    if (failure) throw failure.reason;
+  }
+  function clearOwnedData(owner) { return settleCleanup([videoPlans.clearOwner(owner), materials.clearOwner(owner), audioPlans.clearOwner(owner)]); }
   server.requestTimeout = 30_000;
   server.headersTimeout = 15_000;
-  server.on('close', () => { clearInterval(interval); for (const session of sessions.values()) session.importController?.abort(); sessions.clear(); void materials.close().catch(() => {}); void audioPlans.close().catch(() => {}); });
+  server.on('close', () => { clearInterval(interval); for (const session of sessions.values()) session.importController?.abort(); sessions.clear(); void videoPlans.close().catch(() => {}); void materials.close().catch(() => {}); void audioPlans.close().catch(() => {}); });
   return { server };
 }
 

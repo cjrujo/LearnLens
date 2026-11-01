@@ -12,6 +12,10 @@
 #audio-scope-note{margin-top:12px}
 .audio-progress-panel .button-row{flex-wrap:wrap}
 @media(max-width:700px){.audio-progress-panel .btn{white-space:normal;min-height:42px}.audio-progress-panel{padding:14px}}
+/* Explicit URL acquisition stays separate from AI generation. */
+.url-import{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end;margin:18px 0 10px;min-width:0}
+.url-import>.field{min-width:0}
+@media(max-width:700px){.url-import{grid-template-columns:minmax(0,1fr)}.url-import .btn{width:100%;white-space:normal}}
 /* Unified materials: one entry point, optional read-only review. */
 .material-list{list-style:none;padding:0;margin:18px 0;display:grid;gap:12px;min-width:0}
 .material-card{border:1px solid var(--line);border-radius:10px;padding:14px;min-width:0;overflow-wrap:anywhere}

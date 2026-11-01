@@ -1,11 +1,17 @@
 import http from 'node:http';
+import assert from 'node:assert/strict';
+import { videoWindows } from '../lib/video-analysis.mjs';
 import { demoLesson } from '../lib/lesson.mjs';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pdf, zip, docxEntries, paragraph, pptxManyEntries } from './document-fixtures.mjs';
 
 export function callKind(call) {
-  if (call.path === '/v1/audio/transcriptions' || /^\/v1beta\/models\/[^/]+:generateContent$/.test(call.path)) return 'transcription';
+  if (/^\/v1beta\/models\/[^/]+:generateContent$/.test(call.path)) {
+    const nativeVideo = call.body?.systemInstruction?.parts?.some(part => part.text?.includes('LEARNLENS_WHOLE_VIDEO_V1')) || call.body?.contents?.some(content => content.parts?.some(part => part.inlineData?.mimeType?.startsWith('video/')));
+    return nativeVideo ? 'video' : 'transcription';
+  }
+  if (call.path === '/v1/audio/transcriptions') return 'transcription';
   if (call.path === '/v1/audio/speech') return 'speech';
   if (call.path !== '/v1/responses') return 'discovery';
   const instructions = call.body?.instructions || '';
@@ -32,9 +38,9 @@ export async function importFixtures(directory, { media = false } = {}) {
     const video = ['-f', 'lavfi', '-i', 'color=c=blue:size=320x180:rate=2'];
     const specs = [
       ['long-recording.mp3', [...sound, '-t', '181.25', '-c:a', 'libmp3lame', '-b:a', '32k']],
-      ['movie.mp4', [...video, ...sound, '-t', '2.25', '-c:v', 'mpeg4', '-q:v', '8', '-c:a', 'aac']],
-      ['recording.webm', [...video, ...sound, '-t', '2.25', '-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '8', '-c:a', 'libopus']],
-      ['silent.mp4', [...video, '-t', '2.25', '-c:v', 'mpeg4', '-q:v', '8', '-an']],
+      ['movie.mp4', [...video, ...sound, '-t', '2.5', '-c:v', 'mpeg4', '-q:v', '8', '-c:a', 'aac']],
+      ['recording.webm', [...video, ...sound, '-t', '2.5', '-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '8', '-c:a', 'libopus']],
+      ['silent.mp4', [...video, '-t', '2.5', '-c:v', 'mpeg4', '-q:v', '8', '-an']],
     ];
     for (const [name, args] of specs) {
       const path = resolve(directory, name);
@@ -93,6 +99,27 @@ export function mathAudioLesson() {
     audio: [], warnings: ['Invented mathematics fixture; no real learner material.'],
   };
 }
+// Invented recognition output, not a claim that the tone/solid-color fixture
+// contains speech or screen words. Native decoding remains the app's real path.
+export function wholeVideoFixtureResponse(body) {
+  assert.ok(body?.systemInstruction?.parts?.some(part => part.text?.includes('LEARNLENS_WHOLE_VIDEO_V1')), 'Native video requires the whole-video marker');
+  const parts = body.contents?.[0]?.parts;
+  assert.equal(parts?.[1]?.inlineData?.mimeType, 'video/mp4');
+  assert.ok(parts[1].inlineData.data, 'Native video has attached clip bytes');
+  const requested = /^Analyze every interval in this native audiovisual clip\. Required windows: (\[.*\])\. Clip duration: ([\d.]+) seconds\. A soundtrack (is present|is absent)\b/.exec(parts[0]?.text || '');
+  assert.ok(requested, 'Use the actual requested clip windows/duration and soundtrack metadata');
+  const windows = JSON.parse(requested[1]), duration = Number(requested[2]), hasAudio = requested[3] === 'is present';
+  assert.deepEqual(windows, videoWindows(duration), 'No fixed one-window or truncated-tail fixture');
+  const result = { version: 1, windows: windows.map(bounds => ({
+    ...bounds,
+    transcript: hasAudio ? `Mock native speech from ${bounds.start} to ${bounds.end} seconds / stays verbatim.` : '',
+    visibleText: `Mock screen words from ${bounds.start} to ${bounds.end} seconds / stay original.`,
+    observations: `Derived visual interpretation from ${bounds.start} to ${bounds.end} seconds is not original speech.`,
+    audioCoverage: hasAudio ? 'complete' : 'no_audio', visualCoverage: 'complete',
+  })), warnings: ['Invented QA recognition output, not evidence of real speech, screen text or model accuracy.'] };
+  return { candidates: [{ finishReason: 'STOP', content: { role: 'model', parts: [{ text: 'Excluded fixture thinking', thought: true }, { text: JSON.stringify(result) }] } }] };
+}
+
 export function createQAProvider({ lesson: suppliedLesson } = {}) {
   const config = { lesson: suppliedLesson && structuredClone(suppliedLesson), status: 200, failKind: null, failAfter: null, audioExtractFailAt: null, speechDelay: 0, lessonDelay: 0, flushLessonHeaders: false, digestNotes: null, digestFaultAt: null, digestFaultRepeat: false, digestFault: 'oversized-notes' }, calls = [];
   const lesson = structuredClone(demoLesson);
@@ -147,6 +174,10 @@ export function createQAProvider({ lesson: suppliedLesson } = {}) {
       res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text }] }] }));
     } else if (req.url === '/v1/audio/speech') { res.setHeader('Content-Type', 'audio/wav'); res.end(wav); }
     else if (req.url === '/v1/audio/transcriptions') res.end(JSON.stringify({ text: config.transcriptText ?? transcriptText }));
+    else if (call.kind === 'video') {
+      try { res.end(JSON.stringify(wholeVideoFixtureResponse(body))); }
+      catch (error) { call.failed = true; res.statusCode = 500; res.end(JSON.stringify({ error: error.message })); }
+    }
     else if (/^\/v1beta\/models\/[^/]+:generateContent$/.test(req.url)) res.end(JSON.stringify({ candidates: [{ finishReason: 'STOP', content: { role: 'model', parts: [{ text: 'Excluded fixture thinking', thought: true }, { text: 'Gemini-native synthetic transcript about Newton’s laws.' }] } }] }));
     else { res.statusCode = 404; res.end('{}'); }
   });

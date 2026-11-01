@@ -36,24 +36,29 @@ The tests use local mock providers. They do not call paid models or prove the ed
 - Primary-model thinking level: Default, None, Minimal, Low, Medium, High, Extra high or Maximum, subject to model support. Configurable request wait: 30–600 seconds, default 300.
 - Optional primary-model setup advisor: reviewed suggestions with reasons, never silently saved or treated as capability verification.
 - Explicit model listing and opt-in **billable** text, vision and speech capability tests.
-- Separate primary, transcription and speech model roles. Same provider/model may serve several roles when supported.
+- Separate primary, transcription, native-video and speech model roles. Same provider/model may serve several roles when supported.
 - Responses API with narrowly scoped Chat Completions fallback, or explicit endpoint mode. Bounded completed SSE responses and UTF-8 BOMs are handled; malformed, empty and HTML responses get safe, format-specific diagnostics rather than blaming the model.
-- Voice recording and media transcription through `/audio/transcriptions` or an explicitly selected [Gemini-native audio API](GEMINI-AUDIO.md), after explicit consent. Long recordings are automatically split into independent audio parts; video also contributes sampled stills.
+- Voice recording and media transcription through `/audio/transcriptions` or an explicitly selected [Gemini-native audio API](GEMINI-AUDIO.md), after explicit consent. Long audio-only recordings are automatically split into independent audio parts. New videos use complete chronological native audiovisual clips, not sampled stills.
 - [Complete English audio](FULL-AUDIO.md) defaults to **Auto: English-subject lessons only**, with explicit On/Off overrides. Subject Auto uses the normal lesson response, not the explanation language or an extra classifier call. It covers words and sentence/phrase targets from **both uploaded material and the generated lesson**, not eight selected examples. Full extracted text is retained separately from teaching summaries. Click-to-play, repeat, Stop and 1× / 0.75× / 0.5× work offline; completed clips are reused on continuation without repeating paid teaching.
 - Explicit generated reading-pause `/` marks stay visible but become pauses in speech; literal slashes in unmarked content are not stripped. Downloaded existing clips are unchanged.
 - Speech uses native Kokoro or an explicitly selected compatible provider. Native output is WAV internally; managed FFmpeg compresses complete-mode exports to MP3. The exact unique clip count and local/potentially billable speech destination require a second confirmation. English/Latin-script matching is not reliable language identification; recognition and pronunciation still need review. No automatic cloud or browser-TTS fallback.
 - Downloaded HTML includes its own CSS, trusted interaction script, source images and successfully generated audio. No CDN, font download, API connection or API key is required to open it offline.
 - Responsive browser interface; separate in-memory state and credentials for each browser session.
 
+## Public links and videos (unreleased)
+
+The working tree adds explicit **fetch → private review → separate AI approval** for public webpage/audio/video/YouTube links. Whole-video analysis requires a separately configured native-video role and saved results for every interval before teaching. See [setup, recovery, privacy and limits](URL-SOURCES.md). Local tests are not proof of public YouTube availability or perfect video understanding; the release/activation gates remain in [TESTING.md](TESTING.md#url-sources-and-whole-video-unreleased).
+
 ## Choose models
 
 | Role | Requirement | When needed |
 |---|---|---|
 | Primary | Text generation and image understanding for screenshots; able to follow a JSON schema prompt | Always |
-| Transcription | OpenAI multipart `/audio/transcriptions` or explicit Gemini-native `models.generateContent` | Prepared audio input |
+| Transcription | OpenAI multipart `/audio/transcriptions` or explicit Gemini-native `models.generateContent` | Audio-only input |
+| Video analysis | Explicit Gemini-native `generateContent` with inline MP4 and requested FPS | Whole-video input; assigned manually |
 | Speech | OpenAI-compatible `/audio/speech`, binary audio response, a voice supported by the provider | Lesson audio |
 
-That means **one required role and two optional roles**, not necessarily three distinct models. Embeddings, live voice and multi-agent orchestration are not needed for the first document-to-lesson flow.
+That means **one always-required role and three input/output-dependent roles**, not necessarily four distinct models. Embeddings, live voice and multi-agent orchestration are not needed for the first document-to-lesson flow.
 
 1. Start with the **OpenAI standard** preset or choose **Custom**. The base URL remains editable; enter the key belonging to that destination. Example: `https://api.openai.com/v1`, or `https://your-gateway.example/api/v1`.
 2. Use **Discover models** to query `{baseURL}/models`. This does not run inference. A provider without this endpoint can still work: enter model IDs manually.
@@ -63,6 +68,8 @@ That means **one required role and two optional roles**, not necessarily three d
 6. Add material, preferences and a goal, then generate. Source material is sent to the selected primary provider. **Audio: Auto** includes English-learning lessons only (even with explanations in another language); choose On/Off to override. Subject Auto can identify English after teaching, then build original audio sources by rereading local parts and reusing pinned transcripts—no repeated teaching or transcription. Extra audio OCR is conditional and disclosed before generation; unfinished OCR needs renewed consent on continuation. Missing speech setup retains text while you configure it. Complete audio requires a separate exact-count confirmation; speech text then goes to the selected speech engine/provider. Voice recordings go to the selected transcription provider.
 
 **Gemini audio:** In Speech-to-text, choose **Transcription API → Gemini-native audio**, then save. Your provider/key stay on the same host; a `/v1` base maps to `/v1beta` for audio only. Configure the primary teaching API separately (Aiberm documents Chat Completions for its Gemini model). A user reported a successful `gemini-3.8-flash` native transcription. Automated tests remain local fixtures; broader gateway/token-group compatibility is not established. No paid probe or protocol fallback is automatic. See [setup, limits and evidence](GEMINI-AUDIO.md).
+
+**Native video:** configure its provider/model explicitly, requested sampling (1–24 FPS, default 24), and independent wait limit (30–600 seconds, default 300). No video fallback to STT, stills or another provider runs. Successful receipts feed later English audio without repeating video analysis. All submitted intervals and model-reported coverage do not prove every detail was understood. See [whole-video requirements](URL-SOURCES.md#how-to-configure-whole-video-analysis).
 
 **Thinking level:** Default omits the parameter entirely; it is not the same as None. Responses uses `reasoning: { effort }`; Chat uses `reasoning_effort`. Both use output-token limits that include reasoning tokens. More effort can increase latency/cost or exhaust the output budget. Not every model/gateway supports every setting; unsupported requests fail visibly, without silently downgrading effort or retrying against a different endpoint on HTTP 400. Use Default if unsure. Capability badges are scoped to API mode/thinking level/wait limit (and voice for speech).
 

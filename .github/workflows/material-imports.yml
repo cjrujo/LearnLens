@@ -20,9 +20,10 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run setup:media
+      - run: npm run setup:youtube
       - name: Real Windows media from cache
         if: runner.os == 'Windows'
-        run: npm run test:media
+        run: node --test tests/native-media.test.mjs tests/material-import.test.mjs tests/video-clips.test.mjs tests/video-timing.test.mjs tests/video-store-native.test.mjs tests/audio-encode.test.mjs tests/youtube-tools.test.mjs
         env:
           LEARNLENS_MEDIA_OFFLINE: '1'
           LEARNLENS_MEDIA_INTEGRATION: '1'
@@ -30,4 +31,26 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          sudo unshare --net -- bash -c 'ip link set lo up; export LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1; exec "$1" --test tests/native-media.test.mjs tests/material-import.test.mjs' _ "$(command -v node)"
+          sudo unshare --net -- bash -c 'ip link set lo up; export LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1; exec "$1" --test tests/native-media.test.mjs tests/material-import.test.mjs tests/video-clips.test.mjs tests/video-timing.test.mjs tests/video-store-native.test.mjs tests/audio-encode.test.mjs tests/youtube-tools.test.mjs' _ "$(command -v node)"
+      - name: Public DNS and full source acquisition (no AI)
+        run: node tests/url-public-smoke.mjs
+        env:
+          LEARNLENS_PUBLIC_URL_TEST: '1'
+          LEARNLENS_MEDIA_OFFLINE: '1'
+      - name: Best-effort public YouTube trial (no login or AI)
+        continue-on-error: true
+        run: node tests/url-public-smoke.mjs --youtube
+        env:
+          LEARNLENS_PUBLIC_URL_TEST: '1'
+          LEARNLENS_MEDIA_OFFLINE: '1'
+          LEARNLENS_YOUTUBE_OFFLINE: '1'
+      - name: Retain explicit public-source results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-source-results-${{ runner.os }}
+          path: |
+            artifacts/url-public-smoke-*.json
+            artifacts/youtube-public-smoke-*.json
+          if-no-files-found: warn
+          retention-days: 7

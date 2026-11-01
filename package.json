@@ -12,6 +12,8 @@
     "start:lite": "node --env-file-if-exists=.env server.mjs",
     "setup:speech": "node deploy/setup-native.mjs",
     "setup:media": "node deploy/setup-media.mjs",
+    "setup:youtube": "node deploy/setup-youtube.mjs",
+    "test:video": "node --test tests/video-clips.test.mjs tests/video-timing.test.mjs tests/video-store-native.test.mjs tests/video-analysis.test.mjs tests/video-plans.test.mjs tests/url-video-api.test.mjs",
     "test:media": "node --test tests/native-media.test.mjs tests/material-import.test.mjs",
     "test:native": "node tests/native-smoke.mjs",
     "test:audio-native": "node tests/full-audio-native.mjs",
@@ -22,6 +24,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "3.8.1",
+    "htmlparser2": "12.0.0",
     "kokoro-js": "1.2.1",
     "pdfjs-dist": "6.4.299",
     "saxes": "6.0.0",

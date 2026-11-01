@@ -9,6 +9,13 @@
 
 See [IMPORTS.md](IMPORTS.md) for platform prerequisites and offline cache preparation.
 
+## Public URL parsing and optional YouTube helpers
+
+- `htmlparser2` **12.0.0**, MIT: https://github.com/fb55/htmlparser2. Its locked parsing dependencies (`domhandler`, `domutils`, `domelementtype`, `dom-serializer`, `entities`) are MIT; copies of their installed license files are in `third_party/`. Exact transitive versions and integrity hashes remain in `package-lock.json`.
+- Optional managed **yt-dlp 2026.10.26** standalone releases bundle Python, **yt-dlp-ejs 0.8.0** and other components. The standalone distribution is not simply the source project's Unlicense: GPLv3+ and bundled-component notices/obligations apply. Sources/build information: https://github.com/yt-dlp/yt-dlp/tree/2026.10.26 and https://github.com/yt-dlp/ejs. Review the exact release's third-party notices and corresponding-source obligations before redistributing binaries or preloaded images.
+- **Deno 2.9.8**: https://github.com/denoland/deno/tree/v2.9.8 (MIT project; bundled runtime/component licenses also apply). The official executable ZIP is retained to reverify the extracted executable. `deploy/youtube-assets.mjs` pins exact official Windows/Linux x64 assets, sizes and SHA-256 hashes. These binaries are not vendored into Git, installed globally, or silently updated by imports.
+- `.cache/youtube/` is project-local and excluded from Git/Docker build context. Cached binaries and the new helper integration require runtime validation; checked source code and synthetic tests do not establish upstream availability, permission enforcement on every platform, or redistribution compliance.
+
 ## Native Node deployment (default)
 
 `npm ci` installs locked dependencies; LearnLens does not vendor their compiled binaries into Git. `npm start` prepares a local model cache. The LearnLens MIT license does not replace dependency/model licenses.

@@ -1,5 +1,31 @@
 # LearnLens verification
 
+## URL sources and whole video (unreleased)
+
+These are **working-tree checks**, not a published/activated release or fresh Linux/public-network certification. The active release remains the separately verified English-audio build until an explicitly authorized restart.
+
+- Current local suite: **712 total, 705 passed, 0 failed, 7 optional skips**; syntax checks passed for **103 files**. This run precedes the subsequent documentation and legacy-browser-fixture updates.
+- Cached/offline Windows FFmpeg: **45 passed, 0 skipped** across `video-clips`, `video-timing`, `video-store-native` and `native-media`. MP4 and real VP9/Opus WebM retained all 490 frames across three clips, ten tail marker frames and a late 880-Hz tone; originals unchanged. WebM used one packet scan across import plus all three clips. Also tested silent/offset/multiple-track rejection, hard packet limits, cancellation, source-proof tampering and real material-store/private-plan/clip integration.
+- Dedicated URL/video browser suite: **8 scenario groups passed**, including separate fetch/AI/speech consent, cancellation, GET-only lost-ack recovery, explicit new-ID reimport, complete coverage before teaching, failed-second-clip resume without repeating the first, FPS change rejection, local checkpoint repair after role removal, Auto/On raw-video-source audio reuse without native/STT/OCR replay, 320px layouts and finite offline MP3 playback. Synthetic providers only; native FFmpeg encoded a synthetic tone. This does not test recognition or pronunciation quality.
+- Parser/lifecycle regressions cover whitespace/preformatted fidelity, active media parentage, complete-original retention before parser/sidecar failure, same-snapshot local retry, bounded staging cleanup and worker-exit resource lifetime. A real isolated HTML worker was exercised with the deferred downloader/store integration.
+- A read-only independent review of the six relevant complete implementation files found no new concrete issue and confirmed the six initial P2 fixes at implementation level. It did not independently execute tests; this is not a security certification.
+
+Commands (Node 22+, no real provider credentials):
+
+```sh
+npm test
+npm run check
+# Existing verified FFmpeg cache only; includes real WebM and store timing tests:
+LEARNLENS_MEDIA_OFFLINE=1 LEARNLENS_MEDIA_INTEGRATION=1 npm run test:video
+```
+
+Local evidence: `artifacts/url-resumed-full-suite.log`, `url-resumed-syntax.log`, `url-resumed-native.log`, `url-resumed-text-all.log`, `url-real-worker-recovery.log`, `url-final-local-review.md`, and `url-video-browser/2026-11-01T00-57-01-091Z/`. The dedicated browser runner uses an explicitly owned Chrome on **9333**, a fresh private profile and local synthetic fixtures, then closes/removes its resources. Never use browser autodiscovery, a normal user profile or port 9222. A prior automatic precheck read browser port metadata and made a TCP probe to 9222; no CDP attachment/tabs/cookies were accessed. That boundary incident is recorded in `artifacts/url-browser-precheck-boundary.md`; later checks avoided discovery.
+
+**Outstanding gates:** actual pinned yt-dlp/Deno permission/process behavior, real public URL/YouTube acquisition, fresh native Linux whole-video behavior and exact-commit CI/publication. This host's observed public-host DNS response was benchmarking address `198.18.0.10`; the guarded client correctly rejected it before HTTPS. No address exception, inherited proxy credentials or OS DNS/VPN change was used. Legacy full-browser media assertions are being updated separately; do not count historical STT/still-video results as native-video evidence. Four-hour coverage has algebraic limits tests, not a four-hour native fixture. The seventh optional skip is the absent verified YouTube runtime; remaining native opt-ins are separately attributed above (audio-encoder verification remains historical for this full-suite run).
+
+[Feature setup and limitations](URL-SOURCES.md) · [API](API-CONTRACT.md#url-acquisition-and-native-video-plans)
+
+
 ## Automated checks
 
 From the project directory, with Node.js 22.13+ (run `npm ci` first):

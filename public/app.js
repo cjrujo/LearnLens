@@ -5,7 +5,7 @@ import { createAudioContext, prepareAudioPlan, generateAudioClips, exportAudioPl
 const $ = id => document.getElementById(id);
 const $$ = selector => [...document.querySelectorAll(selector)];
 const token = document.querySelector('meta[name="learnlens-token"]').content;
-const EMPTY = { primary: null, transcription: null, speech: null };
+const EMPTY = { primary: null, transcription: null, video: null, speech: null };
 let state = { providers: [], roles: { ...EMPTY }, locked: false };
 let ready = false, busy = false, settingsBusy = false, page = 'lesson';
 let currentLesson = null, downloadUrl = '', lastRequest = null, clock = null;
@@ -15,7 +15,7 @@ let roleDrafts = { ...EMPTY }, roleViews = {};
 let editingProviderId = null, recommendations = null;
 let recording = null, micStream = null, recordTimer = null, micPending = false;
 let sessionEpoch = 0, confirming = false, generationController = null;
-const materials = new MaterialWorkspace({ list: $('material-list'), api, changed: () => updateStatus() });
+const materials = new MaterialWorkspace({ list: $('material-list'), api, changed: () => updateStatus(), confirmUrlImport });
 function cancelWork(session = false) { sessionEpoch++; generationController?.abort(); materials.cancelPending({ session }); if (session) { if (generationCheckpoint) { generationCheckpoint.unavailable = true; generationCheckpoint.prepared = null; } for (const lesson of lessonHistory) if (lesson.audio) { lesson.audio.unavailable = true; lesson.audio.notice = 'Session changed. Retained HTML is available, but this audio plan cannot resume.'; } } }
 let toastTimer;
 
@@ -32,14 +32,24 @@ function approvedAudioSetup() { return { revision: state.setupRevision, roles: s
 function duration(seconds) { return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`; }
 function transcriptionMode(role) { return role?.api === 'gemini' ? 'Gemini-native audio (generateContent)' : 'OpenAI multipart (/audio/transcriptions)'; }
 function primaryWait(role) { return `Primary request wait: ${role?.timeoutSeconds ?? 300} seconds per provider request. Providers/proxies may stop sooner; no automatic timeout retry.`; }
+function videoDisclosure(roles) {
+  if (!materials.items.some(item => item.manifest?.analysisMode === 'whole-video')) return '';
+  const role = roles.video;
+  return '\nNative video: ' + (providerFor(role)?.name || 'Not configured') + ' / ' + (role?.model || 'required for unfinished video') +
+    '\nGemini-native audiovisual input; requested sampling ' + (role?.fps ?? 24) + ' fps, frozen per source plan; ' + (role?.timeoutSeconds ?? 300) + ' seconds per request.' +
+    '\nEvery chronological clip must finish before teaching. Full-duration copies may be resized/re-encoded; source quality and model sampling can miss fine text, frames, speech or motion. Coverage is model-reported, not certified. Long videos and higher sampling can incur many billable calls. Accepted video results are reused for English audio without separate STT or still OCR.';
+}
 function checkOf(role, kind) {
   const check = role?.engine === 'kokoro' ? state.speechServices?.kokoro?.checks?.[role.voice] : providerFor(role)?.checks?.[role?.model]?.[kind];
+  if (kind === 'video' && (check?.api !== role?.api || check?.fps !== role?.fps)) return null;
   if (!check || (['text', 'vision'].includes(kind) && (check.api !== role?.api || (check.reasoningEffort || 'default') !== (role?.reasoningEffort || 'default') || (check.timeoutSeconds ?? 300) !== (role?.timeoutSeconds ?? 300))) || (kind === 'speech' && check.voice !== (role?.voice || 'alloy')) || (kind === 'transcription' && (check.api === 'gemini') !== (role?.api === 'gemini'))) return null;
   return check;
 }
 
 // Metadata-only, per-attempt activity; never retain request bodies, filenames or credentials.
 let lessonTrace = null;
+// Lookup keys remain private; reports contain only normalized endpoint templates.
+const videoActivity = new Map();
 const tracePanel = element('details'), traceTitle = element('summary', 'Request activity & safe diagnostics');
 tracePanel.id = 'lesson-diagnostics'; tracePanel.className = 'guide-card'; tracePanel.hidden = true;
 const traceStatus = element('p'), traceHint = element('p'), traceOutput = element('pre'), traceCopy = element('button', 'Copy safe report');
@@ -50,14 +60,14 @@ tracePanel.append(traceTitle, traceStatus, traceHint, traceOutput, traceCopy,
   element('p', 'Current attempt only; up to 520 operations. Keys, request/response bodies, instructions and filenames are not collected. Provider/model labels are included—review before sharing. Reloading clears this report and the in-page preparation cache.', 'field-hint'));
 $('preview-error').after(tracePanel);
 traceStatus.style.overflowWrap = 'anywhere';
-const stageLabel = value => ({ transcription: 'Transcribing audio', source_preparation: 'Preparing source notes', lesson_generation: 'Generating final lesson', source_recognition: 'Recognizing source text', speech_generation: 'Generating English audio' }[value] || value);
+const stageLabel = value => ({ transcription: 'Transcribing audio', source_preparation: 'Preparing source notes', lesson_generation: 'Generating final lesson', source_recognition: 'Recognizing source text', speech_generation: 'Generating English audio', video_analysis: 'Analyzing whole-video clips' }[value] || value);
 const traceStages = { '/transcribe': 'Transcribing audio', '/materials/summarize': 'Preparing source notes', '/lessons': 'Generating final lesson', '/audio/extract': 'source_recognition' };
 // This private checkpoint contains source snapshots; diagnostics receive counts ONLY.
 const generationPanel = element('section', undefined, 'guide-card'); generationPanel.id = 'generation-checkpoint'; generationPanel.hidden = true;
 const generationSummary = element('p'), generationHint = element('p'), generationContinue = element('button', 'Continue generation', 'btn secondary small');
 generationSummary.id = 'generation-checkpoint-summary'; generationHint.className = 'field-hint'; generationContinue.id = 'continue-generation'; generationContinue.type = 'button';
 generationPanel.append(element('h3', 'Generation checkpoint'), generationSummary, generationHint, generationContinue); $('preview-error').after(generationPanel);
-function materialSignature() { return JSON.stringify(materials.items.map(item => [item.id, item.partCount])); }
+function materialSignature() { return JSON.stringify(materials.items.map(item => [item.id, item.snapshotId || item.manifest?.snapshotId || null, item.partCount])); }
 function requestSignature(request) { return JSON.stringify([request.goal, request.language, request.level, request.subject, request.audioMode, request.includeAudio]); }
 function checkpointMetadata() {
   const info = materials.checkpointInfo(), checkpoint = generationCheckpoint;
@@ -96,6 +106,7 @@ traceCopy.onclick = async () => {
   catch { const selection = getSelection(), range = document.createRange(); range.selectNodeContents(traceOutput); selection.removeAllRanges(); selection.addRange(range); toast('Select and copy the diagnostic report manually.'); }
 };
 function beginTrace(approvedSetup, resume = false) {
+  videoActivity.clear();
   lessonTrace = { version: 1, startedAt: new Date().toISOString(), status: resume ? 'Continuing from checkpoint' : 'Preparing', resumedFromCheckpoint: resume, cachedResults: materials.cache.size,
     roles: approvedSetup.roles, providers: state.providers.map(({ id, name }) => ({ id, name })), part: null, operations: [] };
   tracePanel.hidden = false; tracePanel.open = true; renderTrace();
@@ -112,24 +123,31 @@ function tracePart(current, total) {
 }
 function operationStart(path, body, method) {
   const speech = /^\/audio\/plans\/[^/]+\/clips\/[^/]+$/.test(path) && method === 'POST';
-  if (!busy || !lessonTrace || (!speech && !traceStages[path])) return null;
-  const trace = lessonTrace, roleName = speech ? 'speech' : path === '/transcribe' ? 'transcription' : 'primary';
+  const video = /^\/video\/plans\/[a-f0-9]{64}\/clips\/[a-f0-9]{64}$/.test(path) && method === 'POST';
+  if (!busy || !lessonTrace || (!speech && !video && !traceStages[path])) return null;
+  const trace = lessonTrace, roleName = speech ? 'speech' : video ? 'video' : path === '/transcribe' ? 'transcription' : 'primary';
   const role = speech ? activeAudio?.approvedSetup.roles.speech : trace.roles[roleName];
-  const entry = { number: (trace.operationCount = (trace.operationCount || 0) + 1), stage: speech ? 'speech_generation' : traceStages[path], role: roleName, part: speech || path === '/lessons' ? null : trace.part,
+  const entry = { number: (trace.operationCount = (trace.operationCount || 0) + 1), stage: speech ? 'speech_generation' : video ? 'video_analysis' : traceStages[path], role: roleName, part: speech || path === '/lessons' ? null : trace.part,
     startedAt: new Date().toISOString(), provider: trace.providers.find(p => p.id === role?.providerId)?.name || 'Configured provider', model: role?.model,
     apiMode: path === '/transcribe' ? (role?.api === 'gemini' ? 'gemini.generateContent' : 'audio/transcriptions') : role?.api, thinking: path === '/transcribe' ? undefined : role?.reasoningEffort || 'default',
-    appEndpoint: speech ? '/audio/plans/{plan}/clips/{clip}' : path, status: 'Waiting', input: speech ? { clips: 1 } : path === '/audio/extract' ? { images: 1 } : { textCharacters: body?.text?.length || 0, images: body?.images?.length || 0,
+    appEndpoint: speech ? '/audio/plans/{plan}/clips/{clip}' : video ? '/video/plans/{plan}/clips/{clip}' : path, status: 'Waiting', input: speech || video ? { clips: 1 } : path === '/audio/extract' ? { images: 1 } : { textCharacters: body?.text?.length || 0, images: body?.images?.length || 0,
       audioBytesApprox: body?.dataUrl ? Math.floor((body.dataUrl.split(',')[1]?.length || 0) * .75) : 0 } };
-  if (roleName === 'primary') entry.timeoutMs = (role?.timeoutSeconds ?? 300) * 1000;
+  if (video) { entry.apiMode = 'gemini.generateContent'; delete entry.thinking; }
+  if (roleName === 'primary' || video) entry.timeoutMs = (role?.timeoutSeconds ?? 300) * 1000;
   if (speech) { entry.provider = role?.engine === 'kokoro' ? 'Built-in Kokoro' : activeAudio?.approvedSetup.speechProvider || 'Configured speech provider'; entry.apiMode = role?.engine === 'kokoro' ? 'local' : 'audio/speech'; delete entry.thinking; }
   if (trace.operations.length >= 520) trace.operations.shift();
   trace.operations.push(entry); $('progress-title').textContent = entry.stage + (entry.part ? ` · part ${entry.part.current} of ${entry.part.total}` : ''); renderTrace();
-  return { trace, entry, started: Date.now() };
+  const operation = { trace, entry, started: Date.now() };
+  if (video) { operation.videoPath = path; videoActivity.set(path, operation); }
+  return operation;
 }
 function operationFinish(operation, error, result) {
   if (!operation) return;
   const { trace, entry, started } = operation;
+  if (operation.videoPath && !error && ['failed', 'damaged'].includes(result?.status)) error = { diagnostics: result.diagnostics || {} };
   entry.elapsedMs = Date.now() - started; entry.status = error ? error.name === 'AbortError' ? 'Stopped; upstream outcome unknown' : 'Failed' : 'Completed';
+  if (operation.videoPath && !error && result?.status !== 'complete') entry.status = result?.working ? 'Background work running; poll only' : result?.status === 'checkpoint_failed' ? 'Accepted result needs local checkpoint repair' : 'Accepted; outcome pending';
+  if (operation.videoPath && (error || result?.status === 'complete' || (result?.status === 'checkpoint_failed' && !result.working))) videoActivity.delete(operation.videoPath);
   if (!error && entry.appEndpoint === '/materials/summarize' && result?.preparationMode === 'verbatim') {
     entry.execution = 'local'; entry.role = 'local'; entry.apiMode = 'local';
     delete entry.provider; delete entry.model; delete entry.thinking; delete entry.timeoutMs;
@@ -155,8 +173,9 @@ function operationFinish(operation, error, result) {
 }
 async function api(path, options = {}) {
   const operation = operationStart(path, options.body, options.method);
-  try { const result = await apiRequest(path, options, operation); operationFinish(operation, null, result); return result; }
-  catch (error) { operationFinish(operation, error); throw error; }
+  const activity = operation || ((!options.method || options.method === 'GET') ? videoActivity.get(path) : null);
+  try { const result = await apiRequest(path, options, operation); operationFinish(activity, null, result); return result; }
+  catch (error) { operationFinish(activity, error); throw error; }
 }
 async function apiRequest(path, options = {}, operation = null) {
   let response;
@@ -207,7 +226,7 @@ async function refreshState(rebuild = true) {
 
 function updateStatus() {
   const assigned = Object.values(state.roles).filter(Boolean).length;
-  $('setup-count').textContent = `${assigned}/3`; $('mini-count').textContent = `${assigned}/3`;
+  $('setup-count').textContent = `${assigned}/4`; $('mini-count').textContent = `${assigned}/4`;
   $('saved-role-count').textContent = assigned;
   $('setup-label').textContent = !ready ? 'Connection unavailable' : state.locked ? 'Unlock workspace' : state.roles.primary ? 'AI setup ready' : 'Connect your AI';
   $('setup-dot').classList.toggle('pending', !state.roles.primary);
@@ -217,6 +236,7 @@ function updateStatus() {
   $('retry-preview').disabled = !editable;
   materials.setLocked(busy || settingsBusy || confirming || !ready || state.locked || Boolean(recording) || micPending || sourceBlocked);
   $('dropzone').disabled = !editable || sourceBlocked; $('material-input').disabled = !editable || sourceBlocked;
+  for (const id of ['source-url', 'source-mode', 'import-url']) $(id).disabled = !editable || sourceBlocked;
   $('learning-goal').disabled = !editable;
   for (const id of ['subject', 'level', 'language']) $(id).disabled = !editable;
   $('custom-subject').disabled = !editable || $('subject').value !== 'custom';
@@ -240,12 +260,12 @@ function updateStatus() {
   $('record-button').disabled = ((!usable || sourceBlocked) && !recording) || !navigator.mediaDevices?.getUserMedia || !window.MediaRecorder;
   for (const id of ['mini-roles', 'setup-role-list']) {
     const root = $(id); root.replaceChildren();
-    for (const [key, label] of [['primary', 'Lesson model'], ['transcription', 'Voice input'], ['speech', 'Complete English audio']]) {
+    for (const [key, label] of [['primary', 'Lesson model'], ['transcription', 'Audio input'], ['video', 'Whole-video analysis'], ['speech', 'Complete English audio']]) {
       const row = element('div'); const name = element('span', label); const value = element('span', state.roles[key]?.model || (key === 'primary' ? 'Needed' : 'Optional')); value.title = value.textContent; row.append(name, value); root.append(row);
     }
   }
   const unique = new Set(Object.values(state.roles).filter(Boolean).map(r => (r.engine || r.providerId) + '/' + r.model)).size;
-  $('mini-setup-description').textContent = `${assigned} role${assigned === 1 ? '' : 's'} assigned across ${unique} distinct model${unique === 1 ? '' : 's'}. One primary is required; the two audio roles are optional.`;
+  $('mini-setup-description').textContent = `${assigned} role${assigned === 1 ? '' : 's'} assigned across ${unique} distinct model${unique === 1 ? '' : 's'}. One primary is required. Add native video or audio roles only for sources/features that need them.`;
   for (const view of Object.values(roleViews)) view.refreshChecks();
   updateAdvisorControls(usable);
   updateSummary(); renderAudioStatus(); renderGenerationCheckpoint();
@@ -369,7 +389,8 @@ function renderProviders() {
 }
 const rolesConfig = {
   primary: { title: 'Primary lesson model', icon: 'book', description: 'Understands material, identifies subjects, and creates lessons.', kinds: ['text', 'vision'] },
-  transcription: { title: 'Speech-to-text', icon: 'mic', description: 'Transcribes prepared audio and video segments for your lesson.', kinds: ['transcription'] },
+  transcription: { title: 'Speech-to-text', icon: 'mic', description: 'Transcribes audio-only sources; whole videos use the separate native-video role.', kinds: ['transcription'] },
+  video: { title: 'Whole-video analysis', icon: 'book', description: 'Analyzes complete audiovisual clips, including speech, screen text, diagrams and motion.', kinds: ['video'] },
   speech: { title: 'Natural speech', icon: 'headphones', description: 'Creates complete English word and sentence audio from sources and the lesson.', kinds: ['speech'] },
 };
 function renderRoles() {
@@ -378,21 +399,25 @@ function renderRoles() {
     const card = $('role-card-template').content.firstElementChild.cloneNode(true); card.dataset.role = name;
     card.querySelector('.role-icon').append(icon(config.icon)); card.querySelector('[data-role-title]').textContent = config.title;
     card.querySelector('.role-requirement').textContent = name === 'primary' ? 'Required' : 'Optional'; card.querySelector('.role-description').textContent = config.description;
-    const fields = Object.fromEntries(['provider', 'model', 'manual', 'api', 'voice', 'effort', 'engine', 'timeout'].map(key => [key, card.querySelector(`[data-field="${key}"]`)]));
+    const fields = Object.fromEntries(['provider', 'model', 'manual', 'api', 'voice', 'effort', 'engine', 'timeout', 'fps'].map(key => [key, card.querySelector(`[data-field="${key}"]`)]));
     for (const [key, field] of Object.entries(fields)) { field.id = `role-${name}-${key}`; card.querySelector(`[data-for="${key}"]`).htmlFor = field.id; if (field.tagName === 'INPUT') field.maxLength = 200; }
     for (const provider of state.providers) fields.provider.add(new Option(provider.name, provider.id));
     if (name === 'transcription') {
       fields.api.replaceChildren(new Option('OpenAI multipart', 'auto'), new Option('Gemini-native audio', 'gemini'));
       card.querySelector('[data-for="api"]').textContent = 'Transcription API';
     }
-    const draft = roleDrafts[name]; fields.provider.value = draft?.providerId || ''; fields.api.value = name === 'transcription' ? (draft?.api === 'gemini' ? 'gemini' : 'auto') : draft?.api || 'auto'; fields.voice.value = draft?.voice || ''; fields.effort.value = draft?.reasoningEffort || 'default'; fields.engine.value = draft?.engine || 'provider'; fields.timeout.value = draft?.timeoutSeconds ?? 300;
-    card.querySelector('.api-field').hidden = !['primary', 'transcription'].includes(name); card.querySelector('.effort-field').hidden = name !== 'primary'; card.querySelector('.timeout-field').hidden = name !== 'primary'; card.querySelector('.voice-field').hidden = name !== 'speech'; card.querySelector('.engine-field').hidden = name !== 'speech';
+    if (name === 'video') {
+      fields.api.replaceChildren(new Option('Gemini-native video · explicit compatibility required', 'gemini'));
+      card.querySelector('.timeout-field .field-hint').textContent = '30–600 seconds per video-analysis request; default 300. Independent of primary, transcription and speech. No automatic retry; providers/proxies may stop sooner.';
+    }
+    const draft = roleDrafts[name]; fields.provider.value = draft?.providerId || ''; fields.api.value = name === 'video' ? 'gemini' : name === 'transcription' ? (draft?.api === 'gemini' ? 'gemini' : 'auto') : draft?.api || 'auto'; fields.voice.value = draft?.voice || ''; fields.effort.value = draft?.reasoningEffort || 'default'; fields.engine.value = draft?.engine || 'provider'; fields.timeout.value = draft?.timeoutSeconds ?? 300; fields.fps.value = draft?.fps ?? 24;
+    card.querySelector('.api-field').hidden = !['primary', 'transcription', 'video'].includes(name); card.querySelector('.effort-field').hidden = name !== 'primary'; card.querySelector('.timeout-field').hidden = !['primary', 'video'].includes(name); card.querySelector('.fps-field').hidden = name !== 'video'; card.querySelector('.voice-field').hidden = name !== 'speech'; card.querySelector('.engine-field').hidden = name !== 'speech';
     fields.engine.querySelector('[value="kokoro"]').disabled = !state.speechServices?.kokoro?.available;
     card.querySelector('.kokoro-hint').textContent = state.speechServices?.kokoro?.available ? (state.speechServices.kokoro.languages?.length === 1 && state.speechServices.kokoro.languages[0] === 'en' ? 'Included native Kokoro supports English only (US/UK voices). Default: af_heart. Complete-audio matching uses English/Latin text heuristics, not reliable language identification. No API key or automatic cloud fallback.' : 'Included speech runs on this server. Complete audio covers English word/sentence targets; native Kokoro supports English only. English voice af_heart is the default. No API key or automatic cloud fallback.') : 'Built-in speech is unavailable on this server. You can use an online provider or contact the workspace administrator. No learner-side installation is required.';
     function readDraft() {
       if (name === 'speech' && fields.engine.value === 'kokoro') return { engine: 'kokoro', model: state.speechServices.kokoro.model, api: 'auto', voice: fields.voice.value.trim() || state.speechServices.kokoro.voice };
       if (!fields.provider.value) return null;
-      return { providerId: fields.provider.value, model: fields.model.value === '__manual__' ? fields.manual.value.trim() : fields.model.value, api: fields.api.value, ...(name === 'primary' ? { timeoutSeconds: Number(fields.timeout.value) } : {}), ...(name === 'primary' && fields.effort.value !== 'default' ? { reasoningEffort: fields.effort.value } : {}), ...(name === 'speech' ? { voice: fields.voice.value.trim() || 'alloy' } : {}) };
+      return { providerId: fields.provider.value, model: fields.model.value === '__manual__' ? fields.manual.value.trim() : fields.model.value, api: fields.api.value, ...(['primary', 'video'].includes(name) ? { timeoutSeconds: Number(fields.timeout.value) } : {}), ...(name === 'video' ? { fps: Number(fields.fps.value) } : {}), ...(name === 'primary' && fields.effort.value !== 'default' ? { reasoningEffort: fields.effort.value } : {}), ...(name === 'speech' ? { voice: fields.voice.value.trim() || 'alloy' } : {}) };
     }
     function refreshEngine() {
       const local = name === 'speech' && fields.engine.value === 'kokoro';
@@ -414,7 +439,7 @@ function renderRoles() {
       for (const kind of config.kinds) {
         const check = checkOf(role, kind); const badge = element('span', `${kind}: ${check?.status === 'verified' ? 'Verified' : check?.status === 'failed' ? 'Test failed' : 'Untested'}`, 'badge ' + (check?.status === 'verified' ? 'verified' : check?.status === 'failed' ? 'failed' : 'neutral')); badge.title = check?.detail || 'No verified capability test yet.'; checks.append(badge);
       }
-      const help = role?.engine === 'kokoro' ? 'Uses the included Kokoro engine, never the online speech provider. Changing voices requires another check. Listen to judge language coverage and naturalness.' : name === 'primary' ? 'Auto tries Responses, then Chat only for missing endpoints. Thinking levels are model-dependent; Default is safest. Vision checks one synthetic image, not handwriting accuracy.' : name === 'speech' ? 'Requires /audio/speech compatibility. A Realtime-only model will not work here. Voice defaults to alloy; set a voice your provider supports.' : role?.api === 'gemini' ? 'Uses inline WAV audio via models.generateContent on this same provider. A /v1 base becomes /v1beta; native bases are also supported. Gateway audio support needs a real transcription check. No automatic fallback or retry. Primary API mode stays unchanged.' : 'Requires multipart /audio/transcriptions support, not just audio understanding. Gemini-native audio is a separate explicit option; it is never selected from a model name. Verification comes from an actual recording.';
+      const help = role?.engine === 'kokoro' ? 'Uses the included Kokoro engine, never the online speech provider. Changing voices requires another check. Listen to judge language coverage and naturalness.' : name === 'primary' ? 'Auto tries Responses, then Chat only for missing endpoints. Thinking levels are model-dependent; Default is safest. Vision checks one synthetic image, not handwriting accuracy.' : name === 'video' ? 'Requires native MP4 audiovisual input via this provider’s Gemini generateContent endpoint. Audio/image support or a model name is not proof of compatibility. No automatic protocol fallback. Complete clips are sent only after AI consent; valid output is not proof that every detail was understood.' : name === 'speech' ? 'Requires /audio/speech compatibility. A Realtime-only model will not work here. Voice defaults to alloy; set a voice your provider supports.' : role?.api === 'gemini' ? 'Uses inline WAV audio via models.generateContent on this same provider. A /v1 base becomes /v1beta; native bases are also supported. Gateway audio support needs a real transcription check. No automatic fallback or retry. Primary API mode stays unchanged.' : 'Requires multipart /audio/transcriptions support, not just audio understanding. Gemini-native audio is a separate explicit option; it is never selected from a model name. Verification comes from an actual recording.';
       card.querySelector('.role-check-help').textContent = help;
       card.querySelectorAll('.probe-buttons button').forEach(button => button.disabled = !role?.model || (!provider && role?.engine !== 'kokoro') || busy || settingsBusy);
     }
@@ -423,8 +448,8 @@ function renderRoles() {
     fields.engine.onchange = () => { fields.voice.value = fields.engine.value === 'kokoro' ? state.speechServices.kokoro.voice : ''; update(); };
     fields.provider.onchange = () => { populateModel(); update(); };
     fields.model.onchange = () => { card.querySelector('.manual-model-field').hidden = fields.model.value !== '__manual__'; update(); };
-    for (const key of ['manual', 'api', 'voice', 'effort', 'timeout']) fields[key].addEventListener(['api', 'effort'].includes(key) ? 'change' : 'input', update);
-    if (name !== 'transcription') for (const kind of config.kinds) {
+    for (const key of ['manual', 'api', 'voice', 'effort', 'timeout', 'fps']) fields[key].addEventListener(['api', 'effort'].includes(key) ? 'change' : 'input', update);
+    if (!['transcription', 'video'].includes(name)) for (const kind of config.kinds) {
       const button = element('button', `Test ${kind}`, 'btn secondary small'); button.type = 'button';
       button.onclick = async () => {
         const role = readDraft(); if (!role?.model || busy || settingsBusy) return;
@@ -442,6 +467,24 @@ function renderRoles() {
   }
 }
 
+async function confirmUrlImport(url, { mode = 'auto' } = {}) {
+  if (busy || settingsBusy || confirming || recording || micPending || !ready || state.locked || pendingAudioSources()) return false;
+  let citation;
+  try { const parsed = new URL(url); if (parsed.protocol !== 'https:' || parsed.username || parsed.password || (parsed.port && parsed.port !== '443')) throw new Error(); citation = parsed.origin + parsed.pathname; }
+  catch { message('upload-message', 'Use a public HTTPS URL without credentials, on port 443.', 'error'); return false; }
+  const epoch = sessionEpoch; confirming = true; updateStatus();
+  try {
+    return await confirmAction({ title: 'Fetch this public source?', description: 'The app server will contact this site and any permitted redirects, then retain a private temporary snapshot. The site can see the request and query parameters. No AI request is made. No login, browser cookies or DRM bypass. Review the snapshot before separately approving AI processing.',
+      detail: citation + '\nSource type: ' + mode + '\nStatic pages may omit dynamic content, images and embeds. Videos require all audiovisual intervals; unavailable or over-quota content fails rather than silently shrinking coverage. Query tokens are excluded from citations, but origin/path sharing still needs your review. Imports expire with this session.',
+      accept: 'Fetch private snapshot' }) && epoch === sessionEpoch;
+  } finally { confirming = false; updateStatus(); }
+}
+async function addUrlSource() {
+  const url = $('source-url').value.trim(), mode = $('source-mode').value;
+  if (!url || materials.busy || !await confirmUrlImport(url, { mode })) return;
+  try { const issues = await materials.addUrl(url, { mode }); if (!issues.length) $('source-url').value = ''; message('upload-message', issues.length ? issues.join(' ') : 'Review the retained source before creating a lesson. No AI request was made.', issues.length ? 'error' : ''); }
+  catch (error) { if (error.name !== 'AbortError') message('upload-message', error.message, 'error'); }
+}
 async function addFiles(files) {
   if (busy || settingsBusy || confirming || recording || micPending || !ready || state.locked || pendingAudioSources()) return;
   try { const issues = await materials.add(files); message('upload-message', issues.join(' '), issues.length ? 'error' : ''); }
@@ -557,9 +600,9 @@ async function continueLessonAudio({ exportOnly = false } = {}) {
         if (!ready || state.locked || epoch !== sessionEpoch) return;
         sourceApproval = approvedAudioSetup();
         const primary = sourceApproval.roles.primary;
-        consent = await confirmAction({ title: 'Prepare remaining English audio sources?', description: 'Keep the saved lesson and reuse acknowledged transcripts and recognition. Only missing/failed image recognition may make new primary-model requests; no transcription, digests or teaching will repeat. Failed/unknown attempts may already have been billed. After the inventory, confirm the exact unique speech count separately.',
+        consent = await confirmAction({ title: 'Prepare remaining English audio sources?', description: 'Keep the saved lesson and reuse acknowledged transcripts and recognition. Only missing/failed image recognition may make new primary-model requests; no video analysis, transcription, digests or teaching will repeat. Failed/unknown attempts may already have been billed. After the inventory, confirm the exact unique speech count separately.',
           detail: `Primary: ${providerFor(primary)?.name || 'Not configured'} / ${primary?.model || 'needed only for unfinished images'}\nThinking: ${primary?.reasoningEffort || 'model default'}\n${primaryWait(primary)}\nSpeech: ${sourceApproval.roles.speech?.model || 'Not configured — configure it before continuing'}\nKeep the original attachments until this source inventory finishes or is explicitly discarded.`, paid: materials.hasVisuals, accept: 'Prepare remaining sources' });
-      } else consent = await confirmAction({ title: 'Resume this retained lesson’s audio?', description: 'Refresh local setup/status and restore the existing plan only. Teaching, OCR and transcription will NOT run again. A second confirmation will show the exact speech count and any failed/unknown attempts before potentially billable speech. Provider/model/voice identity must still match the original plan; changing settings never silently retargets audio.', accept: 'Check retained audio' });
+      } else consent = await confirmAction({ title: 'Resume this retained lesson’s audio?', description: 'Refresh local setup/status and restore the existing plan only. Teaching, video analysis, OCR and transcription will NOT run again. A second confirmation will show the exact speech count and any failed/unknown attempts before potentially billable speech. Provider/model/voice identity must still match the original plan; changing settings never silently retargets audio.', accept: 'Check retained audio' });
     } finally { confirming = false; updateStatus(); }
     if (!consent || epoch !== sessionEpoch) return;
   }
@@ -725,7 +768,8 @@ async function generate(event, { resume = false } = {}) {
   if (!request.goal && !materials.items.length) { message('generation-error', 'Add material or ask a question in Instructions.', 'error'); $('learning-goal').focus(); return; }
   if (!request.language || !request.subject) { message('generation-error', 'Enter your chosen language and subject, or choose automatic detection.', 'error'); return; }
   if (materials.items.some(item => item.status !== 'ready')) { message('generation-error', 'Resume failed local imports before creating the lesson.', 'error'); return; }
-  if (!resume && materials.needsTranscription && !state.roles.transcription) { message('generation-error', 'Assign a transcription role in AI providers for your audio or video.', 'error'); return; }
+  if (!resume && materials.needsTranscription && !state.roles.transcription) { message('generation-error', 'Assign a transcription role in AI providers for audio-only sources.', 'error'); return; }
+  if (!resume && materials.needsVideoAnalysis && !state.roles.video) { message('generation-error', 'Assign an explicitly compatible native-video role in AI providers before analyzing whole videos.', 'error'); return; }
   if (!Number.isInteger(state.setupRevision)) { message('generation-error', 'Refresh AI setup before confirming: the server did not provide its setup revision.', 'error'); return; }
   const approvedSetup = approvedAudioSetup();
   request.expectedSetupRevision = approvedSetup.revision;
@@ -734,7 +778,7 @@ async function generate(event, { resume = false } = {}) {
   try {
     const info = resume ? checkpointMetadata() : null;
     const replace = !resume && saved && saved.phase !== 'retained' && !saved.unavailable;
-    consent = await confirmAction({ title: resume ? 'Continue generation from the last checkpoint?' : replace ? 'Start a new lesson instead of continuing?' : 'Process all parts and create your lesson?', description: resume ? 'Reuse successful transcription, image recognition and preparation notes. Only the failed/unknown step and remaining work can make new billable requests. The saved instructions/options are used; current form edits are not applied. Current confirmed model settings apply only to unfinished steps; earlier successful results may come from a previous model. Incomplete model output is not treated as a successful checkpoint.' : (replace ? 'Starting this changed request replaces the unfinished checkpoint and may repeat paid preparation. Cancel and use Continue generation to keep the saved request. ' : '') + 'Extracted text and images go to your primary provider; prepared audio parts go to your transcription provider. Originals never go directly to providers. This can make multiple billable calls. AI digests are lossy, not guaranteed verbatim; only representative preview images are embedded. Remove sensitive material before continuing.', detail: (resume ? `${info.completedCalls} successful preparation call(s) retained; ${info.completedParts}/${info.totalParts} parts prepared. ${info.preparationComplete ? 'Preparation is complete: retry only final lesson generation.' : 'Resume the unfinished preparation step, then generate the final lesson.'}\nNo successful checkpoint is evicted to make room for another request; quotas stop before new paid work. Failed/unknown attempts may already have been billed.\n` : '') + materials.describe({ completeAudio: request.includeAudio }) + '\nPrimary: ' + providerFor(approvedSetup.roles.primary)?.name + ' / ' + approvedSetup.roles.primary.model + '\nThinking: ' + (approvedSetup.roles.primary.reasoningEffort || 'model default') + '\n' + primaryWait(approvedSetup.roles.primary) + (materials.needsTranscription && approvedSetup.roles.transcription ? '\nSpeech-to-text: ' + providerFor(approvedSetup.roles.transcription)?.name + ' / ' + approvedSetup.roles.transcription.model + '\nTranscription API: ' + transcriptionMode(approvedSetup.roles.transcription) : '') + (audioDecision(request.audioMode, request.subject) !== false ? '\n' + (request.audioMode === 'auto' ? 'Automatic English audio: only for an English-learning subject, not merely English explanations. With Subject Auto, the normal teaching response classifies the lesson (not independently verified); other subjects skip extra audio recognition and speech. ' : 'Complete English audio requested. ') + 'Local encoder readiness/capacity is checked before source-audio recognition; managed assets may download, but preflight uses no AI. If English audio is selected, one potentially paid primary-model OCR call per extracted visual may follow (successful transcripts/recognition are reused). This confirmation authorizes those conditional recognition requests. Missing speech setup keeps the text lesson while you configure it. After the source inventory, a separate confirmation shows the exact unique word/sentence clip count and speech provider/voice. All English word targets and sentences from both sources and the generated lesson are included, not just AI keywords. English/Latin matching is not reliable language identification; OCR/transcription may miss or misrecognize content. Native Kokoro is English-only. Your teaching language stays unchanged.' : '\nAudio is off for this request: no extra audio recognition or speech. Transcription needed to understand uploaded recordings is separate.'), paid: true, accept: resume ? 'Continue from checkpoint' : replace ? 'Replace checkpoint & create' : 'Process all parts & create' });
+    consent = await confirmAction({ title: resume ? 'Continue generation from the last checkpoint?' : replace ? 'Start a new lesson instead of continuing?' : 'Process all parts and create your lesson?', description: resume ? 'Reuse successful native-video analysis, transcription, image recognition and preparation notes. Only the failed/unknown step and remaining work can make new billable requests. The saved instructions/options are used; current form edits are not applied. Current confirmed model settings apply only to unfinished steps; earlier successful results may come from a previous model. Incomplete model output is not treated as a successful checkpoint.' : (replace ? 'Starting this changed request replaces the unfinished checkpoint and may repeat paid preparation. Cancel and use Continue generation to keep the saved request. ' : '') + 'Extracted text and images go to your primary provider; audio-only parts go to your transcription provider. Complete audiovisual analysis copies go to the separate video provider. Acquired originals remain private on this server. Redacted citation origins/paths may be shared with providers and included in the lesson; private fetch query tokens are omitted. This can make multiple billable calls. AI digests are lossy, not guaranteed verbatim; only representative preview images are embedded. Remove sensitive material before continuing.', detail: (resume ? `${info.completedCalls} successful preparation call(s) retained; ${info.completedParts}/${info.totalParts} parts prepared. ${info.preparationComplete ? 'Preparation is complete: retry only final lesson generation.' : 'Resume the unfinished preparation step, then generate the final lesson.'}\nNo successful checkpoint is evicted to make room for another request; quotas stop before new paid work. Failed/unknown attempts may already have been billed.\n` : '') + materials.describe({ completeAudio: request.includeAudio, roles: approvedSetup.roles }) + videoDisclosure(approvedSetup.roles) + '\nPrimary: ' + providerFor(approvedSetup.roles.primary)?.name + ' / ' + approvedSetup.roles.primary.model + '\nThinking: ' + (approvedSetup.roles.primary.reasoningEffort || 'model default') + '\n' + primaryWait(approvedSetup.roles.primary) + (materials.needsTranscription && approvedSetup.roles.transcription ? '\nSpeech-to-text: ' + providerFor(approvedSetup.roles.transcription)?.name + ' / ' + approvedSetup.roles.transcription.model + '\nTranscription API: ' + transcriptionMode(approvedSetup.roles.transcription) : '') + (audioDecision(request.audioMode, request.subject) !== false ? '\n' + (request.audioMode === 'auto' ? 'Automatic English audio: only for an English-learning subject, not merely English explanations. With Subject Auto, the normal teaching response classifies the lesson (not independently verified); other subjects skip extra audio recognition and speech. ' : 'Complete English audio requested. ') + 'Local encoder readiness/capacity is checked before source-audio recognition; managed assets may download, but preflight uses no AI. If English audio is selected, one potentially paid primary-model OCR call per extracted still/image may follow. Whole-video speech and visible words reuse accepted native analyses, never repeat video analysis, transcription or still OCR. This confirmation authorizes those conditional recognition requests. Missing speech setup keeps the text lesson while you configure it. After the source inventory, a separate confirmation shows the exact unique word/sentence clip count and speech provider/voice. All English word targets and sentences from both sources and the generated lesson are included, not just AI keywords. English/Latin matching is not reliable language identification; OCR/transcription may miss or misrecognize content. Native Kokoro is English-only. Your teaching language stays unchanged.' : '\nAudio is off for this request: no extra audio recognition or speech. Transcription needed to understand uploaded recordings is separate.'), paid: true, accept: resume ? 'Continue from checkpoint' : replace ? 'Replace checkpoint & create' : 'Process all parts & create' });
   } finally { confirming = false; updateStatus(); }
   if (consent && epoch === sessionEpoch) await preview('generate', request, approvedSetup, { resume });
 }
@@ -845,6 +889,8 @@ $('roles-form').onsubmit = async event => {
   catch (error) { message('roles-message', error.message, 'error'); }
   finally { settingsBusy = false; updateStatus(); }
 };
+$('import-url').onclick = addUrlSource;
+$('source-url').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); void addUrlSource(); } });
 $('dropzone').onclick = () => { if (!$('dropzone').disabled) $('material-input').click(); };
 $('material-input').onchange = async event => { await addFiles(event.target.files); event.target.value = ''; };
 for (const type of ['dragenter', 'dragover']) $('dropzone').addEventListener(type, event => { event.preventDefault(); $('dropzone').classList.add('dragover'); });

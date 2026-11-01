@@ -1,0 +1,2 @@
+# Preserve the supplied upstream license, including its whitespace.
+htmlparser2-LICENSE -text -whitespace

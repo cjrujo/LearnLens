@@ -1,13 +1,15 @@
 // Run against a disposable headless Chromium debugging instance on :9333.
 // Starts its own app + mock provider. No credentials, external services or paid AI.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { parseVideoAnalysis } from '../lib/video-analysis.mjs';
 import { writeFile, readFile, mkdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createApp } from '../server.mjs';
 import { probeImage } from '../lib/provider.mjs';
 import { prepareAudioEncoder } from '../lib/audio-encode.mjs';
-import { createQAProvider, wav, listen, close, importFixtures, sourceText, transcriptText, ocrText, longSentence, englishAudioLesson, mathAudioLesson, readingFixtures } from './browser-fixtures.mjs';
+import { createQAProvider, wholeVideoFixtureResponse, wav, listen, close, importFixtures, sourceText, transcriptText, ocrText, longSentence, englishAudioLesson, mathAudioLesson, readingFixtures } from './browser-fixtures.mjs';
 const publicDirectory = resolve(process.env.LEARNLENS_TEST_UI || 'public');
 process.env.LEARNLENS_MEDIA_OFFLINE = '1';
 // Node-side provider calls and tool acquisition must stay loopback/offline.
@@ -127,7 +129,7 @@ async function audioFixtureTab(origin, providerOrigin, { speech = true } = {}) {
   await evaluate(session, 'document.querySelector(".discover-button").click()');
   await wait(session, 'document.querySelector(".provider-model-count")?.textContent === "4 listed models"');
   await evaluate(session, `document.getElementById('role-speech-engine').value='provider';document.getElementById('role-speech-engine').dispatchEvent(new Event('change'));for(const [role,model] of ${JSON.stringify([['primary','test/vision'], ['transcription','test/transcribe'], ...(speech ? [['speech','test/speech']] : [])])}){const p=document.getElementById('role-'+role+'-provider');p.selectedIndex=1;p.dispatchEvent(new Event('change'));const m=document.getElementById('role-'+role+'-model');m.value=model;m.dispatchEvent(new Event('change'))}document.getElementById('roles-form').requestSubmit()`);
-  await wait(session, `document.getElementById('setup-count').textContent === '${speech ? 3 : 2}/3' && !document.getElementById('roles-fields').disabled`);
+  await wait(session, `document.getElementById('setup-count').textContent === '${speech ? 3 : 2}/4' && !document.getElementById('roles-fields').disabled`);
   await evaluate(session, 'document.querySelector("[data-page=lesson]").click();document.getElementById("tab-compose").click()');
   return { session, context };
 }
@@ -239,40 +241,186 @@ async function verifyReadingPausesOffline(session, qa, count) {
   englishAudioEvidence.push({ case: 'reading-pauses-wire-offline', count, normalizedInputs: [readingFixtures.spokenBody, readingFixtures.spokenQuestion, readingFixtures.spokenAnswer, readingFixtures.spokenAudio], unmarkedInputs: [readingFixtures.uploaded, 'Choose and / or for alternatives.', 'Compare 3/4 and m/s.'], export: file });
   passed('reading pauses: marked sections/questions/answers/audio normalize actual provider input to commas; unmarked meaningful/uploaded slashes stay; original offline markers and concealed answers retained; MP3 playback/collapse, Chinese language and 320px');
 }
+async function assignVideoRole(session, qa, assigned = 4) {
+  const before = qa.calls.length;
+  await evaluate(session, `document.querySelector('[data-page=providers]').click();document.getElementById('role-video-provider').selectedIndex=1;document.getElementById('role-video-provider').dispatchEvent(new Event('change'));document.getElementById('role-video-model').value='__manual__';document.getElementById('role-video-model').dispatchEvent(new Event('change'));document.getElementById('role-video-manual').value='gemini-video-fixture';document.getElementById('role-video-manual').dispatchEvent(new Event('input'));document.getElementById('role-video-api').value='gemini';document.getElementById('role-video-api').dispatchEvent(new Event('change'));document.getElementById('role-video-fps').value='24';document.getElementById('role-video-fps').dispatchEvent(new Event('input'));document.getElementById('roles-form').requestSubmit()`);
+  await wait(session, `document.getElementById('setup-count').textContent === '${assigned}/4' && !document.getElementById('roles-fields').disabled`);
+  assert.equal(await evaluate(session, 'document.getElementById("role-video-api").value'), 'gemini');
+  assert.equal(qa.calls.length, before, 'Assigning native video never probes automatically');
+  await evaluate(session, 'document.querySelector("[data-page=lesson]").click();document.getElementById("tab-compose").click()');
+}
+const wholeVideoCounts = qa => ({ video: qa.calls.filter(c=>c.kind==='video').length, ...audioCounts(qa) });
+async function observeWholeVideo(session) {
+  // Passive copies of synthetic traffic only. Do not fabricate plans, receipts,
+  // media bytes or responses, or bypass the native material inspection/clipper.
+  await evaluate(session, `(()=>{
+    const original=window.fetch;
+    window.__wholeVideoEvidence={plans:{},receipts:{},teaching:[],sources:[],transcriptions:[]};
+    window.fetch=async function(input,options){
+      const path=new URL(typeof input==='string'?input:input.url,location.href).pathname;
+      const method=options?.method||'GET', evidence=window.__wholeVideoEvidence;
+      const body=method==='POST'&&typeof options?.body==='string'?JSON.parse(options.body):null;
+      const response=await original.call(this,input,options);
+      if(response.ok){
+        if(/\\/video-plan$/.test(path)||/^\\/api\\/video\\/plans\\/[^/]+$/.test(path)){
+          const plan=await response.clone().json();evidence.plans[plan.id]=plan;
+        }else if(/^\\/api\\/video\\/plans\\/[^/]+\\/clips\\/[^/]+$/.test(path)){
+          const receipt=await response.clone().json();if(receipt.status==='complete')evidence.receipts[receipt.id]=receipt;
+        }else if(path==='/api/transcribe'&&body)evidence.transcriptions.push(body.name);
+        else if(path==='/api/lessons'&&body)evidence.teaching.push(body.videoPlans||[]);
+        else if(/^\\/api\\/audio\\/plans\\/[^/]+\\/sources$/.test(path)&&body)evidence.sources.push(body.source);
+      }
+      return response;
+    };
+  })()`);
+}
+async function acceptedWholeVideo(session, qa, expectedVideos, hasAudio = true) {
+  const evidence = await evaluate(session, 'window.__wholeVideoEvidence');
+  const plans = Object.values(evidence.plans), calls = qa.calls.filter(c=>c.kind==='video'), used = new Set(), results = [];
+  assert.equal(plans.length, expectedVideos, 'Every video owns a native whole-interval plan');
+  assert.equal(evidence.teaching.length, 1, 'One successful teaching request follows complete receipts');
+  assert.deepEqual(evidence.teaching[0].map(ref=>[ref.materialId,ref.snapshotId,ref.planId]).sort(), plans.map(plan=>[plan.materialId,plan.snapshotId,plan.id]).sort(), 'Teaching references every accepted video snapshot');
+  for (const plan of plans) {
+    assert.equal(plan.analysisMode, 'whole-video'); assert.equal(plan.hasVideo, true);
+    assert.equal(plan.hasAudio, hasAudio); assert.equal(plan.fps, 24);
+    assert.ok(plan.clips.length > 0); assert.equal(plan.summary.totalClips, plan.clips.length);
+    let end = 0;
+    for (const clip of plan.clips) {
+      assert.equal(clip.start, end, 'Native clip intervals are contiguous from zero');
+      assert.ok(clip.end > clip.start && clip.end - clip.start <= 30.5); end = clip.end;
+      const receipt = evidence.receipts[clip.id];
+      assert.equal(receipt?.status, 'complete', 'A saved accepted receipt exists for every clip');
+      assert.equal(receipt.attempts, 1, 'No hidden native-video retry');
+      const index = calls.findIndex((call, i) => !used.has(i) && createHash('sha256').update(Buffer.from(call.body.contents[0].parts[1].inlineData.data, 'base64')).digest('hex') === receipt.result.videoSha256);
+      assert.notEqual(index, -1, 'Receipt identity matches actual requested native clip bytes');
+      used.add(index);
+      const call = calls[index];
+      assert.equal(call.path, '/v1beta/models/gemini-video-fixture:generateContent');
+      assert.equal(call.body.contents[0].parts[1].videoMetadata.fps, plan.fps);
+      const envelope = wholeVideoFixtureResponse(call.body);
+      const text = envelope.candidates[0].content.parts.filter(part=>!part.thought).map(part=>part.text).join('');
+      const expected = parseVideoAnalysis(text, { start: clip.start, end: clip.end, hasAudio: plan.hasAudio, videoSha256: receipt.result.videoSha256 }, { fps: plan.fps });
+      assert.deepEqual(receipt.result, expected, 'Strict schema, requested windows, original source bounds and all text survive acceptance');
+      results.push(expected);
+    }
+    assert.equal(end, plan.duration, 'Receipt coverage includes the exact native source tail');
+  }
+  assert.equal(Object.keys(evidence.receipts).length, results.length);
+  assert.equal(calls.length, results.length, 'Exactly one native request per accepted clip');
+  return { plans, results };
+}
 async function verifyVideoSourceConsent(origin, textFile) {
   const fixtures = await importFixtures(resolve('artifacts/english-audio-browser/english-video-fixtures'), { media: true });
   const video = fixtures.media.find(file=>file.endsWith('movie.mp4'));
-  assert.ok(video, 'Generic native video fixture exists');
+  assert.ok(video, 'Real native-decoded synthetic MP4 fixture exists');
   const qa = createQAProvider({ lesson: englishAudioLesson() }); englishAudioProviders.push(qa);
-  const { session } = await audioFixtureTab(origin, await listen(qa.server));
+  // Missing speech pauses after teaching, retaining the accepted video receipt.
+  const { session } = await audioFixtureTab(origin, await listen(qa.server), { speech: false });
+  await assignVideoRole(session, qa, 3);
+  await observeWholeVideo(session);
+  const beforeUpload = qa.calls.length;
   await upload(session, '#material-input', [video]); await attachments(session, 1);
-  const visuals = await evaluate(session, 'document.querySelectorAll("#material-list > li:first-child .material-visuals img").length');
-  assert.ok(visuals > 0, 'Video prepares real stills before text preview clears them');
+  assert.equal(await evaluate(session, 'document.querySelectorAll("#material-list .material-visuals img").length'), 0, 'Whole video exposes immutable clip references, not stills for OCR');
   await upload(session, '#material-input', [textFile]); await attachments(session, 2);
-  assert.equal(await evaluate(session, 'document.querySelectorAll("#material-list > li:first-child .material-visuals img").length'), 0, 'Loading text preview clears disposable video previews');
+  assert.equal(await evaluate(session, 'document.querySelectorAll("#material-list .material-visuals img").length'), 0, 'Loading text leaves no disposable video preview images');
+  assert.equal(qa.calls.length, beforeUpload, 'Native preparation and preview switching are AI-free');
   const start = browserRequests.length;
-  qa.config.audioExtractFailAt = 1;
   await initialAudioConsent(session, qa, start); await retainedAudioIdle(session);
-  assert.deepEqual(audioCounts(qa), { transcription: 1, digest: 1, lesson: 1, 'audio-extract': 1, speech: 0 });
+  const { plans, results } = await acceptedWholeVideo(session, qa, 1);
+  const windows = results.flatMap(result=>result.windows), prepared = wholeVideoCounts(qa);
+  assert.deepEqual(prepared, { video: results.length, transcription: 0, digest: 0, lesson: 1, 'audio-extract': 0, speech: 0 }, 'Whole-video receipts replace STT/still OCR; short source notes remain verbatim');
+  assert.deepEqual(audioRequests(session, start), [], 'Missing speech defers the audio inventory without repeating video analysis');
+  const retained = await evaluate(session, 'document.getElementById("lesson-frame").srcdoc');
+  const teaching = qa.calls.find(c=>c.kind==='lesson').body.input[0].content[0].text;
+  for (const window of windows) for (const key of ['transcript','visibleText','observations']) assert.ok(teaching.includes(window[key]), 'Teaching retains each separately labelled native result');
+  assert.doesNotMatch(teaching, /Excluded fixture thinking/);
+  await evaluate(session, `document.querySelector('[data-page=providers]').click();document.getElementById('role-speech-provider').selectedIndex=1;document.getElementById('role-speech-provider').dispatchEvent(new Event('change'));document.getElementById('role-speech-model').value='test/speech';document.getElementById('role-speech-model').dispatchEvent(new Event('change'));document.getElementById('roles-form').requestSubmit()`);
+  await wait(session, 'document.getElementById("setup-count").textContent === "4/4" && !document.getElementById("roles-fields").disabled');
+  await evaluate(session, 'document.querySelector("[data-page=lesson]").click()');
+  const beforeContinue = browserRequests.length, before = qa.calls.length;
   await evaluate(session, 'document.getElementById("continue-audio").click()');
   await wait(session, 'document.getElementById("confirm-dialog").open');
   assert.equal(await evaluate(session, 'document.getElementById("confirm-title").textContent'), 'Prepare remaining English audio sources?');
-  assert.equal(await evaluate(session, 'document.getElementById("confirm-consent").closest("[hidden]") === null && !document.getElementById("confirm-consent").checked && document.getElementById("confirm-accept").disabled'), true, 'Durable video manifest requires explicit paid OCR consent even with no retained preview images');
-  const before = qa.calls.length;
-  await evaluate(session, 'document.getElementById("confirm-accept").click()');
-  assert.equal(await evaluate(session, 'document.getElementById("confirm-dialog").open'), true);
-  assert.equal(qa.calls.length, before, 'Disabled acceptance cannot dispatch paid video OCR');
-  await shot(session, 'video-text-cleared-preview-paid-consent.png');
+  assert.equal(await evaluate(session, 'document.getElementById("confirm-consent").closest("[hidden]") !== null && !document.getElementById("confirm-accept").disabled'), true, 'Receipt-only inventory is local, not paid video OCR');
   await evaluate(session, 'document.getElementById("confirm-cancel").click()'); await retainedAudioIdle(session);
   assert.equal(qa.calls.length, before);
-  qa.config.audioExtractFailAt = null;
-  await evaluate(session, 'document.getElementById("continue-audio").click()'); await consent(session);
+  await evaluate(session, 'document.getElementById("continue-audio").click()');
+  await wait(session, 'document.getElementById("confirm-dialog").open');
+  await evaluate(session, 'document.getElementById("confirm-accept").click()');
   const count = await exactAudioCount(session);
-  assert.deepEqual(audioCounts(qa), { transcription: 1, digest: 1, lesson: 1, 'audio-extract': visuals + 1, speech: 0 }, 'Only failed/remaining video OCR is dispatched after checkbox consent');
+  assert.equal(await evaluate(session, 'document.getElementById("confirm-consent").closest("[hidden]") === null && !document.getElementById("confirm-consent").checked'), true, 'Remote speech has its own visible unchecked consent even with no previews');
+  await evaluate(session, 'document.getElementById("confirm-accept").click()');
+  assert.equal(await evaluate(session, 'document.getElementById("confirm-dialog").open'), true, 'Unchecked exact speech consent cannot dispatch');
+  assert.equal(qa.calls.length, before);
+  const sources = await evaluate(session, 'window.__wholeVideoEvidence.sources');
+  assert.deepEqual(sources.map(source=>source.text), [...windows.flatMap(window=>[window.transcript,window.visibleText]), readingFixtures.uploaded], 'Audio inventory retains every raw speech and screen word, not derived observations/digests');
+  assert.deepEqual(sources.slice(0,-1).map(source=>source.extraction), windows.flatMap(()=>['transcription','vision']));
+  assert.ok(sources.every(source=>source.origin==='uploaded' && !source.readingPauses), 'Source slashes are never treated as generated reading markup');
+  assert.ok(sources.slice(0,-1).every(source=>source.coverage==='uncertain'), 'Model-reported native coverage is not claimed as verified original text');
+  for (const window of windows) assert.ok(!sources.some(source=>source.text.includes(window.observations)));
+  await shot(session, 'video-text-cleared-preview-speech-consent.png');
   await exactConsent(session, false); await retainedAudioIdle(session);
-  englishAudioEvidence.push({ case: 'video-source-consent', originalVisualCount: visuals, previewVisualsAfterText: 0, paidCheckboxRequired: true, exactClips: count, counts: audioCounts(qa) });
-  passed('video + text: clearing disposable video preview images cannot hide the paid pending-OCR checkbox; cancelled/unchecked consent dispatches nothing; only remaining OCR resumes, with no STT/digest/teaching replay');
+  assert.equal(await evaluate(session, 'document.getElementById("lesson-frame").srcdoc'), retained, 'Speech cancellation retains the text lesson');
+  assert.deepEqual(wholeVideoCounts(qa), prepared);
+  const inventoryDone = browserRequests.length;
+  await evaluate(session, 'document.getElementById("continue-audio").click()');
+  await wait(session, 'document.getElementById("confirm-dialog").open');
+  assert.match(await evaluate(session, 'document.getElementById("confirm-title").textContent'), /Resume this retained/);
+  await evaluate(session, 'document.getElementById("confirm-accept").click()');
+  assert.equal(await exactAudioCount(session), count, 'Resume preserves the exact inventory');
+  assert.equal(qa.calls.length, before);
+  await exactConsent(session);
+  const inputs = await checkSpeechCount(session, qa, count);
+  for (const window of windows) for (const text of [window.transcript,window.visibleText]) assert.ok(inputs.includes(text), 'Original video sentence reaches speech unchanged');
+  assert.ok(!inputs.some(input=>/Derived visual interpretation|Excluded fixture thinking/.test(input)));
+  assert.deepEqual({ ...wholeVideoCounts(qa), speech: 0 }, prepared, 'Continue audio never replays native video/STT/still OCR/digests/teaching');
+  const resumedRequests = browserRequests.slice(beforeContinue).filter(r=>r.session===session);
+  assert.equal(resumedRequests.filter(r=>/^\/api\/(?:video\/|transcribe$|materials\/summarize$|audio\/extract$|lessons$)/.test(r.path) || /\/video-plan$/.test(r.path)).length, 0, 'Audio inventory/resume uses saved receipts, with no video or paid source endpoints');
+  assert.equal(browserRequests.slice(inventoryDone).filter(r=>r.session===session && /\/parts$/.test(r.path)).length, 0, 'Completed inventory resumes without local source rereads');
+  englishAudioEvidence.push({ case: 'video-source-consent', nativeClips: results.length, intervals: plans.map(plan=>plan.clips.map(({start,end})=>({start,end}))), previewVisualsAfterText: 0, inventoryTexts: sources.map(source=>source.text), exactClips: count, separateSpeechConsent: true, counts: wholeVideoCounts(qa) });
+  passed('whole video + text: accepted full-interval receipts feed raw speech/screen inventory, never observations; no preview stills or extra native/STT/OCR; independent exact speech consent, cancellation and no-replay Continue');
   await releaseAudioFixtureSession(session);
+}
+async function verifyClearedVisualConsent(origin, textFile) {
+  const fixtures = await importFixtures(resolve('artifacts/english-audio-browser/cleared-visual-fixtures'));
+  for (const spec of [
+    { name: 'image', file: resolve('artifacts/english-audio-browser/test-screenshot.png'), images: 1, digests: 1 },
+    { name: 'pdf', file: fixtures.documents[0], images: 5, digests: 2 },
+  ]) {
+    const qa = createQAProvider({ lesson: englishAudioLesson() }); englishAudioProviders.push(qa);
+    const { session } = await audioFixtureTab(origin, await listen(qa.server));
+    await upload(session, '#material-input', [spec.file]); await attachments(session, 1);
+    const visuals = await evaluate(session, 'document.querySelectorAll("#material-list > li:first-child .material-visuals img").length');
+    assert.ok(visuals > 0, 'Ordinary ' + spec.name + ' has genuine preview images');
+    await upload(session, '#material-input', [textFile]); await attachments(session, 2);
+    assert.equal(await evaluate(session, 'document.querySelectorAll("#material-list > li:first-child .material-visuals img").length'), 0, 'Text preview clears disposable ' + spec.name + ' visuals');
+    qa.config.audioExtractFailAt = 1;
+    await initialAudioConsent(session, qa, browserRequests.length); await retainedAudioIdle(session);
+    assert.deepEqual(wholeVideoCounts(qa), { video: 0, transcription: 0, digest: spec.digests, lesson: 1, 'audio-extract': 1, speech: 0 });
+    await assertSourceLock(session, qa);
+    await evaluate(session, 'document.getElementById("continue-audio").click()');
+    await wait(session, 'document.getElementById("confirm-dialog").open');
+    assert.equal(await evaluate(session, 'document.getElementById("confirm-title").textContent'), 'Prepare remaining English audio sources?');
+    assert.equal(await evaluate(session, 'document.getElementById("confirm-consent").closest("[hidden]") === null && !document.getElementById("confirm-consent").checked && document.getElementById("confirm-accept").disabled'), true, 'Cleared ' + spec.name + ' previews cannot hide paid OCR consent');
+    const before = qa.calls.length;
+    await evaluate(session, 'document.getElementById("confirm-accept").click()');
+    assert.equal(await evaluate(session, 'document.getElementById("confirm-dialog").open'), true);
+    assert.equal(qa.calls.length, before, 'Unchecked ordinary-source OCR dispatches nothing');
+    await shot(session, spec.name + '-text-cleared-preview-paid-consent.png');
+    await evaluate(session, 'document.getElementById("confirm-cancel").click()'); await retainedAudioIdle(session);
+    assert.equal(qa.calls.length, before, 'Cancelled ordinary-source OCR dispatches nothing');
+    qa.config.audioExtractFailAt = null;
+    await evaluate(session, 'document.getElementById("continue-audio").click()'); await consent(session);
+    const count = await exactAudioCount(session);
+    assert.deepEqual(wholeVideoCounts(qa), { video: 0, transcription: 0, digest: spec.digests, lesson: 1, 'audio-extract': spec.images + 1, speech: 0 }, 'Only failed/remaining image or PDF OCR runs after renewed consent');
+    const extracts = qa.calls.filter(c=>c.kind==='audio-extract');
+    assert.equal(extracts[0].failed, true);
+    assert.deepEqual(extracts[1].body.input, extracts[0].body.input, 'First failed source image is retried rather than skipped');
+    await exactConsent(session, false); await retainedAudioIdle(session);
+    englishAudioEvidence.push({ case: 'cleared-' + spec.name + '-source-consent', originalVisualCount: visuals, previewVisualsAfterText: 0, paidCheckboxRequired: true, exactClips: count, counts: wholeVideoCounts(qa) });
+    passed(spec.name + ' + text: clearing previews cannot hide paid OCR consent; unchecked/cancelled dispatches nothing; only failed/remaining OCR resumes, without teaching replay');
+    await releaseAudioFixtureSession(session);
+  }
 }
 async function verifyRetentionResumeGuard(origin) {
   const qa = createQAProvider({ lesson: englishAudioLesson({ title: 'First retained audio lesson' }) }); englishAudioProviders.push(qa);
@@ -345,7 +493,7 @@ async function runEnglishAudioChecks(origin) {
     { name: 'selected-english-false-metadata', lesson: englishAudioLesson({ englishLearning: false, subject: 'Unclassified material' }), mode: 'auto', subject: 'English', audio: true },
     { name: 'selected-math-true-metadata', lesson: englishAudioLesson(), mode: 'auto', subject: 'Mathematics', audio: false },
   ];
-  const allowed = [...matrix.map(c=>c.name), 'deferred-ocr-resume', 'missing-speech', 'pending-discard', 'video-source-consent', 'retention-resume-guard'];
+  const allowed = [...matrix.map(c=>c.name), 'deferred-ocr-resume', 'missing-speech', 'pending-discard', 'video-source-consent', 'cleared-visual-source-consent', 'retention-resume-guard'];
   assert.ok(selectedCases.every(name=>allowed.includes(name)), 'Unknown LEARNLENS_BROWSER_CASES value');
   for (const spec of matrix.filter(c=>wanted(c.name))) {
     const qa = createQAProvider({ lesson: spec.lesson }); englishAudioProviders.push(qa);
@@ -494,6 +642,7 @@ async function runEnglishAudioChecks(origin) {
     await releaseAudioFixtureSession(session);
   }
   if (wanted('video-source-consent')) await verifyVideoSourceConsent(origin, text);
+  if (wanted('cleared-visual-source-consent')) await verifyClearedVisualConsent(origin, text);
   if (wanted('retention-resume-guard')) await verifyRetentionResumeGuard(origin);
 }
 
@@ -645,11 +794,11 @@ try {
   await evaluate(s, 'document.getElementById("confirm-consent").click();document.getElementById("confirm-accept").click()');
   await wait(s, '!document.getElementById("recommend-results").hidden');
   assert.equal(provider.calls.at(-1).body.reasoning.effort, 'high');
-  assert.equal(await evaluate(s, 'document.getElementById("setup-count").textContent'), '1/3', 'Advice cannot save roles');
+  assert.equal(await evaluate(s, 'document.getElementById("setup-count").textContent'), '1/4', 'Advice cannot save roles');
   await evaluate(s, 'document.querySelector("#recommend-cards input[data-role=primary]").click();document.querySelector("#recommend-cards input[data-role=speech]").click();document.getElementById("apply-recommendations").click()');
   assert.equal(await evaluate(s, 'document.getElementById("role-primary-model").value'), 'test/vision');
   assert.equal(await evaluate(s, 'document.getElementById("role-primary-timeout").value'), '450', 'Advisor preserves draft wait');
-  assert.equal(await evaluate(s, 'document.getElementById("setup-count").textContent'), '1/3', 'Applying advice only changes the form');
+  assert.equal(await evaluate(s, 'document.getElementById("setup-count").textContent'), '1/4', 'Applying advice only changes the form');
   await evaluate(s, 'document.querySelector(".setup-advisor").scrollIntoView({block:"start"})');
   await shot(s, 'app-model-advisor.png');
   await call('Emulation.setDeviceMetricsOverride', { width: 320, height: 700, deviceScaleFactor: 1, mobile: true }, s);
@@ -657,7 +806,7 @@ try {
   await shot(s, 'app-advisor-mobile.png');
   await call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false }, s);
   await evaluate(s, 'document.getElementById("role-primary-effort").value="low";document.getElementById("role-primary-effort").dispatchEvent(new Event("change"));document.getElementById("roles-form").requestSubmit()');
-  await wait(s, 'document.getElementById("setup-count").textContent === "3/3" && !document.getElementById("roles-fields").disabled');
+  await wait(s, 'document.getElementById("setup-count").textContent === "3/4" && !document.getElementById("roles-fields").disabled');
   await evaluate(s, `document.querySelector('[data-role="primary"] .probe-buttons button:last-child').click()`);
   await wait(s, 'document.getElementById("confirm-dialog").open');
   assert.equal(await evaluate(s, 'document.getElementById("confirm-accept").disabled'), true);
@@ -870,7 +1019,7 @@ try {
   await evaluate(checkpointTab, 'document.querySelector(".discover-button").click()');
   await wait(checkpointTab, 'document.querySelector(".provider-model-count")?.textContent === "4 listed models"');
   await evaluate(checkpointTab, `for(const [role,model] of [['primary','test/vision'],['transcription','__manual__']]){const p=document.getElementById('role-'+role+'-provider');p.selectedIndex=1;p.dispatchEvent(new Event('change'));const m=document.getElementById('role-'+role+'-model');m.value=model;m.dispatchEvent(new Event('change'))}document.getElementById('role-transcription-manual').value='gemini-checkpoint-fixture';document.getElementById('role-transcription-manual').dispatchEvent(new Event('input'));document.getElementById('role-transcription-api').value='gemini';document.getElementById('role-transcription-api').dispatchEvent(new Event('change'));document.getElementById('roles-form').requestSubmit()`);
-  await wait(checkpointTab, 'document.getElementById("setup-count")?.textContent === "3/3" && !document.getElementById("roles-fields").disabled');
+  await wait(checkpointTab, 'document.getElementById("setup-count")?.textContent === "3/4" && !document.getElementById("roles-fields").disabled');
   await evaluate(checkpointTab, 'document.querySelector("[data-page=lesson]").click();document.querySelector("[data-action=demo]").click()'); await created(checkpointTab);
   const checkpointPrevious = await evaluate(checkpointTab, 'document.getElementById("lesson-frame").srcdoc');
   const checkpointGoal = 'CHECKPOINT_PRIVATE_INSTRUCTIONS retain original science examples';
@@ -1031,7 +1180,7 @@ try {
   browserContextId = checkpointPrivateContext;
   const clearedCheckpointTab = await tab(origin);
   browserContextId = checkpointOriginalContext;
-  await wait(clearedCheckpointTab, 'document.getElementById("setup-count")?.textContent === "3/3"');
+  await wait(clearedCheckpointTab, 'document.getElementById("setup-count")?.textContent === "3/4"');
   provider.config.failKind = 'lesson';
   const beforeClearFailure = provider.calls.length;
   await evaluate(clearedCheckpointTab, 'document.getElementById("learning-goal").value="Synthetic clear-session checkpoint";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("audio-mode").value="off";document.getElementById("audio-mode").dispatchEvent(new Event("input"));document.getElementById("lesson-form").requestSubmit()');
@@ -1041,7 +1190,7 @@ try {
   await evaluate(clearedCheckpointTab, 'document.getElementById("clear-session").click()');
   await wait(clearedCheckpointTab, 'document.getElementById("confirm-dialog").open');
   await evaluate(clearedCheckpointTab, 'document.getElementById("confirm-accept").click()');
-  await wait(clearedCheckpointTab, 'document.getElementById("setup-label").textContent === "Connect your AI" && document.getElementById("setup-count").textContent === "1/3"');
+  await wait(clearedCheckpointTab, 'document.getElementById("setup-label").textContent === "Connect your AI" && document.getElementById("setup-count").textContent === "1/4"');
   assert.equal(await evaluate(clearedCheckpointTab, 'document.getElementById("continue-generation").disabled'), true);
   assert.match(await evaluate(clearedCheckpointTab, 'document.getElementById("generation-checkpoint").textContent'), /cannot resume after a session change/);
   await evaluate(clearedCheckpointTab, 'document.getElementById("continue-generation").click();document.getElementById("retry-preview").click()');
@@ -1050,7 +1199,7 @@ try {
   passed('checkpoint: attachment changes block continuation and require explicit replacement; Stop retains successful counts; session clear invalidates without silent provider replay');
   // A separate draft exercises digest/STT failures without disturbing prior cached work.
   const diagnosticTab = await tab(origin);
-  await wait(diagnosticTab, 'document.getElementById("setup-count")?.textContent === "3/3"');
+  await wait(diagnosticTab, 'document.getElementById("setup-count")?.textContent === "3/4"');
   const diagnosticSource = 'DIAGNOSTIC_PRIVATE_LONG_SOURCE ' + 'Synthetic bounded digest evidence. '.repeat(90) + ' DIAGNOSTIC_PRIVATE_TAIL';
   await setAudioMode(diagnosticTab, 'off');
   assert.ok(diagnosticSource.length > 2200);
@@ -1088,7 +1237,7 @@ try {
   // Two short parts force the checkpoint digest step; both must pass locally,
   // including the reported 2110-character transcript, not merely bypass preparation.
   const localTab = await tab(origin);
-  await wait(localTab, 'document.getElementById("setup-count")?.textContent === "3/3"');
+  await wait(localTab, 'document.getElementById("setup-count")?.textContent === "3/4"');
   const tinyTranscript = 'TINY_TRANSCRIPT_PRIVATE_BEGIN ' + 'a'.repeat(2052) + ' TINY_TRANSCRIPT_PRIVATE_END';
   assert.equal(tinyTranscript.length, 2110);
   provider.config.transcriptText = tinyTranscript;
@@ -1120,37 +1269,63 @@ try {
   await evaluate(localTab, 'document.querySelector("#material-list button").click()'); await attachments(localTab, 0);
   passed('2110-character transcript and short Markdown: two successful local preparation operations, zero provider digest calls, consent required, exact raw tails retained, no false lossy warning or diagnostic provider/model labels');
   if (fixtures.media.length) {
-    const beforeMedia = provider.calls.length;
-    await evaluate(s, 'document.getElementById("tab-compose").click()');
-    await upload(s, '#material-input', fixtures.media.slice(0, 3));
-    await attachments(s, 10);
-    assert.equal(provider.calls.length, beforeMedia, 'Native MP3/MP4/WebM prepare with no provider calls');
-    const mediaCards = await evaluate(s, '[...document.querySelectorAll("#material-list > li")].slice(-3).map(li=>({name:li.querySelector("strong").textContent,parts:li.querySelectorAll("select option").length}))');
+    // Isolate video snapshots/role changes from the legacy English, STT and
+    // checkpoint tabs: their assigned role counts and caches must not change.
+    const mediaQA = createQAProvider(); englishAudioProviders.push(mediaQA);
+    const { session: mediaSession, context: mediaContext } = await audioFixtureTab(origin, await listen(mediaQA.server));
+    await assignVideoRole(mediaSession, mediaQA);
+    await setAudioMode(mediaSession, 'off');
+    await observeWholeVideo(mediaSession);
+    const beforeMedia = mediaQA.calls.length;
+    await upload(mediaSession, '#material-input', fixtures.media.slice(0, 3)); await attachments(mediaSession, 3);
+    assert.equal(mediaQA.calls.length, beforeMedia, 'Native MP3/MP4/WebM prepare with no provider calls');
+    const mediaCards = await evaluate(mediaSession, '[...document.querySelectorAll("#material-list > li")].map(li=>({name:li.querySelector("strong").textContent,parts:li.querySelectorAll("select option").length}))');
     assert.equal(mediaCards[0].parts, 2, '181-second MP3 has automatic tail part');
-    await evaluate(s, 'document.getElementById("lesson-form").requestSubmit()');
-    await consent(s); await created(s);
-    const mediaCalls = provider.calls.slice(beforeMedia);
-    assert.equal(mediaCalls.filter(c=>c.kind==='transcription').length, mediaCards.reduce((sum,c)=>sum+c.parts,0), 'Every native audio part, including MP3 tail, transcribed');
-    assert.ok(mediaCalls.filter(c=>c.kind==='transcription').every(c=>c.model==='test/transcribe'), 'Transcriptions use the assigned role');
+    await evaluate(mediaSession, 'document.getElementById("lesson-form").requestSubmit()');
+    await consent(mediaSession); await created(mediaSession);
+    const mediaCalls = mediaQA.calls.slice(beforeMedia);
+    const { results } = await acceptedWholeVideo(mediaSession, mediaQA, 2);
+    const audioParts = mediaCards.filter(card=>card.name.endsWith('.mp3')).reduce((sum,card)=>sum+card.parts,0);
+    const videoParts = mediaCards.filter(card=>!card.name.endsWith('.mp3')).reduce((sum,card)=>sum+card.parts,0);
+    assert.deepEqual(wholeVideoCounts(mediaQA), { video: videoParts, transcription: audioParts, digest: 0, lesson: 1, 'audio-extract': 0, speech: 0 }, 'Only MP3/audio-only parts use STT; every MP4/WebM interval uses native video, never still OCR');
+    assert.ok(mediaCalls.filter(c=>c.kind==='transcription').every(c=>c.model==='test/transcribe' && c.filename==='recording.wav'), 'Assigned STT receives prepared WAV under an anonymized filename');
+    const transcribedSources = await evaluate(mediaSession, 'window.__wholeVideoEvidence.transcriptions');
+    assert.equal(transcribedSources.length, audioParts); assert.ok(transcribedSources.every(name=>name.includes('long-recording.mp3')), 'Only local MP3 source parts reach transcription');
+    const mediaTeaching = mediaCalls.findLast(c=>c.kind==='lesson').body.input[0].content[0].text;
     for (const card of mediaCards) for (let part=1;part<=card.parts;part++) {
-      const expectedKind = card.name.endsWith('.mp3') ? 'lesson' : 'digest';
-      assert.ok(mediaCalls.some(c=>c.kind===expectedKind && JSON.stringify(c.body.input).includes(card.name) && JSON.stringify(c.body.input).includes('(' + part + '/' + card.parts + ')')), 'Every native media part reaches a digest or verbatim final input');
+      assert.ok(mediaTeaching.includes(card.name) && mediaTeaching.includes('(' + part + '/' + card.parts + ')'), 'Every native media part reaches verbatim final input');
     }
-    assert.ok(mediaCalls.findLast(c=>c.kind==='lesson').body.input[0].content[0].text.includes(transcriptText), 'Short MP3 transcripts retain their final sentinel');
-    await shot(s, 'app-native-media.png');
-    // A fresh draft in the same private cookie session, with STT deliberately removed.
-    await evaluate(s, 'document.querySelector("[data-page=providers]").click();document.getElementById("role-transcription-provider").value="";document.getElementById("role-transcription-provider").dispatchEvent(new Event("change"));document.getElementById("roles-form").requestSubmit()');
-    await wait(s, 'document.getElementById("setup-count").textContent === "2/3" && !document.getElementById("roles-fields").disabled');
-    const silent = await tab(origin);
-    await wait(silent, 'document.getElementById("setup-count")?.textContent === "2/3"');
-    const beforeSilent = provider.calls.length;
+    for (const result of results) for (const window of result.windows) for (const key of ['transcript','visibleText','observations']) assert.ok(mediaTeaching.includes(window[key]), 'Teaching includes all accepted audiovisual windows');
+    assert.equal(mediaTeaching.split(transcriptText).length - 1, audioParts, 'Both MP3 transcript parts, including the final tail sentinel, survive');
+    await shot(mediaSession, 'app-native-media.png');
+    // Remove finished sources so the new draft cannot borrow their receipts.
+    await evaluate(mediaSession, 'document.getElementById("tab-compose").click()');
+    for (let remaining=2;remaining>=0;remaining--) {
+      await evaluate(mediaSession, 'document.querySelector("#material-list button").click()'); await attachments(mediaSession, remaining);
+    }
+    await evaluate(mediaSession, `document.querySelector('[data-page=providers]').click();for(const role of ['transcription','video']){document.getElementById('role-'+role+'-provider').value='';document.getElementById('role-'+role+'-provider').dispatchEvent(new Event('change'))}document.getElementById('roles-form').requestSubmit()`);
+    await wait(mediaSession, 'document.getElementById("setup-count").textContent === "2/4" && !document.getElementById("roles-fields").disabled');
+    const silent = await tabInContext(origin, mediaContext);
+    await wait(silent, 'document.getElementById("setup-count")?.textContent === "2/4"');
+    await observeWholeVideo(silent);
+    const beforeSilent = mediaQA.calls.length;
     await setAudioMode(silent, 'off');
     await upload(silent, '#material-input', [fixtures.media[3]]); await attachments(silent, 1);
-    assert.equal(provider.calls.length, beforeSilent, 'Silent video local preparation is AI-free');
-    await evaluate(silent, 'document.getElementById("learning-goal").value="Explain these video stills";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("lesson-form").requestSubmit()');
+    assert.equal(mediaQA.calls.length, beforeSilent, 'Silent video local preparation is AI-free');
+    await evaluate(silent, 'document.getElementById("learning-goal").value="Explain the entire synthetic silent video";document.getElementById("learning-goal").dispatchEvent(new Event("input"));document.getElementById("lesson-form").requestSubmit()');
+    assert.match(await evaluate(silent, 'document.getElementById("generation-error").textContent'), /native-video role/);
+    assert.equal(await evaluate(silent, 'document.getElementById("confirm-dialog").open'), false, 'Silent video also requires explicit native video setup before consent');
+    assert.equal(mediaQA.calls.length, beforeSilent, 'No native role means no fallback STT/still OCR/teaching');
+    await assignVideoRole(silent, mediaQA, 3);
+    assert.equal(await evaluate(silent, 'document.getElementById("role-transcription-provider").value'), '', 'Silent video needs no STT role');
+    await evaluate(silent, 'document.getElementById("lesson-form").requestSubmit()');
     await consent(silent); await created(silent);
-    assert.equal(provider.calls.slice(beforeSilent).filter(c=>c.kind==='transcription').length, 0, 'Silent video creates without a transcription role or STT call');
-    passed('managed-cache MP3/MP4/WebM: every audio part transcribed, video stills digested, MP3 tail included; silent video creates without STT');
+    const silentQA = { calls: mediaQA.calls.slice(beforeSilent) };
+    const acceptedSilent = await acceptedWholeVideo(silent, silentQA, 1, false);
+    assert.deepEqual(wholeVideoCounts(silentQA), { video: acceptedSilent.results.length, transcription: 0, digest: 0, lesson: 1, 'audio-extract': 0, speech: 0 }, 'Silent video requires accepted native visual receipts, never STT or still OCR');
+    assert.ok(acceptedSilent.results.every(result=>result.windows.every(window=>window.audioCoverage==='no_audio' && window.transcript==='')), 'All silent-video windows explicitly report no soundtrack');
+    passed('managed-cache MP3/MP4/WebM: MP3 tail/audio-only STT retained; MP4/WebM use explicit Gemini video role and complete native receipts; silent video requires native video with no STT');
+    await releaseAudioFixtureSession(silent);
   } else {
     const note = 'SKIP: optional long MP3/MP4/WebM integration (set LEARNLENS_MEDIA_INTEGRATION=1); WAV and browser-native recording were tested. Real microphone permission/device remains unverified.';
     testLog.push(note); console.log(note);
@@ -1233,7 +1408,7 @@ try {
   await evaluate(full, 'document.querySelector(".discover-button").click()');
   await wait(full, 'document.querySelector(".provider-model-count")?.textContent === "4 listed models"');
   await evaluate(full, `for(const [role,model] of [['primary','test/vision'],['transcription','test/transcribe']]){const p=document.getElementById('role-'+role+'-provider');p.selectedIndex=1;p.dispatchEvent(new Event('change'));const m=document.getElementById('role-'+role+'-model');m.value=model;m.dispatchEvent(new Event('change'))}document.getElementById('roles-form').requestSubmit()`);
-  await wait(full, 'document.getElementById("setup-count")?.textContent === "3/3" && !document.getElementById("roles-fields").disabled');
+  await wait(full, 'document.getElementById("setup-count")?.textContent === "3/4" && !document.getElementById("roles-fields").disabled');
   await evaluate(full, 'document.querySelector("[data-page=lesson]").click()');
   await evaluate(full, 'document.querySelector("[data-action=demo]").click()'); await created(full);
   const priorFull = await evaluate(full, 'document.getElementById("lesson-frame").srcdoc');
@@ -1364,7 +1539,9 @@ try {
     await writeFile('artifacts/english-audio-browser/timeout-notes-long-wait.json', JSON.stringify(outcome.result, null, 2));
   }
   }
-  assert.deepEqual(errors.filter(error => !/Failed to load resource:.*502/.test(error) && !(longWaitRun && /Failed to load resource:.*504.*\/api\/lessons/.test(error))), [], 'Unexpected browser console/CSP errors');
+  // A missing local video plan is explicitly GET-checked before its first POST;
+  // permit only this expected 404, never unrelated missing resources.
+  assert.deepEqual(errors.filter(error => !/Failed to load resource:.*502/.test(error) && !/Failed to load resource:.*404.*\/api\/materials\/[a-f0-9-]{36}\/video-plan\?fps=24\]$/.test(error) && !(longWaitRun && /Failed to load resource:.*504.*\/api\/lessons/.test(error))), [], 'Unexpected browser console/CSP errors');
   assert.deepEqual(lifecycleFailures, [], 'Full audio lifecycle failures (recorded while allowing offline/native checks to finish)');
   passed(process.env.LEARNLENS_BROWSER_SUITE === 'english-audio' ? 'Targeted English-audio checks finished; legacy/full/native replay intentionally not run.' : '1440/390/320px layouts; sandbox; discovery/roles/consented probe; unified imports; generation/failure recovery; actual download; OpenAI preset; consented model advisor + thinking controls; online/Kokoro speech routing; password gate; offline audio playback/speed/answers.');
 } catch (error) {
